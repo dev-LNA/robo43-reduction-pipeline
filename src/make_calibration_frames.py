@@ -236,6 +236,8 @@ class CalibrationMaker:
             master_frame = self.create_master_bias(filelist)
             self.plot_frame(master_frame)
         elif self.cal_type == 'dark':
+            self.logger.warning("Not implemented. Use bias mode instead.")
+            return
             filelist, _ = self.get_calibration_files()
             master_frame, _ = self.create_master_dark(filelist)
             self.plot_frame(master_frame)
