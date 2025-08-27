@@ -102,18 +102,47 @@ class ProcessFrame:
 
         return fits_files
 
-    def bias_subtraction(self, image):
+    def bias_subtraction(self, hdul):
         """Subtract master bias from science frame."""
         path_to_bias = os.path.join(self.workdir, self.masterbias)
         if os.path.exists(path_to_bias):
             master_bias = fits.getdata(path_to_bias)
             self.logger.debug('Master bias shape: %s', master_bias.shape)
-            return image - master_bias
+            bias_subtracted = hdul[0].data - master_bias
+            hdul[0].header['HISTORY'] = 'Bias subtracted'
+            hdul[0].data = bias_subtracted
+            return hdul
         else:
             self.logger.critical(
                 'No master bias file found at %s', path_to_bias)
             raise FileNotFoundError(
                 f'Master bias file not found: {path_to_bias}')
+
+    def flat_correction(self, hdul):
+        """Apply flat field correction to science frame."""
+        # get image filter
+        image_filter = hdul[0].header.get('FILTER', 'unknown')
+        path_to_flat = os.path.join(self.workdir, self.masterflat)
+        if not os.path.exists(path_to_flat):
+            self.logger.warning(
+                'Default master flat not found. Trying to guess...')
+            path_to_flat = os.path.join(
+                self.workdir, f'master_flat_{image_filter}.fits')
+            if not os.path.exists(path_to_flat):
+                self.logger.critical(
+                    'No master flat file found at %s', path_to_flat)
+                raise FileNotFoundError(
+                    f'Master flat file not found: {path_to_flat}')
+        else:
+            self.logger.info('Using default master flat: %s', path_to_flat)
+
+        master_flat = fits.getdata(path_to_flat)
+        self.logger.debug('Master flat shape: %s', master_flat.shape)
+
+        flat_corrected_data = hdul[0].data / master_flat
+        hdul[0].header['HISTORY'] = 'Flat field corrected'
+        hdul[0].data = flat_corrected_data
+        return hdul
 
     def plot_frame(self, image, file_name):
         """Plot a single frame for visual inspection."""
@@ -134,12 +163,13 @@ class ProcessFrame:
         """Process a single FITS frame."""
         self.logger.info('Processing frame: %s', fits_file)
         with fits.open(fits_file) as hdul:
-            image_data = hdul[0].data
-            header = hdul[0].header
 
             # bias subtraction
-            processed_data = self.bias_subtraction(image_data)
-            self.plot_frame(processed_data, fits_file)
+            processed_data = self.bias_subtraction(hdul)
+            self.plot_frame(processed_data[0].data, fits_file)
+            # flat correction
+            processed_data = self.flat_correction(processed_data)
+            self.plot_frame(processed_data[0].data, fits_file)
 
         if self.save_processed:
             proc_file_name = os.path.join(
