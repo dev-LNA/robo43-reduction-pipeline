@@ -29,7 +29,6 @@ def create_thumbnail(args):
 
     for fits_file in fits_files:
         with fits.open(fits_file) as hdul:
-            title = os.path.basename(fits_file)
             xlabel = f' {hdul[0].header.get("FILTER", "")}'
             xlabel += f' {hdul[0].header.get("OBJECT", "")}'
             data = hdul[0].data
