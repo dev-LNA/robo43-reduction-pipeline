@@ -47,8 +47,10 @@ def parse_arguments():
                         help='Path to the master flat FITS file.')
     parser.add_argument('--save_processed', action='store_true',
                         help='Save processed frames to disk.')
-    parser.add_argument('--np', type=int, default=4,
+    parser.add_argument('--np', type=int, default=1,
                         help='Number of processes for parallel processing.')
+    parser.add_argument('--runtest', action='store_true',
+                        help='Run in test mode with limited files.')
     parser.add_argument('--clobber', action='store_true',
                         help='Overwrite existing output file if it exists.')
     parser.add_argument('--verbose', action='store_true',
@@ -68,6 +70,7 @@ class ProcessFrame:
         self.masterflat = args.masterflat
         self.save_processed = args.save_processed
         self.np = args.np
+        self.runtest = args.runtest
         self.clobber = args.clobber
         self.verbose = args.verbose
         self.logfile = args.logfile
@@ -78,6 +81,7 @@ class ProcessFrame:
         self.object_names_to_guess = {
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula'],
         }
+        self.output_status = {}
 
     def get_fits_files(self):
         fits_files = glob.glob(os.path.join(self.workdir, '*.fits'))
@@ -88,10 +92,17 @@ class ProcessFrame:
             self.logger.debug('FITS file: %s', f)
             proc_file_name = os.path.join(
                 self.output_dir, os.path.basename(f).replace('.fits', '_proc.fits'))
-            if os.path.exists(proc_file_name) and not self.clobber:
-                self.logger.info(
-                    'Some processed files already exist. Use --clobber to overwrite.')
-                sys.exit(1)
+            if os.path.exists(proc_file_name):
+                if self.clobber:
+                    if '_proc' in f:
+                        exclusion_indexes.append(index)
+                        self.logger.debug(
+                            'Will overwrite existing processed file: %s', proc_file_name)
+                else:
+                    self.logger.info(
+                        'Some processed files already exist. Use --clobber to overwrite.')
+                    sys.exit(1)
+
             # selecting only science frames
             header = fits.getheader(f)
             if 'flat' in header.get('OBJECT', '').lower():
@@ -105,7 +116,9 @@ class ProcessFrame:
                 exclusion_indexes.append(index)
 
         fits_files = sorted([f for i, f in enumerate(fits_files)
-                             if i not in exclusion_indexes])
+                             if i not in exclusion_indexes and '_proc' not in f])
+        self.logger.info(
+            'Selected %d science FITS files for processing.', len(fits_files))
 
         return fits_files
 
@@ -189,13 +202,18 @@ class ProcessFrame:
             'RA and DEC not found in header. Querying astrometry.net...')
         # detect photometric sources
         hdul = fits.open(path_to_fits, mode='update')
-        daofind = DAOStarFinder(fwhm=3.0, threshold=5.*np.std(hdul[0].data))
+        daofind = DAOStarFinder(fwhm=3.0, threshold=3.0*np.std(hdul[0].data))
         sources = daofind(hdul[0].data - np.median(hdul[0].data))
         sorted_sources = sources[np.argsort(sources['flux'])[::-1]]
 
         ast = AstrometryNet()
         img_width = hdul[0].header.get('NAXIS1', hdul[0].data.shape[1])
         img_height = hdul[0].header.get('NAXIS2', hdul[0].data.shape[0])
+        if "RA" in hdul[0].header and "DEC" in hdul[0].header:
+            ast.ra = hdul[0].header['RA']
+            ast.dec = hdul[0].header['DEC']
+            ast.radius = 1.0
+
         wcs_header = ast.solve_from_source_list(
             sorted_sources['xcentroid'], sorted_sources['ycentroid'],
             img_width, img_height, solve_timeout=120)
@@ -220,14 +238,14 @@ class ProcessFrame:
         self.plot_frame(hdul[0].data, path_to_fits,
                         sources=sorted_sources, show=True)
 
-        return hdul
+        return
 
     def plot_frame(self, image, file_name, sources=None, show=False):
         """Plot a single frame for visual inspection."""
         plt.figure(figsize=(10, 8))
         plt.imshow(image, cmap='gray', origin='lower', vmin=np.percentile(image, 5),
                    vmax=np.percentile(image, 95))
-        plt.title(os.path.basename(file_name).replace('.fits', ''))
+        title = os.path.basename(file_name).replace('_proc.fits', '')
         plt.colorbar()
 
         if sources is not None and len(sources) > 0:
@@ -236,16 +254,18 @@ class ProcessFrame:
                                   radius=30, color='green', fill=False, lw=3)
                 plt.gca().add_patch(circ)
             png_file_name = file_name.replace('.fits', '_astro.png')
+            title += f' {len(sources)} sources used'
         else:
             png_file_name = file_name.replace('.fits', '_proc.png')
 
+        plt.title(title)
         plt.xlabel('X Pixel')
         plt.ylabel('Y Pixel')
         plt.tight_layout()
         if self.save_processed:
             plt.savefig(png_file_name)
             self.logger.info('Saved plot to: %s', png_file_name)
-            if show:
+            if show and self.np == 1:
                 plt.show()
             else:
                 plt.close()
@@ -284,13 +304,21 @@ class ProcessFrame:
             self.logger.info(
                 'RA and DEC found in header: RA=%s, DEC=%s',
                 processed_data[0].header['RA'], processed_data[0].header['DEC'])
-            processed_data = self.solve_astrometry(proc_path)
+            self.solve_astrometry(proc_path)
 
     def main(self):
         self.logger.info('Starting processing of frames.')
         fits_files = self.get_fits_files()
-        # Process only the first frame for now
-        self.process_frame(fits_files[0])
+
+        if self.np > 1:
+            with Pool(processes=self.np) as pool:
+                pool.map(self.process_frame, fits_files)
+        else:
+            if self.runtest:
+                fits_files = fits_files[:2]
+            else:
+                for fits_file in fits_files:
+                    self.process_frame(fits_file)
 
 
 if __name__ == '__main__':
