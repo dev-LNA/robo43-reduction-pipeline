@@ -7,6 +7,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astroquery.simbad import Simbad
 from astroquery.astrometry_net import AstrometryNet
+from photutils.detection import DAOStarFinder
 from multiprocessing import Pool
 import matplotlib.pyplot as plt
 import glob
@@ -186,26 +187,36 @@ class ProcessFrame:
     def solve_astrometry(self, path_to_fits):
         self.logger.info(
             'RA and DEC not found in header. Querying astrometry.net...')
-        ast = AstrometryNet()
+        # detect photometric sources
+        hdul = fits.open(path_to_fits, mode='update')
+        daofind = DAOStarFinder(fwhm=3.0, threshold=5.*np.std(hdul[0].data))
+        sources = daofind(hdul[0].data - np.median(hdul[0].data))
+        sorted_sources = sources[np.argsort(sources['flux'])[::-1]]
 
-        wcs_header = ast.solve_from_image(path_to_fits,
-                                          # force_image_upload=True,
-                                          ra_key='RA',
-                                          dec_key='DEC',
-                                          ra_dec_units=('deg', 'deg'),
-                                          fwhm=3.0,
-                                          detect_threshold=2)
-        hdul = fits.open(path_to_fits)
-        import pdb
-        pdb.set_trace()
+        ast = AstrometryNet()
+        img_width = hdul[0].header.get('NAXIS1', hdul[0].data.shape[1])
+        img_height = hdul[0].header.get('NAXIS2', hdul[0].data.shape[0])
+        wcs_header = ast.solve_from_source_list(
+            sorted_sources['xcentroid'], sorted_sources['ycentroid'],
+            img_width, img_height, solve_timeout=120)
+
+        # NOTE: Alternative method using image upload does not work.
+        # Connection errors occur frequently and all attempts failed.
+        # wcs_header = ast.solve_from_image(path_to_fits,
+        #                                   # force_image_upload=True,
+        #                                   ra_key='RA',
+        #                                   dec_key='DEC',
+        #                                   ra_dec_units=('deg', 'deg'),
+        #                                   fwhm=3.0,
+        # detect_threshold = 2)
         if wcs_header:
             wcs = WCS(wcs_header)
             hdul[0].header.update(wcs.to_header())
             self.logger.info('Astrometry solved and WCS updated in header.')
         else:
             self.logger.error('Astrometry solving failed.')
-
-        return hdul
+        hdul.flush()
+        return hdul, sources
 
     def plot_frame(self, image, file_name):
         """Plot a single frame for visual inspection."""
