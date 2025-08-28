@@ -216,9 +216,13 @@ class ProcessFrame:
         else:
             self.logger.error('Astrometry solving failed.')
         hdul.flush()
-        return hdul, sources
 
-    def plot_frame(self, image, file_name):
+        self.plot_frame(hdul[0].data, path_to_fits,
+                        sources=sorted_sources, show=True)
+
+        return hdul
+
+    def plot_frame(self, image, file_name, sources=None, show=False):
         """Plot a single frame for visual inspection."""
         plt.figure(figsize=(10, 8))
         plt.imshow(image, cmap='gray', origin='lower', vmin=np.percentile(image, 5),
@@ -226,10 +230,25 @@ class ProcessFrame:
         plt.title(os.path.basename(file_name).replace('.fits', ''))
         plt.colorbar()
 
-        if self.save_processed:
+        if sources is not None and len(sources) > 0:
+            for source in sources:
+                circ = plt.Circle((source['xcentroid'], source['ycentroid']),
+                                  radius=30, color='green', fill=False, lw=3)
+                plt.gca().add_patch(circ)
+            png_file_name = file_name.replace('.fits', '_astro.png')
+        else:
             png_file_name = file_name.replace('.fits', '_proc.png')
+
+        plt.xlabel('X Pixel')
+        plt.ylabel('Y Pixel')
+        plt.tight_layout()
+        if self.save_processed:
             plt.savefig(png_file_name)
             self.logger.info('Saved plot to: %s', png_file_name)
+            if show:
+                plt.show()
+            else:
+                plt.close()
         else:
             plt.show()
 
@@ -267,16 +286,11 @@ class ProcessFrame:
                 processed_data[0].header['RA'], processed_data[0].header['DEC'])
             processed_data = self.solve_astrometry(proc_path)
 
-        import pdb
-        pdb.set_trace()
-
     def main(self):
         self.logger.info('Starting processing of frames.')
         fits_files = self.get_fits_files()
         # Process only the first frame for now
         self.process_frame(fits_files[0])
-        import pdb
-        pdb.set_trace()
 
 
 if __name__ == '__main__':
