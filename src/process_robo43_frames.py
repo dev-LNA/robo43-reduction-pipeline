@@ -5,6 +5,8 @@ import sys
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
+from astroquery.simbad import Simbad
+from astroquery.astrometry_net import AstrometryNet
 from multiprocessing import Pool
 import matplotlib.pyplot as plt
 import glob
@@ -72,6 +74,10 @@ class ProcessFrame:
         self.logger.info(
             'Initialized ProcessFrame with workdir: %s', self.workdir)
 
+        self.object_names_to_guess = {
+            'eta car': ['etacar', 'eta carinae', 'etaCarNebula'],
+        }
+
     def get_fits_files(self):
         fits_files = glob.glob(os.path.join(self.workdir, '*.fits'))
         self.logger.info('Found %d FITS files in %s',
@@ -97,8 +103,8 @@ class ProcessFrame:
                 self.logger.debug('Excluded bias frame: %s', f)
                 exclusion_indexes.append(index)
 
-        fits_files = [f for i, f in enumerate(fits_files)
-                      if i not in exclusion_indexes]
+        fits_files = sorted([f for i, f in enumerate(fits_files)
+                             if i not in exclusion_indexes])
 
         return fits_files
 
@@ -144,6 +150,63 @@ class ProcessFrame:
         hdul[0].data = flat_corrected_data
         return hdul
 
+    def guess_ra_dec(self, proc_path):
+        """Guess to get RA and DEC if not present using OBJECT."""
+        hdul = fits.open(proc_path, mode='update')
+        if 'RA' in hdul[0].header and 'DEC' in hdul[0].header:
+            self.logger.debug('RA and DEC already present in header.')
+            return hdul
+
+        object_name = hdul[0].header.get('OBJECT', '').strip()
+        for key, aliases in self.object_names_to_guess.items():
+            if object_name.lower() in aliases:
+                object_name = key
+                break
+
+        if object_name:
+            self.logger.info(
+                'Attempting to resolve OBJECT name: %s', object_name)
+            try:
+                result = Simbad.query_object(object_name)
+                # update header with RA and DEC
+                hdul[0].header['RA'] = (
+                    result['ra'][0], 'Right Ascension from SIMBAD')
+                hdul[0].header['DEC'] = (
+                    result['dec'][0], 'Declination from SIMBAD')
+                self.logger.info('Resolved RA: %s, DEC: %s', ra, dec)
+            except Exception as e:
+                self.logger.error(
+                    'Error querying SIMBAD: %s. Falling back to astrometry.net.', str(e))
+        else:
+            self.logger.warning('No OBJECT name found in header.')
+
+        hdul.flush()
+        return hdul
+
+    def solve_astrometry(self, path_to_fits):
+        self.logger.info(
+            'RA and DEC not found in header. Querying astrometry.net...')
+        ast = AstrometryNet()
+
+        wcs_header = ast.solve_from_image(path_to_fits,
+                                          # force_image_upload=True,
+                                          ra_key='RA',
+                                          dec_key='DEC',
+                                          ra_dec_units=('deg', 'deg'),
+                                          fwhm=3.0,
+                                          detect_threshold=2)
+        hdul = fits.open(path_to_fits)
+        import pdb
+        pdb.set_trace()
+        if wcs_header:
+            wcs = WCS(wcs_header)
+            hdul[0].header.update(wcs.to_header())
+            self.logger.info('Astrometry solved and WCS updated in header.')
+        else:
+            self.logger.error('Astrometry solving failed.')
+
+        return hdul
+
     def plot_frame(self, image, file_name):
         """Plot a single frame for visual inspection."""
         plt.figure(figsize=(10, 8))
@@ -162,8 +225,14 @@ class ProcessFrame:
     def process_frame(self, fits_file):
         """Process a single FITS frame."""
         self.logger.info('Processing frame: %s', fits_file)
-        with fits.open(fits_file) as hdul:
+        proc_path = os.path.join(
+            self.output_dir, os.path.basename(fits_file).replace('.fits', '_proc.fits'))
+        if os.path.exists(proc_path) and not self.clobber:
+            self.logger.info(
+                'Processed file already exists: %s. Skipping.', proc_path)
+            return
 
+        with fits.open(fits_file) as hdul:
             # bias subtraction
             processed_data = self.bias_subtraction(hdul)
             self.plot_frame(processed_data[0].data, fits_file)
@@ -174,9 +243,21 @@ class ProcessFrame:
         if self.save_processed:
             proc_file_name = os.path.join(
                 self.output_dir, os.path.basename(fits_file).replace('.fits', '_proc.fits'))
-            fits.writeto(proc_file_name, processed_data, header,
-                         overwrite=self.clobber)
+            processed_data.writeto(proc_file_name, overwrite=self.clobber)
             self.logger.info('Saved processed frame to: %s', proc_file_name)
+
+        if 'RA' not in processed_data[0].header or 'DEC' not in processed_data[0].header:
+            self.logger.info('RA/DEC missing, attempting to guess.')
+            processed_data = self.guess_ra_dec(proc_path)
+
+        if 'RA' in processed_data[0].header and 'DEC' in processed_data[0].header:
+            self.logger.info(
+                'RA and DEC found in header: RA=%s, DEC=%s',
+                processed_data[0].header['RA'], processed_data[0].header['DEC'])
+            processed_data = self.solve_astrometry(proc_path)
+
+        import pdb
+        pdb.set_trace()
 
     def main(self):
         self.logger.info('Starting processing of frames.')
