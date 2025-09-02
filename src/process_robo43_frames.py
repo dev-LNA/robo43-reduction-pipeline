@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.wcs import WCS
+import astroquery
 from astroquery.simbad import Simbad
 from astroquery.astrometry_net import AstrometryNet
 from photutils.detection import DAOStarFinder
@@ -59,7 +60,7 @@ def parse_arguments():
                         help='Attempt to solve astrometry for processed frames.')
     parser.add_argument('--sigma_clip', type=float, default=3.0,
                         help='Sigma clipping value for source detection.')
-    parser.add_argument('--object', type=str, default=None,
+    parser.add_argument('--object_name', type=str, default=None,
                         help='Name of the target object to select images to process.')
     parser.add_argument('--runtest', action='store_true',
                         help='Run in test mode with limited files.')
@@ -67,6 +68,8 @@ def parse_arguments():
                         help='Overwrite existing output file if it exists.')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose logging.')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging and stops when fail.')
     parser.add_argument('--logfile', type=str,
                         help='File to log output messages.')
 
@@ -84,10 +87,11 @@ class ProcessFrame:
         self.np = args.np
         self.solve_astrometry = args.solve_astrometry
         self.sigma_clip = args.sigma_clip
-        self.object_name = args.object
+        self.object_name = args.object_name
         self.runtest = args.runtest
         self.clobber = args.clobber
         self.verbose = args.verbose
+        self.debug = args.debug
         self.logfile = args.logfile
         self.logger = setup_logging(self.verbose, self.logfile)
         self.logger.info(
@@ -165,6 +169,10 @@ class ProcessFrame:
                 self.logger.error(
                     'Error reading master bias file: %s', str(e))
                 self.proc_status[raw_name]['proc_status'] = 'Bias subtraction failed'
+                self.proc_status[raw_name]['proc_code'] = 2
+                if self.debug:
+                    import pdb
+                    pdb.set_trace()
                 raise e from e
         else:
             self.logger.critical(
@@ -215,6 +223,12 @@ class ProcessFrame:
         except Exception as e:
             self.logger.error('Error during flat correction: %s', str(e))
             self.proc_status[raw_name]['proc_status'] = 'Flat correction failed'
+            if self.debug:
+                _brake_point = 1
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return hdul
 
     def guess_ra_dec(self, proc_path, raw_path):
@@ -261,6 +275,12 @@ class ProcessFrame:
                     'Error querying SIMBAD: %s.', str(e))
                 self.proc_status[raw_name]['proc_status'] = 'RA/DEC guessing failed'
                 self.proc_status[raw_name]['proc_code'] = 11
+                if self.debug:
+                    _brake_point = 3
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
         else:
             self.logger.warning('No OBJECT name found in header.')
             self.proc_status[raw_name]['proc_status'] = 'RA/DEC guessing failed'
@@ -286,6 +306,12 @@ class ProcessFrame:
                                             'DEC', None),
                                         radius_deg=1.0),
                                     solution_parameters=astrometry.SolutionParameters())
+            if self.debug:
+                _brake_point = 47
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             if solution.has_match():
                 wcs_header = solution.best_match().astropy_wcs()
                 stars_used = {'ra': [obj.ra_deg for obj in solution.best_match().stars],
@@ -294,35 +320,157 @@ class ProcessFrame:
                     'Astrometry solved using local index files.')
                 self.proc_status[raw_name]['proc_status'] = 'Astrometry solved'
                 self.proc_status[raw_name]['proc_code'] = 59
+
                 return wcs_header, stars_used
 
-    def run_astrometry_solver2(self, sorted_sources, hdul, raw_name):
+            elif not solution.has_match() and self.debug:
+                _brake_point = 5
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
+
+    def run_astrometry_solver2(self, sorted_sources, hdul, raw_name, force_image_upload=False):
         ast = AstrometryNet()
         img_width = hdul[0].header.get('NAXIS1', hdul[0].data.shape[1])
         img_height = hdul[0].header.get('NAXIS2', hdul[0].data.shape[0])
+        path_to_fits = os.path.join(
+            self.output_dir, os.path.basename(raw_name).replace('.fits', '_proc.fits'))
         if self.proc_status[raw_name]['proc_code'] == 7:
             ast.ra = hdul[0].header['RA']
             ast.dec = hdul[0].header['DEC']
             ast.radius = 1.0
 
-        try:
-            wcs_header = ast.solve_from_source_list(
-                sorted_sources['xcentroid'], sorted_sources['ycentroid'],
-                img_width, img_height, solve_timeout=120)
+        try_again = True
+        submission_id = None
+        wcs_header = None
+        i = 0
+        while try_again:
+            if force_image_upload:
+                self.logger.info(
+                    'Forcing image upload method for astrometry solving.')
+                try:
+                    if not submission_id:
+                        wcs_header = ast.solve_from_image(path_to_fits,
+                                                          force_image_upload=True,
+                                                          ra_key='RA',
+                                                          dec_key='DEC',
+                                                          ra_dec_units=(
+                                                              'degree', 'degree'),
+                                                          fwhm=2.0,
+                                                          detect_threshold=2,
+                                                          submission_id=submission_id)
+                    else:
+                        self.logger.info(
+                            'Checking status of previous submission ID: %s', submission_id)
+                        wcs_header = ast.monitor_submission(
+                            submission_id, solve_timeout=120)
+                except Exception as e:
+                    self.logger.warning(
+                        'Astrometry solving timed out or connection error: %s. Retrying...', str(e))
+                    if self.debug:
+                        _brake_point = 71
+                        self.logger.debug(
+                            'Entering debug mode at brake point %i' % _brake_point)
+                        import pdb
+                        pdb.set_trace()
+                    if isinstance(e, astroquery.exceptions.TimeoutError):
+                        submission_id = e.args[1]
+                        i += 1
+                    else:
+                        submission_id = None
+                        try_again = False
+                else:
+                    try_again = False
+                    continue
+            else:
+                self.logger.info(
+                    'Attempting astrometry solving via source list upload.')
+                try:
+                    if not submission_id:
+                        wcs_header = ast.solve_from_source_list(
+                            sorted_sources['xcentroid'], sorted_sources['ycentroid'],
+                            img_width, img_height, solve_timeout=120,
+                            submission_id=submission_id)
+                    else:
+                        self.logger.info(
+                            'Checking status of previous submission ID: %s', submission_id)
+                        wcs_header = ast.monitor_submission(
+                            submission_id, solve_timeout=120)
+                except Exception as e:
+                    self.logger.warning(
+                        'Astrometry solving timed out or connection error: %s. Retrying...', str(e))
+                    if self.debug:
+                        _brake_point = 72
+                        self.logger.debug(
+                            'Entering debug mode at brake point %i' % _brake_point)
+                        import pdb
+                        pdb.set_trace()
+                    if isinstance(e, astroquery.exceptions.TimeoutError):
+                        submission_id = e.args[1]
+                        i += 1
+                    else:
+                        submission_id = None
+                        try_again = False
+                else:
+                    try_again = False
+                    continue
+            if i >= 2:
+                self.logger.error(
+                    'Maximum retry attempts reached for astrometry solving.')
+                try_again = False
+
+        if wcs_header:
             self.logger.info('Astrometry solving completed.')
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solved'
             self.proc_status[raw_name]['proc_code'] = 59
-        except Exception as e:
-            self.logger.error('Astrometry solving failed: %s', str(e))
+            return wcs_header, sorted_sources
+        else:
+            self.logger.error('Astrometry solving failed.')
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
             self.proc_status[raw_name]['proc_code'] = 27
-            return None, e
-        return wcs_header, sorted_sources
+            if self.debug:
+                _brake_point = 9
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
+            return None, None
+        # if force_image_upload:
+        #     # NOTE: Alternative method using image upload does not work.
+        #     # Connection errors occur frequently and all attempts failed.
+        #     wcs_header = ast.solve_from_image(path_to_fits,
+        #                                       force_image_upload=True,
+        #                                       ra_key='RA',
+        #                                       dec_key='DEC',
+        #                                       ra_dec_units=(
+        #                                           'degree', 'degree'),
+        #                                       fwhm=2.0,
+        #                                       detect_threshold=2)
+        # else:
+        #     try:
+        #         wcs_header = ast.solve_from_source_list(
+        #             sorted_sources['xcentroid'], sorted_sources['ycentroid'],
+        #             img_width, img_height, solve_timeout=120)
+        #         self.logger.info('Astrometry solving completed.')
+        #         self.proc_status[raw_name]['proc_status'] = 'Astrometry solved'
+        #         self.proc_status[raw_name]['proc_code'] = 59
+        #     except Exception as e:
+        #         self.logger.error('Astrometry solving failed: %s', str(e))
+        #         self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
+        #         self.proc_status[raw_name]['proc_code'] = 27
+        #         if self.debug:
+        #             _brake_point = 7
+        #             self.logger.debug(
+        #                 'Entering debug mode at brake point %i' % _brake_point)
+        #             import pdb
+        #             pdb.set_trace()
+        #         return None, e
 
     def run_daofinder(self, hdul):
         try:
             daofind = DAOStarFinder(
-                fwhm=3.0, threshold=self.sigma_clip * np.std(hdul[0].data))
+                fwhm=2.0, threshold=self.sigma_clip * np.std(hdul[0].data))
             sources = daofind(hdul[0].data - np.median(hdul[0].data))
             sorted_sources = sources[np.argsort(sources['flux'])[::-1]]
             self.logger.info(
@@ -332,6 +480,12 @@ class ProcessFrame:
             self.logger.error('Error detecting sources: %s', str(e))
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
             self.proc_status[raw_name]['proc_code'] = 27
+            if self.debug:
+                _brake_point = 11
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return e
 
     def solver_astrometry(self, path_to_fits, raw_path):
@@ -350,6 +504,12 @@ class ProcessFrame:
             self.logger.error('Error opening FITS file: %s', str(e))
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
             self.proc_status[raw_name]['proc_code'] = 27
+            if self.debug:
+                _brake_point = 13
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return
 
         sorted_sources = self.run_daofinder(hdul)
@@ -357,6 +517,12 @@ class ProcessFrame:
             self.logger.error('No sources detected, cannot solve astrometry.')
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
             self.proc_status[raw_name]['proc_code'] = 27
+            if self.debug:
+                _brake_point = 17
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return
 
         solver_used = 0
@@ -370,21 +536,37 @@ class ProcessFrame:
         except Exception as e:
             self.logger.warning(
                 'Local astrometry solving failed: %s. Trying Astrometry.net service.', str(e))
+            if self.debug:
+                _brake_point = 19
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
 
         if not astrometry_solved:
             wcs_header, stars_used = self.run_astrometry_solver2(
                 sorted_sources, hdul, raw_name)
             solver_used = 2
 
-        # NOTE: Alternative method using image upload does not work.
-        # Connection errors occur frequently and all attempts failed.
-        # wcs_header = ast.solve_from_image(path_to_fits,
-        #                                   # force_image_upload=True,
-        #                                   ra_key='RA',
-        #                                   dec_key='DEC',
-        #                                   ra_dec_units=('deg', 'deg'),
-        #                                   fwhm=3.0,
-        # detect_threshold = 2)
+        if self.debug and wcs_header is None:
+            _brake_point = 23
+            self.logger.debug(
+                'Entering debug mode at brake point %i' % _brake_point)
+            import pdb
+            pdb.set_trace()
+            # try forcing image upload
+            wcs_header, stars_used = self.run_astrometry_solver2(
+                sorted_sources, hdul, raw_name, force_image_upload=True)
+            if wcs_header is None:
+                self.logger.error('Both astrometry solving methods failed.')
+                if self.debug:
+                    _brake_point = 31
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
+                return
+
         if wcs_header:
             try:
                 if solver_used == 1:
@@ -405,11 +587,23 @@ class ProcessFrame:
                     'Error updating WCS in header: %s', str(e))
                 self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
                 self.proc_status[raw_name]['proc_code'] = 59
+                if self.debug:
+                    _brake_point = 23
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
                 return
         else:
             self.logger.error('Astrometry solving failed.')
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
             self.proc_status[raw_name]['proc_code'] = 59
+            if self.debug:
+                _brake_point = 29
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return
 
         hdul.flush()
@@ -583,7 +777,7 @@ class ProcessFrame:
                 with Pool(processes=self.np) as pool:
                     pool.map(self.process_frame, fits_files)
             else:
-                for fits_file in fits_files[:2]:
+                for fits_file in fits_files:
                     self.process_frame(fits_file)
         self.organize_proc_status()
         self.logger.info('Processing completed.')
