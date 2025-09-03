@@ -1,16 +1,13 @@
 #!/bin/python3
 
 import os
+import glob
+import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clip
-from astropy.convolution import Gaussian2DKernel, interpolate_replace_nans
-import numpy as np
-import ccdproc as ccdp
-# from scipy.ndimage import median_filter
-import glob
+import matplotlib.pyplot as plt
 import argparse
 import logging
-import matplotlib.pyplot as plt
 
 
 def parse_args():
@@ -107,6 +104,7 @@ class CalibrationMaker:
 
     def create_master_dark(self, filelist):
         self.logger.info('Creating master dark frame...')
+        # TODO: implement dark frame creation
         dark_frames = []
         for filename in filelist:
             self.logger.debug(f'Reading {filename}')
@@ -114,9 +112,6 @@ class CalibrationMaker:
                 dark_frames.append(hdul[0].data)
         master_dark = np.median(dark_frames, axis=0)
         return master_dark
-
-    def inv_median(self, arr):
-        return 1.0 / np.median(arr)
 
     def create_master_flat(self, filelist, filters_list):
         self.logger.info('Creating master flat frame...')
@@ -246,10 +241,6 @@ class CalibrationMaker:
             master_frame = self.create_master_flat(filelist, filters_list)
             self.plot_frame(master_frame)
 
-        # self.logger.info(
-        #     f'Saving master {self.cal_type} frame to {self.master_filename}')
-        # hdu = fits.PrimaryHDU(master_frame)
-        # hdu.writeto(self.master_filename, overwrite=self.clobber)
         self.logger.info('Done!')
 
 
