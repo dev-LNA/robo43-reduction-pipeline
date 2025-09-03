@@ -5,11 +5,9 @@ import sys
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
-from astropy.nddata import Cutout2D
 import matplotlib.pyplot as plt
 from reproject import reproject_interp
 from scipy.ndimage import gaussian_filter
-from astropy.convolution import convolve, Gaussian2DKernel
 import glob
 import argparse
 import gc
@@ -79,7 +77,6 @@ class CoaddFrames:
         wcs0 = WCS(header0)
         data_stack = [fits.getdata(files[0])]
         exptimes = []
-        # files = files[:5]
         i = 1
         for f in files[1:]:
             with fits.open(f) as hdul:
