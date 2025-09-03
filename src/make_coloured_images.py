@@ -25,10 +25,18 @@ def parse_arguments():
                         required=True, help='List of FITS files for green channel.')
     parser.add_argument('--r_channel', type=str, nargs='+',
                         required=True, help='List of FITS files for red channel.')
+    parser.add_argument('--object_name', type=str, default='myobject',
+                        help='Name of the OBJECT to select frames.')
     parser.add_argument('--stretch', type=float, default=1.0,
                         help='Stretch factor for contrast enhancement.')
     parser.add_argument('--clip', type=float, default=0.01,
                         help='Clipping factor for contrast enhancement.')
+    parser.add_argument('--low_perc', type=float, default=5.0,
+                        help='Low percentile for scaling the image.')
+    parser.add_argument('--up_perc', type=float, default=99.0,
+                        help='High percentile for scaling the image.')
+    parser.add_argument('--smooth_factor', type=float, default=20.0,
+                        help='Smoothing factor for the coloured image.')
     parser.add_argument('--save_output', action='store_true',
                         help='Save the output coloured image to file.')
     parser.add_argument('--degrade_psf', action='store_true',
@@ -45,8 +53,12 @@ class ColouredImageMaker:
         self.b_channel_files = args.b_channel
         self.g_channel_files = args.g_channel
         self.r_channel_files = args.r_channel
+        self.object_name = args.object_name
         self.stretch = args.stretch
         self.clip = args.clip
+        self.low_perc = args.low_perc
+        self.up_perc = args.up_perc
+        self.smooth_factor = args.smooth_factor
         self.save_output = args.save_output
         self.degrade_psf = args.degrade_psf
         self.verbose = args.verbose
@@ -124,27 +136,19 @@ class ColouredImageMaker:
             else:
                 wcs_ref = WCS(ref_header)
                 data_stack = []
-                exptimes = []
                 for f in files:
                     if '_reproj' not in os.path.basename(f):
                         with fits.open(f) as hdul:
                             data = hdul[0].data
                             wcs = WCS(hdul[0].header)
-                            # exptime = hdul[0].header.get('EXPTIME', 1.0)
-                            # exptimes.append(exptime)
                             data, _ = reproject_interp(
                                 (data, wcs), wcs_ref, shape_out=data.shape)
                             data_stack.append(data)
                     else:
                         with fits.open(f) as hdul:
                             data = hdul[0].data
-                            # exptime = hdul[0].header.get('EXPTIME', 1.0)
-                            # exptimes.append(exptime)
                             data_stack.append(data)
                 data_stack = np.array(data_stack)
-                # exptimes = np.array(exptimes)
-                # weighted_data = np.average(
-                #     data_stack, axis=0, weights=exptimes)
                 weighted_data = np.nanmedian(data_stack, axis=0)
                 hdu = fits.PrimaryHDU(weighted_data, header=ref_header)
                 hduls_list[band].append(hdu)
@@ -193,13 +197,14 @@ class ColouredImageMaker:
 
     def plot_and_save(self, b_data, g_data, r_data, hdul):
         """Plot and save the coloured image for the correspondent colour at each channel."""
-        lupton_path = os.path.join(self.output_dir, 'ETACARNEBULA_rgb.png')
+        lupton_path = os.path.join(
+            self.output_dir, self.object_name.upper() + '_coloured.png')
         print("Saving coloured image to", lupton_path)
         b_data = b_data / np.nanmedian(b_data)
         g_data = g_data / np.nanmedian(g_data)
         r_data = r_data / np.nanmedian(r_data)
         low_val, up_val = np.nanpercentile(
-            np.concatenate([r_data, g_data, b_data]), [1.0, 95.0])
+            np.concatenate([r_data, g_data, b_data]), [self.low_perc, self.up_perc])
         stretch_val = up_val - low_val
         print("Using low, stretch values:", low_val, stretch_val)
 
@@ -208,7 +213,7 @@ class ColouredImageMaker:
                                     b_data,
                                     minimum=low_val,
                                     stretch=stretch_val,
-                                    Q=20,
+                                    Q=self.smooth_factor,
                                     filename=lupton_path if self.save_output else None)
 
         plt.figure(figsize=(10, 8))
@@ -230,6 +235,13 @@ class ColouredImageMaker:
         b_files = self.select_images_per_channel(self.b_channel_files)
         g_files = self.select_images_per_channel(self.g_channel_files)
         r_files = self.select_images_per_channel(self.r_channel_files)
+        save_config = open(os.path.join(
+            self.output_dir, f'{self.object_name}_config.txt'), 'w')
+        save_config.write(f"Object: {self.object_name}\n")
+        save_config.write(f"Blue channel files: {b_files}\n")
+        save_config.write(f"Green channel files: {g_files}\n")
+        save_config.write(f"Red channel files: {r_files}\n")
+        save_config.close()
 
         files_per_channel = {
             'B': b_files,
