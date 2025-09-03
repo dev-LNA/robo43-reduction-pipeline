@@ -183,7 +183,6 @@ class ProcessFrame:
 
     def flat_correction(self, hdul, raw_file):
         """Apply flat field correction to science frame."""
-        # get image filter
         image_filter = hdul[0].header.get('FILTER', 'unknown')
         path_to_flat = os.path.join(self.workdir, self.masterflat)
         raw_name = os.path.basename(raw_file)
@@ -436,38 +435,8 @@ class ProcessFrame:
                 import pdb
                 pdb.set_trace()
             return None, None
-        # if force_image_upload:
-        #     # NOTE: Alternative method using image upload does not work.
-        #     # Connection errors occur frequently and all attempts failed.
-        #     wcs_header = ast.solve_from_image(path_to_fits,
-        #                                       force_image_upload=True,
-        #                                       ra_key='RA',
-        #                                       dec_key='DEC',
-        #                                       ra_dec_units=(
-        #                                           'degree', 'degree'),
-        #                                       fwhm=2.0,
-        #                                       detect_threshold=2)
-        # else:
-        #     try:
-        #         wcs_header = ast.solve_from_source_list(
-        #             sorted_sources['xcentroid'], sorted_sources['ycentroid'],
-        #             img_width, img_height, solve_timeout=120)
-        #         self.logger.info('Astrometry solving completed.')
-        #         self.proc_status[raw_name]['proc_status'] = 'Astrometry solved'
-        #         self.proc_status[raw_name]['proc_code'] = 59
-        #     except Exception as e:
-        #         self.logger.error('Astrometry solving failed: %s', str(e))
-        #         self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
-        #         self.proc_status[raw_name]['proc_code'] = 27
-        #         if self.debug:
-        #             _brake_point = 7
-        #             self.logger.debug(
-        #                 'Entering debug mode at brake point %i' % _brake_point)
-        #             import pdb
-        #             pdb.set_trace()
-        #         return None, e
 
-    def run_daofinder(self, hdul):
+    def run_daofinder(self, hdul, raw_name):
         try:
             daofind = DAOStarFinder(
                 fwhm=2.0, threshold=self.sigma_clip * np.std(hdul[0].data))
@@ -512,7 +481,7 @@ class ProcessFrame:
                 pdb.set_trace()
             return
 
-        sorted_sources = self.run_daofinder(hdul)
+        sorted_sources = self.run_daofinder(hdul, raw_name)
         if sorted_sources is None:
             self.logger.error('No sources detected, cannot solve astrometry.')
             self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
