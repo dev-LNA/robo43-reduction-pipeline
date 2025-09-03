@@ -53,7 +53,7 @@ class CoaddFrames:
         files_list = glob.glob(os.path.join(self.workdir, "*_proc.fits"))
         for f in files_list:
             if os.path.isfile(f.replace(".fits", "_astro.png")):
-                if self.object_name == fits.getheader(f).get('OBJECT', None).lower():
+                if self.object_name.lower() == fits.getheader(f).get('OBJECT', None).lower():
                     selected_files.append(f)
 
         if not selected_files:
