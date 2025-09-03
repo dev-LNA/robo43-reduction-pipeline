@@ -125,6 +125,8 @@ class CoaddFrames:
         title = f"Coadded of {self.object_name}"
         title += f"\n(N = {hdul[0].header.get('NCOMBINE', 'N/A')},"
         title += F"TEXPTIME={hdul[0].header.get('TEXPTIME', 'N/A')}s)"
+        ax.set_title(title)
+        plt.grid(color='white', ls='dotted')
         if self.save_plot:
             plot_filename = os.path.join(
                 self.workdir,
