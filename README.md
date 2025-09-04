@@ -26,4 +26,4 @@ Module ``make_coloured_images.py'' creates coloured images from the processed sc
 ## Example
 
 The following example image from the Eta Car Nebula was obtained using the ROBO43 telescope and processed using this pipeline:
-![Eta Car Nebula](ETACARNEBULA_rgb.png)
+![Eta Car Nebula](img/ETACARNEBULA_rgb.png)
