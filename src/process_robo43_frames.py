@@ -282,7 +282,8 @@ class ProcessFrame:
 
         object_name = hdul[0].header.get('OBJECT', '').strip()
         for key, aliases in self.object_names_to_guess.items():
-            if object_name.lower() in aliases:
+            _aliases = [alias.lower() for alias in aliases]
+            if object_name.lower() in _aliases:
                 object_name = key
                 break
 
@@ -324,7 +325,13 @@ class ProcessFrame:
     def run_astrometry_solver1(self, sorted_sources, hdul, raw_name):
         with astrometry.Solver(
             astrometry.series_5200.index_files(
-                cache_directory="/home/herpich/Documents/.astrometry", scales={6})
+                cache_directory="/home/herpich/Documents/.astrometry",
+                scales={3, 4, 5, 6},
+            )
+            + astrometry.series_4100.index_files(
+                cache_directory="/home/herpich/Documents/.astrometry",
+                scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
+            )
         ) as solver:
             stars = [(st['xcentroid'], st['ycentroid'])
                      for st in sorted_sources]
@@ -390,7 +397,8 @@ class ProcessFrame:
                                                           ra_dec_units=(
                                                               'degree', 'degree'),
                                                           fwhm=2.0,
-                                                          detect_threshold=2,
+                                                          detect_threshold=3,
+                                                          solve_timeout=300,
                                                           submission_id=submission_id)
                     else:
                         self.logger.info(
@@ -422,7 +430,7 @@ class ProcessFrame:
                     if not submission_id:
                         wcs_header = ast.solve_from_source_list(
                             sorted_sources['xcentroid'], sorted_sources['ycentroid'],
-                            img_width, img_height, solve_timeout=120,
+                            img_width, img_height, solve_timeout=300,
                             submission_id=submission_id)
                     else:
                         self.logger.info(
