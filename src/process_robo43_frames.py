@@ -11,6 +11,7 @@ import astroquery
 from astroquery.simbad import Simbad
 from astroquery.astrometry_net import AstrometryNet
 from photutils.detection import DAOStarFinder
+from sewpy import SEW
 import astrometry
 from multiprocessing import Pool
 import matplotlib.pyplot as plt
@@ -59,7 +60,9 @@ def parse_arguments():
                         help='Number of processes for parallel processing.')
     parser.add_argument('--solve_astrometry', action='store_true',
                         help='Attempt to solve astrometry for processed frames.')
-    parser.add_argument('--sigma_clip', type=float, default=3.0,
+    parser.add_argument('--min_sources', type=int, default=10,
+                        help='Minimum number of sources required for astrometry solving.')
+    parser.add_argument('--sigma_clip', type=float, default=5.0,
                         help='Sigma clipping value for source detection.')
     parser.add_argument('--object_name', type=str, default=None,
                         help='Name of the target object to select images to process.')
@@ -87,6 +90,7 @@ class ProcessFrame:
         self.save_processed = args.save_processed
         self.np = args.np
         self.solve_astrometry = args.solve_astrometry
+        self.min_sources = args.min_sources
         self.sigma_clip = args.sigma_clip
         self.object_name = args.object_name
         self.runtest = args.runtest
@@ -94,9 +98,8 @@ class ProcessFrame:
         self.verbose = args.verbose
         self.debug = args.debug
         self.logfile = args.logfile
-        self.logger = setup_logging(self.verbose, self.logfile)
-        self.logger.info(
-            'Initialized ProcessFrame with workdir: %s', self.workdir)
+
+        self.files_path = os.path.dirname(os.path.abspath(__file__))
 
         self.object_names_to_guess = {
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula', 'etacarnebula'],
@@ -107,6 +110,10 @@ class ProcessFrame:
             'flat', 'dark', 'bias', 'trash'
         ]
         self.proc_status = {}
+
+        self.logger = setup_logging(self.verbose, self.logfile)
+        self.logger.info(
+            'Initialized ProcessFrame with workdir: %s', self.workdir)
 
     def get_fits_files(self):
         fits_files = glob.glob(os.path.join(self.workdir, '*.fits'))
@@ -477,10 +484,10 @@ class ProcessFrame:
                 pdb.set_trace()
             return None, None
 
-    def run_daofinder(self, hdul, raw_name):
+    def run_daofinder(self, hdul, raw_name, fwhm=2.0, sigma=3.0):
         try:
             daofind = DAOStarFinder(
-                fwhm=2.0, threshold=self.sigma_clip * np.std(hdul[0].data))
+                fwhm=fwhm, threshold=sigma * np.std(hdul[0].data))
             sources = daofind(hdul[0].data - np.median(hdul[0].data))
             sorted_sources = sources[np.argsort(sources['flux'])[::-1]]
             self.logger.info(
@@ -492,6 +499,59 @@ class ProcessFrame:
             self.proc_status[raw_name]['proc_code'] = 27
             if self.debug:
                 _brake_point = 11
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
+            return e
+
+    def run_sewpy(self, hdul, raw_name):
+        out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
+                      'FLUXERR_AUTO', 'MAG_AUTO', 'MAGERR_AUTO',
+                      'CLASS_STAR']
+        sex_config = {
+            "DETECT_TYPE": "CCD",
+            "DETECT_MINAREA": 4,
+            "DETECT_THRESH": self.sigma_clip,
+            "ANALYSIS_THRESH": 3.0,
+            "FILTER": "Y",
+            "FILTER_NAME": os.path.join(self.files_path, "data/tophat_3.0_3x3.conv"),
+            "DEBLEND_NTHRESH": 64,
+            "DEBLEND_MINCONT": 0.0002,
+            "CLEAN": "Y",
+            "CLEAN_PARAM": 1.0,
+            "MASK_TYPE": "CORRECT",
+            "PHOT_APERTURES": 5.45454545,
+            "PHOT_AUTOPARAMS": '3.0,1.82',
+            "PHOT_PETROPARAMS": '2.0,2.73',
+            "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
+            "SATUR_LEVEL": 1600,
+            "MAG_ZEROPOINT": 20,
+            "MAG_GAMMA": 4.0,
+            "GAIN": 10,
+            "PIXEL_SCALE": 0.55,
+            "SEEING_FWHM": 2.0,
+            "STARNNW_NAME": os.path.join(self.files_path, 'data/default.nnw'),
+            "BACK_SIZE": 54,
+            "BACK_FILTERSIZE": 7,
+            "BACKPHOTO_TYPE": "LOCAL",
+            "BACKPHOTO_THICK": 48,
+            # "CHECKIMAGE_TYPE": "SEGMENTATION",
+            # "CHECKIMAGE_NAME": pathtoseg
+        }
+        sew = SEW(workdir=self.workdir, config=sex_config,
+                  sexpath='source-extractor', params=out_params)
+        try:
+            sources = sew(hdul[0].data)
+            sorted_sources = sorted(
+                sources, key=lambda x: x['FLUX_AUTO'], reverse=True)
+            self.logger.info(
+                'Detected %d sources in the image using SExtractor.', len(sorted_sources))
+            return sorted_sources
+        except Exception as e:
+            self.logger.error('Error running SExtractor: %s', str(e))
+            if self.debug:
+                _brake_point = 83
                 self.logger.debug(
                     'Entering debug mode at brake point %i' % _brake_point)
                 import pdb
@@ -522,18 +582,35 @@ class ProcessFrame:
                 pdb.set_trace()
             return
 
-        sorted_sources = self.run_daofinder(hdul, raw_name)
-        if sorted_sources is None:
-            self.logger.error('No sources detected, cannot solve astrometry.')
-            self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
-            self.proc_status[raw_name]['proc_code'] = 27
-            if self.debug:
-                _brake_point = 17
-                self.logger.debug(
-                    'Entering debug mode at brake point %i' % _brake_point)
-                import pdb
-                pdb.set_trace()
-            return
+        _try_again = True
+        while _try_again:
+            # run first sextractor and, if no enough sources, try daofinder
+            sorted_sources = self.run_sewpy(hdul, raw_name)
+            if sorted_sources is None or len(sorted_sources) < self.min_sources:
+                self.logger.warning(
+                    'Not enough sources detected with SExtractor. Trying DAOStarFinder.')
+            else:
+                self.logger.info(
+                    'Proceeding with %d detected sources from SExtractor.', len(sorted_sources))
+                _try_again = False
+                break
+            sorted_sources = self.run_daofinder(
+                hdul, raw_name, fwhm=2.0, sigma=self.sigma_clip)
+            if sorted_sources is None or len(sorted_sources) < self.min_sources:
+                self.logger.error(
+                    'No sources detected, cannot solve astrometry.')
+                self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
+                self.proc_status[raw_name]['proc_code'] = 27
+                if self.debug:
+                    _brake_point = 17
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
+            else:
+                logger.info('Proceeding with %d detected sources.',
+                            len(sorted_sources))
+                _try_again = False
 
         solver_used = 0
         astrometry_solved = False
