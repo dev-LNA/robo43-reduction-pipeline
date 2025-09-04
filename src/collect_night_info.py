@@ -23,20 +23,23 @@ def collect_night_info(workdir):
     filenames = np.array([os.path.basename(f) for f in fits_files])
     objects = np.zeros(len(fits_files), dtype='U20')
     exptimes = np.zeros(len(fits_files), dtype=float)
-    ras = np.zeros(len(fits_files), dtype=float)
-    decs = np.zeros(len(fits_files), dtype=float)
+    filters = np.zeros(len(fits_files), dtype='U10')
+    ras = np.zeros(len(fits_files), dtype='U20')
+    decs = np.zeros(len(fits_files), dtype='U20')
 
     for i, f in enumerate(fits_files):
         hdr = fits.getheader(f)
         objects[i] = hdr.get('OBJECT', 'Unknown')
-        exptimes[i] = hdr.get('EXPTIME', np.nan)
-        ras[i] = hdr.get('RA', np.nan)
-        decs[i] = hdr.get('DEC', np.nan)
+        exptimes[i] = hdr.get('EXPTIME', 0.0)
+        filters[i] = hdr.get('FILTER', 'None')
+        ras[i] = hdr.get('RA', 'None')
+        decs[i] = hdr.get('DEC', 'None')
 
     df = pd.DataFrame({
         'filename': filenames,
         'object': objects,
         'exptime': exptimes,
+        'filter': filters,
         'ra': ras,
         'dec': decs
     })
