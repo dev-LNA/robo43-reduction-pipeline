@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.coordinates import SkyCoord
 import astroquery
 from astroquery.simbad import Simbad
 from astroquery.astrometry_net import AstrometryNet
@@ -99,7 +100,12 @@ class ProcessFrame:
 
         self.object_names_to_guess = {
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula', 'etacarnebula'],
+            'm42': ['orion nebula', 'ngc1976', 'm42'],
+            'eso 97-g13': ['ESO 97-G13', 'Circinus Galaxy', 'Circinus', 'Cir Galaxy'],
         }
+        self.object_names_to_exclude = [
+            'flat', 'dark', 'bias', 'trash'
+        ]
         self.proc_status = {}
 
     def get_fits_files(self):
@@ -128,15 +134,11 @@ class ProcessFrame:
 
             # selecting only science frames
             header = fits.getheader(f)
-            if 'flat' in header.get('OBJECT', '').lower():
-                self.logger.debug('Selected science frame: %s', f)
-                exclusion_indexes.append(index)
-            elif 'dark' in header.get('OBJECT', '').lower():
-                self.logger.debug('Excluded dark frame: %s', f)
-                exclusion_indexes.append(index)
-            elif 'bias' in header.get('OBJECT', '').lower():
-                self.logger.debug('Excluded bias frame: %s', f)
-                exclusion_indexes.append(index)
+            for exclude_name in self.object_names_to_exclude:
+                if exclude_name in header.get('OBJECT', '').lower():
+                    self.logger.debug(
+                        'Excluded %s frame: %s', exclude_name, f)
+                    exclusion_indexes.append(index)
 
         fits_files = sorted([f for i, f in enumerate(fits_files)
                              if i not in exclusion_indexes and '_proc' not in f])
@@ -230,6 +232,35 @@ class ProcessFrame:
                 pdb.set_trace()
             return hdul
 
+    def radec_to_degrees(self, ra_str, dec_str):
+        """Try to guess RA and DEC format and return in degrees."""
+        if len(ra_str.split(':')) == 3 or len(ra_str.split(' ')) == 3:
+            try:
+                _coords = SkyCoord(ra_str, dec_str, unit=('hourangle', 'deg'))
+                return _coords.ra.degree, _coords.dec.degree
+            except Exception as e:
+                self.logger.error('Error converting RA/DEC: %s', str(e))
+                if self.debug:
+                    _brake_point = 91
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
+                return None, None
+        else:
+            try:
+                _coords = SkyCoord(ra_str, dec_str, unit=('deg', 'deg'))
+                return _coords.ra.degree, _coords.dec.degree
+            except Exception as e:
+                self.logger.error('Error converting RA/DEC: %s', str(e))
+                if self.debug:
+                    _brake_point = 97
+                    self.logger.debug(
+                        'Entering debug mode at brake point %i' % _brake_point)
+                    import pdb
+                    pdb.set_trace()
+                return None, None
+
     def guess_ra_dec(self, proc_path, raw_path):
         """Guess to get RA and DEC if not present using OBJECT."""
         if self.proc_status[os.path.basename(raw_path)]['proc_code'] != 3:
@@ -241,8 +272,10 @@ class ProcessFrame:
         hdul = fits.open(proc_path, mode='update')
         if 'RA' in hdul[0].header and 'DEC' in hdul[0].header:
             self.logger.debug('RA and DEC already present in header.')
-            self.proc_status[raw_name]['RA'] = hdul[0].header['RA']
-            self.proc_status[raw_name]['DEC'] = hdul[0].header['DEC']
+            _ra, _dec = self.radec_to_degrees(
+                str(hdul[0].header['RA']), str(hdul[0].header['DEC']))
+            self.proc_status[raw_name]['RA'] = _ra
+            self.proc_status[raw_name]['DEC'] = _dec
             self.proc_status[raw_name]['proc_status'] = 'RA/DEC already present'
             self.proc_status[raw_name]['proc_code'] = 7
             return hdul
