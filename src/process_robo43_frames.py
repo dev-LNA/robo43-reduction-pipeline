@@ -106,6 +106,7 @@ class ProcessFrame:
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula', 'etacarnebula'],
             'm42': ['orion nebula', 'ngc1976', 'm42'],
             'eso 97-g13': ['ESO 97-G13', 'Circinus Galaxy', 'Circinus', 'Cir Galaxy'],
+            'tyc 4663-974-1': ['TYC 4663-974-1', 'Saturn'],
         }
         self.object_names_to_exclude = [
             'flat', 'dark', 'bias', 'trash'
