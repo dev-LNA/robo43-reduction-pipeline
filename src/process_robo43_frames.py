@@ -99,7 +99,8 @@ class ProcessFrame:
         self.debug = args.debug
         self.logfile = args.logfile
 
-        self.files_path = os.path.dirname(os.path.abspath(__file__))
+        self.files_path = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
 
         self.object_names_to_guess = {
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula', 'etacarnebula'],
@@ -270,11 +271,22 @@ class ProcessFrame:
 
     def guess_ra_dec(self, proc_path, raw_path):
         """Guess to get RA and DEC if not present using OBJECT."""
-        if self.proc_status[os.path.basename(raw_path)]['proc_code'] != 3:
+        raw_name = os.path.basename(raw_path)
+        try:
+            if self.proc_status[raw_name]['proc_code'] != 3:
+                self.logger.warning(
+                    'Previous processing steps failed. Skipping RA/DEC guessing.')
+                return
+        except KeyError:
             self.logger.warning(
                 'Previous processing steps failed. Skipping RA/DEC guessing.')
+            if self.debug:
+                _brake_point = 67
+                self.logger.debug(
+                    'Entering debug mode at brake point %i' % _brake_point)
+                import pdb
+                pdb.set_trace()
             return
-        raw_name = os.path.basename(raw_path)
 
         hdul = fits.open(proc_path, mode='update')
         if 'RA' in hdul[0].header and 'DEC' in hdul[0].header:
@@ -340,8 +352,8 @@ class ProcessFrame:
                 scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
             )
         ) as solver:
-            stars = [(st['xcentroid'], st['ycentroid'])
-                     for st in sorted_sources]
+            stars = [a for a in zip(
+                sorted_sources['xcentroid'], sorted_sources['ycentroid'])]
             solution = solver.solve(stars=stars,
                                     size_hint=astrometry.SizeHint(
                                         lower_arcsec_per_pixel=0.2,
@@ -506,6 +518,8 @@ class ProcessFrame:
             return e
 
     def run_sewpy(self, hdul, raw_name):
+        proc_path = os.path.join(
+            self.output_dir, raw_name.replace('.fits', '_proc.fits'))
         out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
                       'FLUXERR_AUTO', 'MAG_AUTO', 'MAGERR_AUTO',
                       'CLASS_STAR']
@@ -515,7 +529,7 @@ class ProcessFrame:
             "DETECT_THRESH": self.sigma_clip,
             "ANALYSIS_THRESH": 3.0,
             "FILTER": "Y",
-            "FILTER_NAME": os.path.join(self.files_path, "data/tophat_3.0_3x3.conv"),
+            "FILTER_NAME": os.path.join(self.files_path, 'data', 'tophat_3.0_3x3.conv'),
             "DEBLEND_NTHRESH": 64,
             "DEBLEND_MINCONT": 0.0002,
             "CLEAN": "Y",
@@ -531,7 +545,7 @@ class ProcessFrame:
             "GAIN": 10,
             "PIXEL_SCALE": 0.55,
             "SEEING_FWHM": 2.0,
-            "STARNNW_NAME": os.path.join(self.files_path, 'data/default.nnw'),
+            "STARNNW_NAME": os.path.join(self.files_path, 'data', 'default.nnw'),
             "BACK_SIZE": 54,
             "BACK_FILTERSIZE": 7,
             "BACKPHOTO_TYPE": "LOCAL",
@@ -542,9 +556,16 @@ class ProcessFrame:
         sew = SEW(workdir=self.workdir, config=sex_config,
                   sexpath='source-extractor', params=out_params)
         try:
-            sources = sew(hdul[0].data)
-            sorted_sources = sorted(
-                sources, key=lambda x: x['FLUX_AUTO'], reverse=True)
+            sources = sew(proc_path)['table']
+            sources = sources.to_pandas()
+            # sort sources by flux
+            sorted_sources = sources.sort_values(
+                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:100]
+            sorted_sources = sorted_sources.rename(columns={
+                'X_IMAGE': 'xcentroid',
+                'Y_IMAGE': 'ycentroid',
+                'FLUX_AUTO': 'flux'
+            })
             self.logger.info(
                 'Detected %d sources in the image using SExtractor.', len(sorted_sources))
             return sorted_sources
@@ -706,7 +727,7 @@ class ProcessFrame:
             self.logger.error('No solver was successful.')
             return
         self.plot_frame(hdul[0].data, path_to_fits,
-                        sources=sources, show=True)
+                        sources=sources)
 
         return
 
@@ -732,10 +753,13 @@ class ProcessFrame:
         plt.xlabel('X Pixel')
         plt.ylabel('Y Pixel')
         plt.tight_layout()
+
+        if self.debug or self.runtest or self.np < 2:
+            show = True
         if self.save_processed:
             plt.savefig(png_file_name)
             self.logger.info('Saved plot to: %s', png_file_name)
-            if show and self.np == 1:
+            if show:
                 plt.show()
             else:
                 plt.close()
@@ -788,6 +812,10 @@ class ProcessFrame:
                         proc_code=3,
                         proc_file=os.path.basename(proc_path),
                     )
+                    if not 'RA' in fits.getheader(proc_path) or not 'DEC' in fits.getheader(proc_path):
+                        self.logger.info(
+                            'RA/DEC missing in header, attempting to guess.')
+                        self.guess_ra_dec(proc_path, fits_file)
                     self.solver_astrometry(proc_path, fits_file)
                 else:
                     self.logger.info(
