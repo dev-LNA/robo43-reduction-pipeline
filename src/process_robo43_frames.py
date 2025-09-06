@@ -92,7 +92,7 @@ class ProcessFrame:
         self.solve_astrometry = args.solve_astrometry
         self.min_sources = args.min_sources
         self.sigma_clip = args.sigma_clip
-        self.object_name = args.object_name
+        self.object_name = args.object_name.lower() if args.object_name else None
         self.runtest = args.runtest
         self.clobber = args.clobber
         self.verbose = args.verbose
@@ -101,6 +101,7 @@ class ProcessFrame:
 
         self.files_path = os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))
+        self.post_fix = '.fits'
 
         self.object_names_to_guess = {
             'eta car': ['etacar', 'eta carinae', 'etaCarNebula', 'etacarnebula'],
@@ -118,14 +119,14 @@ class ProcessFrame:
             'Initialized ProcessFrame with workdir: %s', self.workdir)
 
     def get_fits_files(self):
-        fits_files = glob.glob(os.path.join(self.workdir, '*.fits'))
+        fits_files = glob.glob(os.path.join(self.workdir, f'*{self.post_fix}'))
         self.logger.info('Found %d FITS files in %s',
                          len(fits_files), self.workdir)
         exclusion_indexes = []
         for index, f in enumerate(fits_files):
             self.logger.debug('FITS file: %s', f)
             proc_file_name = os.path.join(
-                self.output_dir, os.path.basename(f).replace('.fits', '_proc.fits'))
+                self.output_dir, os.path.basename(f).replace(f'{self.post_fix}', f'_proc{self.post_fix}'))
             if os.path.exists(proc_file_name):
                 if self.clobber:
                     if '_proc' in f:
@@ -389,12 +390,17 @@ class ProcessFrame:
                 import pdb
                 pdb.set_trace()
 
-    def run_astrometry_solver2(self, sorted_sources, hdul, raw_name, force_image_upload=False):
+    def run_astrometry_solver2(self,
+                               sorted_sources,
+                               hdul,
+                               raw_name,
+                               force_image_upload=False
+                               ):
         ast = AstrometryNet()
         img_width = hdul[0].header.get('NAXIS1', hdul[0].data.shape[1])
         img_height = hdul[0].header.get('NAXIS2', hdul[0].data.shape[0])
         path_to_fits = os.path.join(
-            self.output_dir, os.path.basename(raw_name).replace('.fits', '_proc.fits'))
+            self.output_dir, os.path.basename(raw_name).replace(self.post_fix, f'_proc{self.post_fix}'))
         if self.proc_status[raw_name]['proc_code'] == 7:
             ast.ra = hdul[0].header['RA']
             ast.dec = hdul[0].header['DEC']
@@ -520,7 +526,7 @@ class ProcessFrame:
 
     def run_sewpy(self, hdul, raw_name):
         proc_path = os.path.join(
-            self.output_dir, raw_name.replace('.fits', '_proc.fits'))
+            self.output_dir, raw_name.replace(self.post_fix, f'_proc{self.post_fix}'))
         out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
                       'FLUXERR_AUTO', 'MAG_AUTO', 'MAGERR_AUTO',
                       'CLASS_STAR']
@@ -737,7 +743,8 @@ class ProcessFrame:
         plt.figure(figsize=(10, 8))
         plt.imshow(image, cmap='gray', origin='lower', vmin=np.percentile(image, 5),
                    vmax=np.percentile(image, 95))
-        title = os.path.basename(file_name).replace('_proc.fits', '')
+        title = os.path.basename(file_name).replace(
+            f'_proc{self.post_fix}', '')
         plt.colorbar()
 
         if sources is not None and len(sources) > 0:
@@ -745,10 +752,10 @@ class ProcessFrame:
                 circ = plt.Circle((source['xcentroid'], source['ycentroid']),
                                   radius=30, color='green', fill=False, lw=3)
                 plt.gca().add_patch(circ)
-            png_file_name = file_name.replace('.fits', '_astro.png')
+            png_file_name = file_name.replace(self.post_fix, '_astro.png')
             title += f' {len(sources)} sources used'
         else:
-            png_file_name = file_name.replace('.fits', '_proc.png')
+            png_file_name = file_name.replace(self.post_fix, '_proc.png')
 
         plt.title(title)
         plt.xlabel('X Pixel')
@@ -791,15 +798,16 @@ class ProcessFrame:
     def process_frame(self, fits_file):
         """Process a single FITS frame."""
         self.logger.info('Processing frame: %s', fits_file)
+        self.post_fix = f".{fits_file.split('.')[-1]}"
         proc_path = os.path.join(
-            self.output_dir, os.path.basename(fits_file).replace('.fits', '_proc.fits'))
+            self.output_dir, os.path.basename(fits_file).replace(self.post_fix, '_proc' + self.post_fix))
         if os.path.exists(proc_path) and not self.clobber:
             self.logger.info(
                 'Processed file already exists: %s.', proc_path)
             if self.solve_astrometry:
                 self.logger.info('Attempting astrometry solving.')
                 path_ast_solved = os.path.join(
-                    self.output_dir, os.path.basename(proc_path).replace('.fits', '_astro.png'))
+                    self.output_dir, os.path.basename(proc_path).replace(self.post_fix, '_astro.png'))
                 if not os.path.exists(path_ast_solved):
                     proc_header = fits.getheader(proc_path)
                     self.fill_proc_status(
@@ -845,7 +853,7 @@ class ProcessFrame:
 
             if self.save_processed:
                 proc_file_name = os.path.join(
-                    self.output_dir, os.path.basename(fits_file).replace('.fits', '_proc.fits'))
+                    self.output_dir, os.path.basename(fits_file).replace(self.post_fix, '_proc' + self.post_fix))
                 processed_data.writeto(proc_file_name, overwrite=self.clobber)
                 self.proc_status[os.path.basename(
                     fits_file)]['proc_file'] = os.path.basename(proc_file_name)
@@ -864,7 +872,7 @@ class ProcessFrame:
 
         # save proc_status to CSV for each processed frame
         out_proc_status_file = os.path.join(
-            self.output_dir, f'proc_status_{os.path.basename(fits_file).replace(".fits", "")}.csv')
+            self.output_dir, f'proc_status_{os.path.basename(fits_file).replace(self.post_fix, "")}.csv')
         self.organize_proc_status(output_path_file=out_proc_status_file)
         self.logger.info('Saved processing status to: %s',
                          out_proc_status_file)
@@ -884,7 +892,10 @@ class ProcessFrame:
     def main(self):
         self.logger.info('Starting processing of frames.')
         fits_files = self.get_fits_files()
-        list(fits_files)
+        print(f'Found {len(fits_files)} FITS files to process.')
+        if len(fits_files) == 0:
+            self.logger.warning('No FITS files found to process. Exiting.')
+            return
 
         if self.runtest:
             self.process_frame(fits_files[0])
