@@ -93,12 +93,23 @@ class CalibrationMaker:
                 bias_frames.append(hdul[0].data)
         master_bias = np.median(bias_frames, axis=0)
         header['NCOMBINE'] = (len(filelist), 'Number of combined frames')
+        masked_master = sigma_clip(master_bias, sigma=5, maxiters=5,
+                                   cenfunc='median', stdfunc='mad_std',
+                                   masked=True, copy=True)
+        _variance = np.var(bias_frames, axis=0)
+        weight_map = np.where(masked_master.mask, 0,
+                              1.0 / _variance)
         hdul = fits.PrimaryHDU(master_bias, header=header)
+        weight_hdul = fits.PrimaryHDU(weight_map, header=header)
 
         if self.save_frame:
             self.logger.info(
                 f'Saving master bias frame to {self.master_filename}')
             hdul.writeto(self.master_filename, overwrite=self.clobber)
+            weight_filename = os.path.join(
+                self.output_dir, 'master_bias_weight.fits')
+            self.logger.info(f'Saving weight map to {weight_filename}')
+            weight_hdul.writeto(weight_filename, overwrite=self.clobber)
 
         return hdul
 
