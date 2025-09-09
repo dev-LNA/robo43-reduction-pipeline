@@ -66,6 +66,9 @@ def parse_arguments():
                         help='Sigma clipping value for source detection.')
     parser.add_argument('--object_name', type=str, default=None,
                         help='Name of the target object to select images to process.')
+    parser.add_argument('--usefileslist', action='store_true',
+                        help='Use a predefined list of files to process. \
+                        Will look for the file files_to_provess.txt in the input_dir.')
     parser.add_argument('--runtest', action='store_true',
                         help='Run in test mode with limited files.')
     parser.add_argument('--clobber', action='store_true',
@@ -93,6 +96,7 @@ class ProcessFrame:
         self.min_sources = args.min_sources
         self.sigma_clip = args.sigma_clip
         self.object_name = args.object_name.lower() if args.object_name else None
+        self.usefileslist = args.usefileslist
         self.runtest = args.runtest
         self.clobber = args.clobber
         self.verbose = args.verbose
@@ -119,36 +123,52 @@ class ProcessFrame:
             'Initialized ProcessFrame with workdir: %s', self.workdir)
 
     def get_fits_files(self):
-        fits_files = glob.glob(os.path.join(self.workdir, f'*{self.post_fix}'))
-        self.logger.info('Found %d FITS files in %s',
-                         len(fits_files), self.workdir)
         exclusion_indexes = []
-        for index, f in enumerate(fits_files):
-            self.logger.debug('FITS file: %s', f)
-            proc_file_name = os.path.join(
-                self.output_dir, os.path.basename(f).replace(f'{self.post_fix}', f'_proc{self.post_fix}'))
-            if os.path.exists(proc_file_name):
-                if self.clobber:
-                    if '_proc' in f:
-                        exclusion_indexes.append(index)
+        if self.usefileslist and os.path.exists(os.path.join(self.workdir, 'files_to_process.txt')):
+            with open(os.path.join(self.workdir, 'files_to_process.txt'), 'r') as f:
+                fits_files = [os.path.join(self.workdir, line.strip())
+                              for line in f if line.strip()]
+            self.logger.info('Using predefined list of %d FITS files from files_to_process.txt',
+                             len(fits_files))
+            for index, f in enumerate(fits_files):
+                f = os.path.join(self.workdir, f)
+                for exclude_name in self.object_names_to_exclude:
+                    if exclude_name in fits.getheader(f).get('OBJECT', '').lower():
                         self.logger.debug(
-                            'Will overwrite existing processed file: %s', proc_file_name)
-                else:
-                    if self.solve_astrometry:
-                        self.logger.info(
-                            'Processed file exists, but will attempt astrometry solving: %s', proc_file_name)
-                    else:
-                        self.logger.info(
-                            'Some processed files already exist. Use --clobber to overwrite.')
-                        sys.exit(1)
+                            'Excluded %s frame: %s', exclude_name, f)
+                        exclusion_indexes.append(index)
 
-            # selecting only science frames
-            header = fits.getheader(f)
-            for exclude_name in self.object_names_to_exclude:
-                if exclude_name in header.get('OBJECT', '').lower():
-                    self.logger.debug(
-                        'Excluded %s frame: %s', exclude_name, f)
-                    exclusion_indexes.append(index)
+        else:
+            fits_files = glob.glob(os.path.join(
+                self.workdir, f'*{self.post_fix}'))
+            self.logger.info('Found %d FITS files in %s',
+                             len(fits_files), self.workdir)
+            for index, f in enumerate(fits_files):
+                self.logger.debug('FITS file: %s', f)
+                proc_file_name = os.path.join(
+                    self.output_dir, os.path.basename(f).replace(f'{self.post_fix}', f'_proc{self.post_fix}'))
+                if os.path.exists(proc_file_name):
+                    if self.clobber:
+                        if '_proc' in f:
+                            exclusion_indexes.append(index)
+                            self.logger.debug(
+                                'Will overwrite existing processed file: %s', proc_file_name)
+                    else:
+                        if self.solve_astrometry:
+                            self.logger.info(
+                                'Processed file exists, but will attempt astrometry solving: %s', proc_file_name)
+                        else:
+                            self.logger.info(
+                                'Some processed files already exist. Use --clobber to overwrite.')
+                            sys.exit(1)
+
+                # selecting only science frames
+                header = fits.getheader(f)
+                for exclude_name in self.object_names_to_exclude:
+                    if exclude_name in header.get('OBJECT', '').lower():
+                        self.logger.debug(
+                            'Excluded %s frame: %s', exclude_name, f)
+                        exclusion_indexes.append(index)
 
         fits_files = sorted([f for i, f in enumerate(fits_files)
                              if i not in exclusion_indexes and '_proc' not in f])
