@@ -26,6 +26,7 @@ def collect_night_info(workdir):
     filters = np.zeros(len(fits_files), dtype='U10')
     ras = np.zeros(len(fits_files), dtype='U20')
     decs = np.zeros(len(fits_files), dtype='U20')
+    date_obs = np.zeros(len(fits_files), dtype='U23')
 
     for i, f in enumerate(fits_files):
         hdr = fits.getheader(f)
@@ -34,6 +35,7 @@ def collect_night_info(workdir):
         filters[i] = hdr.get('FILTER', 'None')
         ras[i] = hdr.get('RA', 'None')
         decs[i] = hdr.get('DEC', 'None')
+        date_obs[i] = hdr.get('DATE-OBS', 'Unknown')
 
     df = pd.DataFrame({
         'filename': filenames,
@@ -41,7 +43,8 @@ def collect_night_info(workdir):
         'exptime': exptimes,
         'filter': filters,
         'ra': ras,
-        'dec': decs
+        'dec': decs,
+        'date_obs': date_obs
     })
     output_file = os.path.join(workdir, 'night_info.csv')
     df.to_csv(output_file, index=False)
