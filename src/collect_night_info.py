@@ -27,6 +27,7 @@ def collect_night_info(workdir):
     ras = np.zeros(len(fits_files), dtype='U20')
     decs = np.zeros(len(fits_files), dtype='U20')
     date_obs = np.zeros(len(fits_files), dtype='U23')
+    is_valid = np.ones(len(fits_files), dtype=bool)
 
     for i, f in enumerate(fits_files):
         hdr = fits.getheader(f)
@@ -36,6 +37,10 @@ def collect_night_info(workdir):
         ras[i] = hdr.get('RA', 'None')
         decs[i] = hdr.get('DEC', 'None')
         date_obs[i] = hdr.get('DATE-OBS', 'Unknown')
+        if 'VALID' in hdr and not hdr['VALID']:
+            is_valid[i] = False
+        else:
+            is_valid[i] = True
 
     df = pd.DataFrame({
         'filename': filenames,
@@ -44,7 +49,8 @@ def collect_night_info(workdir):
         'filter': filters,
         'ra': ras,
         'dec': decs,
-        'date_obs': date_obs
+        'date_obs': date_obs,
+        'is_valid': is_valid
     })
     output_file = os.path.join(workdir, 'night_info.csv')
     df.to_csv(output_file, index=False)
