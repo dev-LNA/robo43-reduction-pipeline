@@ -139,8 +139,8 @@ class ProcessFrame:
                         exclusion_indexes.append(index)
 
         else:
-            fits_files = glob.glob(os.path.join(
-                self.workdir, f'*{self.post_fix}'))
+            fits_files = sorted(glob.glob(os.path.join(
+                self.workdir, f'*{self.post_fix}')))
             self.logger.info('Found %d FITS files in %s',
                              len(fits_files), self.workdir)
             for index, f in enumerate(fits_files):
@@ -373,6 +373,11 @@ class ProcessFrame:
                 cache_directory="/home/herpich/Documents/.astrometry",
                 scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
             )
+            + astrometry.series_4200.index_files(
+                cache_directory="/home/herpich/Documents/.astrometry",
+                scales={0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                        11, 12, 13, 14, 15, 16, 17, 18, 19},
+            )
         ) as solver:
             stars = [a for a in zip(
                 sorted_sources['xcentroid'], sorted_sources['ycentroid'])]
@@ -487,7 +492,7 @@ class ProcessFrame:
                     self.logger.warning(
                         'Astrometry solving timed out or connection error: %s. Retrying...', str(e))
                     if self.debug:
-                        _brake_point = 72
+                        _brake_point = 79
                         self.logger.debug(
                             'Entering debug mode at brake point %i' % _brake_point)
                         import pdb
@@ -549,7 +554,7 @@ class ProcessFrame:
             self.output_dir, raw_name.replace(self.post_fix, f'_proc{self.post_fix}'))
         out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
                       'FLUXERR_AUTO', 'MAG_AUTO', 'MAGERR_AUTO',
-                      'CLASS_STAR']
+                      'FWHM_IMAGE', 'FLAGS', 'CLASS_STAR']
         sex_config = {
             "DETECT_TYPE": "CCD",
             "DETECT_MINAREA": 4,
@@ -571,7 +576,7 @@ class ProcessFrame:
             "MAG_GAMMA": 4.0,
             "GAIN": 10,
             "PIXEL_SCALE": 0.55,
-            "SEEING_FWHM": 2.0,
+            "SEEING_FWHM": 3.0,
             "STARNNW_NAME": os.path.join(self.files_path, 'data', 'default.nnw'),
             "BACK_SIZE": 54,
             "BACK_FILTERSIZE": 7,
@@ -585,9 +590,12 @@ class ProcessFrame:
         try:
             sources = sew(proc_path)['table']
             sources = sources.to_pandas()
+            # get only stellar sources
+            sources = sources[(sources['CLASS_STAR'] > 0.5)
+                              & (sources['FLUX_AUTO'] < 50000)]
             # sort sources by flux
             sorted_sources = sources.sort_values(
-                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:100]
+                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:200]
             sorted_sources = sorted_sources.rename(columns={
                 'X_IMAGE': 'xcentroid',
                 'Y_IMAGE': 'ycentroid',
@@ -918,7 +926,7 @@ class ProcessFrame:
             return
 
         if self.runtest:
-            self.process_frame(fits_files[0])
+            self.process_frame(fits_files[1])
         else:
             if self.np > 1:
                 with Pool(processes=self.np) as pool:
