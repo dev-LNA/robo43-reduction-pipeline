@@ -364,15 +364,16 @@ class ProcessFrame:
         return hdul
 
     def run_astrometry_solver1(self, sorted_sources, hdul, raw_name):
+        self.logger.info('Attempting local astrometry solving.')
         with astrometry.Solver(
             astrometry.series_5200.index_files(
                 cache_directory="/home/herpich/Documents/.astrometry",
                 scales={3, 4, 5, 6},
             )
-            + astrometry.series_4100.index_files(
-                cache_directory="/home/herpich/Documents/.astrometry",
-                scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
-            )
+            # + astrometry.series_4100.index_files(
+            #     cache_directory="/home/herpich/Documents/.astrometry",
+            #     scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
+            # )
             + astrometry.series_4200.index_files(
                 cache_directory="/home/herpich/Documents/.astrometry",
                 scales={0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
@@ -389,7 +390,7 @@ class ProcessFrame:
                                         ra_deg=hdul[0].header.get('RA', None),
                                         dec_deg=hdul[0].header.get(
                                             'DEC', None),
-                                        radius_deg=1.0),
+                                        radius_deg=2.0),
                                     solution_parameters=astrometry.SolutionParameters())
             if self.debug:
                 _brake_point = 47
@@ -549,7 +550,7 @@ class ProcessFrame:
                 pdb.set_trace()
             return e
 
-    def run_sewpy(self, hdul, raw_name):
+    def run_sewpy(self, raw_name, sigma_clip=3.0):
         proc_path = os.path.join(
             self.output_dir, raw_name.replace(self.post_fix, f'_proc{self.post_fix}'))
         out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
@@ -557,31 +558,31 @@ class ProcessFrame:
                       'FWHM_IMAGE', 'FLAGS', 'CLASS_STAR']
         sex_config = {
             "DETECT_TYPE": "CCD",
-            "DETECT_MINAREA": 4,
-            "DETECT_THRESH": self.sigma_clip,
+            "DETECT_MINAREA": 6,
+            "DETECT_THRESH": sigma_clip,
             "ANALYSIS_THRESH": 3.0,
             "FILTER": "Y",
             "FILTER_NAME": os.path.join(self.files_path, 'data', 'tophat_3.0_3x3.conv'),
-            "DEBLEND_NTHRESH": 64,
-            "DEBLEND_MINCONT": 0.0002,
+            "DEBLEND_NTHRESH": 32,
+            "DEBLEND_MINCONT": 0.005,
             "CLEAN": "Y",
             "CLEAN_PARAM": 1.0,
             "MASK_TYPE": "CORRECT",
-            "PHOT_APERTURES": 5.45454545,
-            "PHOT_AUTOPARAMS": '3.0,1.82',
-            "PHOT_PETROPARAMS": '2.0,2.73',
-            "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
-            "SATUR_LEVEL": 1600,
+            "PHOT_APERTURES": 6,
+            "PHOT_AUTOPARAMS": '2.5,3.5',
+            # "PHOT_PETROPARAMS": '2.0,2.73',
+            # "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
+            "SATUR_LEVEL": 50000,
             "MAG_ZEROPOINT": 20,
             "MAG_GAMMA": 4.0,
             "GAIN": 10,
-            "PIXEL_SCALE": 0.55,
+            "PIXEL_SCALE": 0.52,
             "SEEING_FWHM": 3.0,
             "STARNNW_NAME": os.path.join(self.files_path, 'data', 'default.nnw'),
-            "BACK_SIZE": 54,
-            "BACK_FILTERSIZE": 7,
-            "BACKPHOTO_TYPE": "LOCAL",
-            "BACKPHOTO_THICK": 48,
+            "BACK_SIZE": 64,
+            "BACK_FILTERSIZE": 3,
+            "BACKPHOTO_TYPE": "GLOBAL",
+            "BACKPHOTO_THICK": 24,
             # "CHECKIMAGE_TYPE": "SEGMENTATION",
             # "CHECKIMAGE_NAME": pathtoseg
         }
@@ -595,7 +596,7 @@ class ProcessFrame:
                               & (sources['FLUX_AUTO'] < 50000)]
             # sort sources by flux
             sorted_sources = sources.sort_values(
-                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:200]
+                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:100]
             sorted_sources = sorted_sources.rename(columns={
                 'X_IMAGE': 'xcentroid',
                 'Y_IMAGE': 'ycentroid',
@@ -638,77 +639,107 @@ class ProcessFrame:
                 pdb.set_trace()
             return
 
+        _sigma_clip = 6
         _try_again = True
         while _try_again:
             # run first sextractor and, if no enough sources, try daofinder
-            sorted_sources = self.run_sewpy(hdul, raw_name)
+            sorted_sources = self.run_sewpy(raw_name, sigma_clip=_sigma_clip)
             if sorted_sources is None or len(sorted_sources) < self.min_sources:
                 self.logger.warning(
                     'Not enough sources detected with SExtractor. Trying DAOStarFinder.')
+                wcs_header = None
             else:
                 self.logger.info(
                     'Proceeding with %d detected sources from SExtractor.', len(sorted_sources))
+                # solver_used = 0
+                try:
+                    wcs_header, stars_used = self.run_astrometry_solver1(
+                        sorted_sources, hdul, raw_name)
+                    if wcs_header is not None:
+                        solver_used = 1
+                        _try_again = False
+                    self.logger.info('Astrometry solving completed.')
+                    continue
+                except Exception as e:
+                    _sigma_clip_old = _sigma_clip
+                    _sigma_clip -= 1.0
+                    self.logger.warning(
+                        'Local astrometry solving failed using sigma \
+                            %.1f: %s. Trying lower sigma = \
+                            %.1f' % (_sigma_clip_old, str(e), _sigma_clip))
+                    wcs_header = None
+                    if self.debug:
+                        _brake_point = 19
+                        self.logger.debug(
+                            'Entering debug mode at brake point %i' % _brake_point)
+                        import pdb
+                        pdb.set_trace()
+            if _sigma_clip < 3.0:
+                self.logger.warning(
+                    "Sigma clipping value too low. Astrometry couldn't be solved.")
                 _try_again = False
+                wcs_header = None
                 break
+
+        if wcs_header is None:
+            # try solving astrometry using the daofinder sources
+            solver_used = 2
+            _try_again = True
+            _sigma_clip = 6
+        while _try_again:
             sorted_sources = self.run_daofinder(
-                hdul, raw_name, fwhm=2.0, sigma=self.sigma_clip)
+                hdul, raw_name, fwhm=3.0, sigma=_sigma_clip)
             if sorted_sources is None or len(sorted_sources) < self.min_sources:
                 self.logger.error(
                     'No sources detected, cannot solve astrometry.')
-                self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
-                self.proc_status[raw_name]['proc_code'] = 27
-                if self.debug:
-                    _brake_point = 17
-                    self.logger.debug(
-                        'Entering debug mode at brake point %i' % _brake_point)
-                    import pdb
-                    pdb.set_trace()
+                _sigma_clip_old = _sigma_clip
+                _sigma_clip -= 1.0
+                self.logger.warning(
+                    'Not enough sources detected with DAOStarFinder. \
+                        Trying lower sigma = %.1f' % (_sigma_clip))
+                if _sigma_clip < 2.0:
+                    self.logger.warning(
+                        "Sigma clipping value too low. Astrometry couldn't be solved.")
+                    self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
+                    self.proc_status[raw_name]['proc_code'] = 27
+                    _try_again = False
+                    wcs_header = None
+                    if self.debug:
+                        _brake_point = 17
+                        self.logger.debug(
+                            'Entering debug mode at brake point %i' % _brake_point)
+                        import pdb
+                        pdb.set_trace()
+                    break
+                continue
             else:
-                logger.info('Proceeding with %d detected sources.',
-                            len(sorted_sources))
-                _try_again = False
-
-        solver_used = 0
-        astrometry_solved = False
-        try:
-            wcs_header, stars_used = self.run_astrometry_solver1(
-                sorted_sources, hdul, raw_name)
-            astrometry_solved = True
-            solver_used = 1
-            self.logger.info('Astrometry solving completed.')
-        except Exception as e:
-            self.logger.warning(
-                'Local astrometry solving failed: %s. Trying Astrometry.net service.', str(e))
-            if self.debug:
-                _brake_point = 19
-                self.logger.debug(
-                    'Entering debug mode at brake point %i' % _brake_point)
-                import pdb
-                pdb.set_trace()
-
-        if not astrometry_solved:
-            wcs_header, stars_used = self.run_astrometry_solver2(
-                sorted_sources, hdul, raw_name)
-            solver_used = 2
-
-        if self.debug and wcs_header is None:
-            _brake_point = 23
-            self.logger.debug(
-                'Entering debug mode at brake point %i' % _brake_point)
-            import pdb
-            pdb.set_trace()
-            # try forcing image upload
-            wcs_header, stars_used = self.run_astrometry_solver2(
-                sorted_sources, hdul, raw_name, force_image_upload=True)
-            if wcs_header is None:
-                self.logger.error('Both astrometry solving methods failed.')
-                if self.debug:
-                    _brake_point = 31
-                    self.logger.debug(
-                        'Entering debug mode at brake point %i' % _brake_point)
-                    import pdb
-                    pdb.set_trace()
-                return
+                self.logger.info('Proceeding with %d detected sources.',
+                                 len(sorted_sources))
+                try:
+                    wcs_header, stars_used = self.run_astrometry_solver1(
+                        sorted_sources, hdul, raw_name)
+                    if wcs_header is not None:
+                        self.logger.info('Astrometry solving completed.')
+                    _try_again = False
+                except Exception as e:
+                    _sigma_clip_old = _sigma_clip
+                    _sigma_clip -= 1.0
+                    self.logger.warning(
+                        'Local astrometry solving failed using sigma \
+                            %.1f: %s. Trying lower sigma = \
+                            %.1f' % (_sigma_clip_old, str(e), _sigma_clip))
+                    wcs_header = None
+                    if self.debug:
+                        _brake_point = 21
+                        self.logger.debug(
+                            'Entering debug mode at brake point %i' % _brake_point)
+                        import pdb
+                        pdb.set_trace()
+                if _sigma_clip < 2.0 and wcs_header is None:
+                    self.logger.warning(
+                        "Sigma clipping value too low. Astrometry couldn't be solved.")
+                    _try_again = False
+                    break
 
         if wcs_header:
             try:
@@ -790,7 +821,7 @@ class ProcessFrame:
         plt.ylabel('Y Pixel')
         plt.tight_layout()
 
-        if self.debug or self.runtest or self.np < 2:
+        if self.debug or self.runtest or self.np < 1:
             show = True
         if self.save_processed:
             plt.savefig(png_file_name)
@@ -926,7 +957,7 @@ class ProcessFrame:
             return
 
         if self.runtest:
-            self.process_frame(fits_files[1])
+            self.process_frame(fits_files[2])
         else:
             if self.np > 1:
                 with Pool(processes=self.np) as pool:
