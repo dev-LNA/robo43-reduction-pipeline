@@ -1,4 +1,4 @@
-# robo43-reduction-pipeline
+# robo43-reduction-pipeline (DEV version)
 Pipeline to process ROBO43 data
 
 This repository contains a set o modules to process the ROBO43 photometric data. The modules are written in Python and use various libraries such as NumPy, SciPy, and Astropy.
@@ -22,6 +22,8 @@ Module ``make_coloured_images.py`` creates coloured images from the processed sc
 - Add module to gather the photometry
 - Add more diagnostic plots
 - Improve the astrometric calibration
+- Add dark frame scaling based on temperature and exposure time
+- Create hot pixel mask
 
 ## Example
 
