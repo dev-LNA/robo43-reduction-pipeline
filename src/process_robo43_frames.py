@@ -75,6 +75,10 @@ def parse_arguments():
                         help='Overwrite existing output file if it exists.')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose logging.')
+    parser.add_argument('--loglevel', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO',
+                                 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set the logging level. Default is INFO.')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging and stops when fail.')
     parser.add_argument('--logfile', type=str,
@@ -102,6 +106,8 @@ class ProcessFrame:
         self.verbose = args.verbose
         self.debug = args.debug
         self.logfile = args.logfile
+        self.loglevel = getattr(logging, args.loglevel.upper(
+        ), logging.INFO) if not self.debug else logging.DEBUG
 
         self.files_path = os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))
@@ -118,7 +124,7 @@ class ProcessFrame:
         ]
         self.proc_status = {}
 
-        self.logger = setup_logging(self.verbose, self.logfile)
+        self.logger = setup_logging(self.verbose, self.logfile, self.loglevel)
         self.logger.info(
             'Initialized ProcessFrame with workdir: %s', self.workdir)
 
@@ -365,6 +371,12 @@ class ProcessFrame:
 
     def run_astrometry_solver1(self, sorted_sources, hdul, raw_name):
         self.logger.info('Attempting local astrometry solving.')
+        if self.debug:
+            _brake_point = 141
+            self.logger.debug(
+                'Entering debug mode at brake point %i' % _brake_point)
+            import pdb
+            pdb.set_trace()
         with astrometry.Solver(
             astrometry.series_5200.index_files(
                 cache_directory="/home/herpich/Documents/.astrometry",
@@ -374,11 +386,11 @@ class ProcessFrame:
             #     cache_directory="/home/herpich/Documents/.astrometry",
             #     scales={7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19},
             # )
-            + astrometry.series_4200.index_files(
-                cache_directory="/home/herpich/Documents/.astrometry",
-                scales={0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                        11, 12, 13, 14, 15, 16, 17, 18, 19},
-            )
+            # + astrometry.series_4200.index_files(
+            #     cache_directory="/home/herpich/Documents/.astrometry",
+            #     scales={0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+            #             11, 12, 13, 14, 15, 16, 17, 18, 19},
+            # )
         ) as solver:
             stars = [a for a in zip(
                 sorted_sources['xcentroid'], sorted_sources['ycentroid'])]
@@ -558,7 +570,7 @@ class ProcessFrame:
                       'FWHM_IMAGE', 'FLAGS', 'CLASS_STAR']
         sex_config = {
             "DETECT_TYPE": "CCD",
-            "DETECT_MINAREA": 6,
+            "DETECT_MINAREA": 8,
             "DETECT_THRESH": sigma_clip,
             "ANALYSIS_THRESH": 3.0,
             "FILTER": "Y",
@@ -568,15 +580,15 @@ class ProcessFrame:
             "CLEAN": "Y",
             "CLEAN_PARAM": 1.0,
             "MASK_TYPE": "CORRECT",
-            "PHOT_APERTURES": 6,
-            "PHOT_AUTOPARAMS": '2.5,3.5',
+            "PHOT_APERTURES": 10,
+            "PHOT_AUTOPARAMS": '2.5,5',
             # "PHOT_PETROPARAMS": '2.0,2.73',
             # "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
             "SATUR_LEVEL": 50000,
             "MAG_ZEROPOINT": 20,
             "MAG_GAMMA": 4.0,
             "GAIN": 10,
-            "PIXEL_SCALE": 0.52,
+            "PIXEL_SCALE": 0.53,
             "SEEING_FWHM": 3.0,
             "STARNNW_NAME": os.path.join(self.files_path, 'data', 'default.nnw'),
             "BACK_SIZE": 64,
@@ -592,11 +604,19 @@ class ProcessFrame:
             sources = sew(proc_path)['table']
             sources = sources.to_pandas()
             # get only stellar sources
-            sources = sources[(sources['CLASS_STAR'] > 0.5)
-                              & (sources['FLUX_AUTO'] < 50000)]
+            mask = (sources['FLUX_AUTO'] > np.percentile(
+                sources['FLUX_AUTO'], 80))
+            mask &= (sources['FLUX_AUTO'] > 5000)
+            mask &= (sources['FLAGS'] < 4)
+            mask &= (sources['FWHM_IMAGE'] > 1)
+            mask &= (sources['FWHM_IMAGE'] < 10)
+            mask &= (sources['CLASS_STAR'] > 0.5)
+
+            sources = sources[mask]
+
             # sort sources by flux
             sorted_sources = sources.sort_values(
-                by='FLUX_AUTO', ascending=False).reset_index(drop=True)[:100]
+                by='FLUX_AUTO', ascending=False).reset_index(drop=True)
             sorted_sources = sorted_sources.rename(columns={
                 'X_IMAGE': 'xcentroid',
                 'Y_IMAGE': 'ycentroid',
@@ -639,7 +659,7 @@ class ProcessFrame:
                 pdb.set_trace()
             return
 
-        _sigma_clip = 6
+        _sigma_clip = 5.
         _try_again = True
         while _try_again:
             # run first sextractor and, if no enough sources, try daofinder
@@ -662,7 +682,7 @@ class ProcessFrame:
                     continue
                 except Exception as e:
                     _sigma_clip_old = _sigma_clip
-                    _sigma_clip -= 1.0
+                    _sigma_clip -= 0.5
                     self.logger.warning(
                         'Local astrometry solving failed using sigma \
                             %.1f: %s. Trying lower sigma = \
@@ -674,7 +694,7 @@ class ProcessFrame:
                             'Entering debug mode at brake point %i' % _brake_point)
                         import pdb
                         pdb.set_trace()
-            if _sigma_clip < 3.0:
+            if _sigma_clip < 1.5 and wcs_header is None:
                 self.logger.warning(
                     "Sigma clipping value too low. Astrometry couldn't be solved.")
                 _try_again = False
@@ -685,7 +705,7 @@ class ProcessFrame:
             # try solving astrometry using the daofinder sources
             solver_used = 2
             _try_again = True
-            _sigma_clip = 6
+            _sigma_clip = 5.
         while _try_again:
             sorted_sources = self.run_daofinder(
                 hdul, raw_name, fwhm=3.0, sigma=_sigma_clip)
@@ -693,11 +713,11 @@ class ProcessFrame:
                 self.logger.error(
                     'No sources detected, cannot solve astrometry.')
                 _sigma_clip_old = _sigma_clip
-                _sigma_clip -= 1.0
+                _sigma_clip -= 0.5
                 self.logger.warning(
                     'Not enough sources detected with DAOStarFinder. \
                         Trying lower sigma = %.1f' % (_sigma_clip))
-                if _sigma_clip < 2.0:
+                if _sigma_clip < 1.5:
                     self.logger.warning(
                         "Sigma clipping value too low. Astrometry couldn't be solved.")
                     self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
@@ -788,7 +808,7 @@ class ProcessFrame:
             sources = [{'xcentroid': src[0], 'ycentroid': src[1]}
                        for src in zip(sources[0], sources[1])]
         elif solver_used == 2:
-            sources = sorted_sources
+            sources = stars_used
         else:
             self.logger.error('No solver was successful.')
             return
@@ -957,7 +977,7 @@ class ProcessFrame:
             return
 
         if self.runtest:
-            self.process_frame(fits_files[2])
+            self.process_frame(fits_files[6])
         else:
             if self.np > 1:
                 with Pool(processes=self.np) as pool:
