@@ -41,6 +41,8 @@ def parse_arguments():
                         help='Save the output coloured image to file.')
     parser.add_argument('--degrade_psf', action='store_true',
                         help='Degrade images to the worst PSF before combining.')
+    parser.add_argument('--isforprint', action='store_true',
+                        help='Adjust settings for print quality.')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose output.')
     return parser.parse_args()
@@ -61,6 +63,7 @@ class ColouredImageMaker:
         self.smooth_factor = args.smooth_factor
         self.save_output = args.save_output
         self.degrade_psf = args.degrade_psf
+        self.isforprint = args.isforprint
         self.verbose = args.verbose
 
         if not os.path.exists(self.output_dir):
@@ -199,7 +202,9 @@ class ColouredImageMaker:
         """Plot and save the coloured image for the correspondent colour at each channel."""
         lupton_path = os.path.join(
             self.output_dir, self.object_name.upper() + '_coloured.png')
-        print("Saving coloured image to", lupton_path)
+        if self.isforprint:
+            lupton_path_print = lupton_path.replace('.png', '_print.png')
+            print('Saving image for print to', lupton_path_print)
         b_data = b_data / np.nanmedian(b_data)
         g_data = g_data / np.nanmedian(g_data)
         r_data = r_data / np.nanmedian(r_data)
@@ -214,19 +219,23 @@ class ColouredImageMaker:
                                     minimum=low_val,
                                     stretch=stretch_val,
                                     Q=self.smooth_factor,
-                                    filename=lupton_path if self.save_output else None)
+                                    filename=lupton_path_print if self.isforprint else None)
 
         plt.figure(figsize=(10, 8))
         ax = plt.subplot(111, projection=WCS(hdul[0].header))
         ax.imshow(rgb_image, origin='lower')
         ax.set_xlabel('RA')
         ax.set_ylabel('DEC')
+        plt.rcParams.update({'font.size': 12})
+        plt.rcParams['axes.linewidth'] = 1.2
         plt.grid(color='white', ls='dotted')
+        _output_dpi = 180
 
+        print("Saving coloured image to", lupton_path)
         plt.tight_layout()
 
         if self.save_output:
-            plt.savefig(lupton_path, dpi=300)
+            plt.savefig(lupton_path, dpi=_output_dpi)
             plt.close()
         else:
             plt.show()
