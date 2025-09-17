@@ -68,7 +68,7 @@ def parse_arguments():
                         help='Name of the target object to select images to process.')
     parser.add_argument('--usefileslist', action='store_true',
                         help='Use a predefined list of files to process. \
-                        Will look for the file files_to_provess.txt in the input_dir.')
+                        Will look for the file files_to_process.txt in the input_dir.')
     parser.add_argument('--runtest', action='store_true',
                         help='Run in test mode with limited files.')
     parser.add_argument('--clobber', action='store_true',
@@ -155,7 +155,7 @@ class ProcessFrame:
                     self.output_dir, os.path.basename(f).replace(f'{self.post_fix}', f'_proc{self.post_fix}'))
                 if os.path.exists(proc_file_name):
                     if self.clobber:
-                        if '_proc' in f:
+                        if '_proc' in f or '_coadded' in f:
                             exclusion_indexes.append(index)
                             self.logger.debug(
                                 'Will overwrite existing processed file: %s', proc_file_name)
@@ -370,13 +370,18 @@ class ProcessFrame:
         return hdul
 
     def run_astrometry_solver1(self, sorted_sources, hdul, raw_name):
-        self.logger.info('Attempting local astrometry solving.')
+        self.logger.warning(
+            'Attempting local astrometry solving using %i sources.', len(sorted_sources))
         if self.debug:
             _brake_point = 141
             self.logger.debug(
                 'Entering debug mode at brake point %i' % _brake_point)
             import pdb
             pdb.set_trace()
+        if len(sorted_sources) > 150:
+            sorted_sources = sorted_sources[:150]
+            self.logger.warning(
+                'Limiting to top 150 sources for astrometry solving.')
         with astrometry.Solver(
             astrometry.series_5200.index_files(
                 cache_directory="/home/herpich/Documents/.astrometry",
@@ -659,11 +664,12 @@ class ProcessFrame:
                 pdb.set_trace()
             return
 
-        _sigma_clip = 5.
+        _sigma_clip = self.sigma_clip
         _try_again = True
         while _try_again:
             # run first sextractor and, if no enough sources, try daofinder
             sorted_sources = self.run_sewpy(raw_name, sigma_clip=_sigma_clip)
+            _fwhm_median = np.median(sorted_sources['FWHM_IMAGE'])
             if sorted_sources is None or len(sorted_sources) < self.min_sources:
                 self.logger.warning(
                     'Not enough sources detected with SExtractor. Trying DAOStarFinder.')
@@ -705,7 +711,7 @@ class ProcessFrame:
             # try solving astrometry using the daofinder sources
             solver_used = 2
             _try_again = True
-            _sigma_clip = 5.
+            _sigma_clip = self.sigma_clip
         while _try_again:
             sorted_sources = self.run_daofinder(
                 hdul, raw_name, fwhm=3.0, sigma=_sigma_clip)
@@ -813,17 +819,17 @@ class ProcessFrame:
             self.logger.error('No solver was successful.')
             return
         self.plot_frame(hdul[0].data, path_to_fits,
-                        sources=sources)
+                        sources=sources, fwnm_mean=_fwhm_median)
 
         return
 
-    def plot_frame(self, image, file_name, sources=None, show=False):
+    def plot_frame(self, image, file_name, sources=None, show=False, fwnm_mean=0):
         """Plot a single frame for visual inspection."""
         plt.figure(figsize=(10, 8))
         plt.imshow(image, cmap='gray', origin='lower', vmin=np.percentile(image, 5),
                    vmax=np.percentile(image, 95))
         title = os.path.basename(file_name).replace(
-            f'_proc{self.post_fix}', '')
+            f'_proc{self.post_fix}', '') + ' FWHM_median={:.2f}'.format(fwnm_mean)
         plt.colorbar()
 
         if sources is not None and len(sources) > 0:
