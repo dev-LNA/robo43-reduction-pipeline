@@ -201,7 +201,7 @@ class ColouredImageMaker:
     def plot_and_save(self, b_data, g_data, r_data, hdul):
         """Plot and save the coloured image for the correspondent colour at each channel."""
         lupton_path = os.path.join(
-            self.output_dir, self.object_name.upper() + '_coloured.png')
+            self.output_dir, self.object_name.replace(' ', '').upper() + '_coloured.png')
         if self.isforprint:
             lupton_path_print = lupton_path.replace('.png', '_print.png')
             print('Saving image for print to', lupton_path_print)
@@ -231,10 +231,10 @@ class ColouredImageMaker:
         plt.grid(color='white', ls='dotted')
         _output_dpi = 180
 
-        print("Saving coloured image to", lupton_path)
         plt.tight_layout()
 
         if self.save_output:
+            print("Saving coloured image to", lupton_path)
             plt.savefig(lupton_path, dpi=_output_dpi)
             plt.close()
         else:
@@ -245,11 +245,16 @@ class ColouredImageMaker:
         g_files = self.select_images_per_channel(self.g_channel_files)
         r_files = self.select_images_per_channel(self.r_channel_files)
         save_config = open(os.path.join(
-            self.output_dir, f'{self.object_name}_config.txt'), 'w')
+            self.output_dir, f'{self.object_name.replace(" ", "")}_config.txt'), 'w')
         save_config.write(f"Object: {self.object_name}\n")
         save_config.write(f"Blue channel files: {b_files}\n")
         save_config.write(f"Green channel files: {g_files}\n")
         save_config.write(f"Red channel files: {r_files}\n")
+        save_config.write(f"Stretch: {self.stretch}\n")
+        save_config.write(f"Clip: {self.clip}\n")
+        save_config.write(f"Low percentile: {self.low_perc}\n")
+        save_config.write(f"Up percentile: {self.up_perc}\n")
+        save_config.write(f"Smoothing factor: {self.smooth_factor}\n")
         save_config.close()
 
         files_per_channel = {
