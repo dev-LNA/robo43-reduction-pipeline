@@ -110,7 +110,7 @@ class CoaddFrames:
 
         return hdul
 
-    def plot_image(self, hdul):
+    def plot_image(self, hdul, file_name=None):
         wcs = WCS(hdul[0].header)
         data = hdul[0].data
         plt.figure(figsize=(10, 8))
@@ -125,10 +125,13 @@ class CoaddFrames:
         ax.set_title(title)
         plt.grid(color='white', ls='dotted')
         if self.save_plot:
-            plot_filename = os.path.join(
-                self.workdir,
-                f"{self.object_name.upper()}_" +
-                f"{hdul[0].header.get('FILTER', 'UNKNOWN')}_coadded.png")
+            if file_name is None:
+                plot_filename = os.path.join(
+                    self.workdir,
+                    f"{self.object_name.replace(' ', '').upper()}_" +
+                    f"{hdul[0].header.get('FILTER', 'UNKNOWN')}_coadded.png")
+            else:
+                plot_filename = file_name.replace('.fits', '.png')
             plt.savefig(plot_filename)
             print(f"Saved plot to '{plot_filename}'")
             if self.show_plot:
@@ -146,7 +149,7 @@ class CoaddFrames:
                 files = files[:3]
             print(f"Coadding {len(files)} frames for filter '{filt}'...")
             output_filename = os.path.join(
-                self.workdir, f"{self.object_name.upper()}_{filt}_coadded.fits")
+                self.workdir, f"{self.object_name.replace(' ', '').upper()}_{filt}_coadded.fits")
             if os.path.isfile(output_filename) and not args.clobber:
                 print(
                     f"File '{output_filename}' already exists. Use --clobber to overwrite.")
