@@ -231,10 +231,11 @@ class ProcessFrame:
                 self.workdir, f'master_flat_{image_filter}.fits')
             if not os.path.exists(path_to_flat):
                 self.logger.critical(
-                    'No master flat file found at %s', path_to_flat)
+                    'No master flat file found at %s. Skipping processing...', path_to_flat)
                 self.proc_status[raw_name]['proc_status'] = 'Flat correction failed'
-                raise FileNotFoundError(
-                    f'Master flat file not found: {path_to_flat}')
+                return
+                # raise FileNotFoundError(
+                #     f'Master flat file not found: {path_to_flat}')
             else:
                 self.logger.info(
                     'Using guessed master flat for filter %s: %s', image_filter, path_to_flat)
@@ -934,7 +935,12 @@ class ProcessFrame:
                 # flat correction
                 processed_data = self.flat_correction(
                     processed_data, fits_file)
-                self.plot_frame(processed_data[0].data, fits_file)
+                if processed_data is None:
+                    self.logger.critical(
+                        'Flat correction failed, skipping further processing.')
+                    return
+                else:
+                    self.plot_frame(processed_data[0].data, fits_file)
 
             if self.save_processed:
                 proc_file_name = os.path.join(
