@@ -550,7 +550,8 @@ class ProcessFrame:
     def run_daofinder(self, hdul, raw_name, fwhm=2.0, sigma=3.0):
         try:
             daofind = DAOStarFinder(
-                fwhm=fwhm, threshold=sigma * np.std(hdul[0].data))
+                fwhm=fwhm, threshold=sigma * np.std(hdul[0].data),
+                exclude_border=True)
             sources = daofind(hdul[0].data - np.median(hdul[0].data))
             sorted_sources = sources[np.argsort(sources['flux'])[::-1]]
             self.logger.info(
@@ -715,7 +716,7 @@ class ProcessFrame:
             _sigma_clip = self.sigma_clip
         while _try_again:
             sorted_sources = self.run_daofinder(
-                hdul, raw_name, fwhm=3.0, sigma=_sigma_clip)
+                hdul, raw_name, fwhm=4.0, sigma=_sigma_clip)
             if sorted_sources is None or len(sorted_sources) < self.min_sources:
                 self.logger.error(
                     'No sources detected, cannot solve astrometry.')
