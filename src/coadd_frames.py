@@ -52,8 +52,9 @@ class CoaddFrames:
         selected_files = []
         files_list = glob.glob(os.path.join(self.workdir, "*_proc.fits"))
         for f in files_list:
-            if os.path.isfile(f.replace(".fits", "_astro.png")):
-                if self.object_name.lower() == fits.getheader(f).get('OBJECT', None).lower():
+            w = WCS(fits.getheader(f))
+            if w.has_celestial:
+                if self.object_name.lower() == fits.getheader(f).get('OBJECT', None).lower().strip():
                     selected_files.append(f)
 
         if not selected_files:
@@ -126,9 +127,12 @@ class CoaddFrames:
         plt.grid(color='white', ls='dotted')
         if self.save_plot:
             if file_name is None:
+                # replace blanks or special chars in object name
+                _object_name = ''.join(
+                    c for c in self.object_name if c.isalnum())
                 plot_filename = os.path.join(
                     self.workdir,
-                    f"{self.object_name.replace(' ', '').upper()}_" +
+                    f"{_object_name.upper()}_" +
                     f"{hdul[0].header.get('FILTER', 'UNKNOWN')}_coadded.png")
             else:
                 plot_filename = file_name.replace('.fits', '.png')
@@ -148,8 +152,10 @@ class CoaddFrames:
             if self.runtest:
                 files = files[:3]
             print(f"Coadding {len(files)} frames for filter '{filt}'...")
+            _obj_name = ''.join(
+                c for c in self.object_name if c.isalnum())
             output_filename = os.path.join(
-                self.workdir, f"{self.object_name.replace(' ', '').upper()}_{filt}_coadded.fits")
+                self.workdir, f"{_obj_name.upper()}_{filt}_coadded.fits")
             if os.path.isfile(output_filename) and not args.clobber:
                 print(
                     f"File '{output_filename}' already exists. Use --clobber to overwrite.")
