@@ -151,11 +151,15 @@ class ProcessFrame:
                              len(fits_files), self.workdir)
             for index, f in enumerate(fits_files):
                 self.logger.debug('FITS file: %s', f)
+                if '_coadded' in f:
+                    exclusion_indexes.append(index)
+                    self.logger.debug('Excluded coadded frame: %s', f)
+                    continue
                 proc_file_name = os.path.join(
                     self.output_dir, os.path.basename(f).replace(f'{self.post_fix}', f'_proc{self.post_fix}'))
                 if os.path.exists(proc_file_name):
                     if self.clobber:
-                        if '_proc' in f or '_coadded' in f:
+                        if '_proc' in f:
                             exclusion_indexes.append(index)
                             self.logger.debug(
                                 'Will overwrite existing processed file: %s', proc_file_name)
@@ -579,24 +583,28 @@ class ProcessFrame:
             "DETECT_TYPE": "CCD",
             "DETECT_MINAREA": 8,
             "DETECT_THRESH": sigma_clip,
-            "ANALYSIS_THRESH": 3.0,
+            "ANALYSIS_THRESH": 1.5,
             "FILTER": "Y",
             "FILTER_NAME": os.path.join(self.files_path, 'data', 'tophat_3.0_3x3.conv'),
             "DEBLEND_NTHRESH": 32,
             "DEBLEND_MINCONT": 0.005,
             "CLEAN": "Y",
             "CLEAN_PARAM": 1.0,
+            "WEIGHT_TYPE": "BACKGROUND",
+            "WEIGHT_IMAGE": os.path.join(self.files_path, 'master_bias_weight.fits'),
             "MASK_TYPE": "CORRECT",
             "PHOT_APERTURES": 10,
-            "PHOT_AUTOPARAMS": '2.5,5',
+            "PHOT_AUTOPARAMS": '2.5, 4',
+            "PHOT_AUTOAPERS": "0.0, 0.0",
             # "PHOT_PETROPARAMS": '2.0,2.73',
             # "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
             "SATUR_LEVEL": 50000,
+            "SATUR_KEY": 'SATURATE',
             "MAG_ZEROPOINT": 20,
             "MAG_GAMMA": 4.0,
             "GAIN": 10,
-            "PIXEL_SCALE": 0.53,
-            "SEEING_FWHM": 3.0,
+            "PIXEL_SCALE": 0.529,
+            "SEEING_FWHM": 4.0,
             "STARNNW_NAME": os.path.join(self.files_path, 'data', 'default.nnw'),
             "BACK_SIZE": 64,
             "BACK_FILTERSIZE": 3,
@@ -611,14 +619,13 @@ class ProcessFrame:
             sources = sew(proc_path)['table']
             sources = sources.to_pandas()
             # get only stellar sources
+            mask = (sources['FLAGS'] < 4)
+            mask &= (sources['FWHM_IMAGE'] > np.percentile(
+                sources['FWHM_IMAGE'][sources['FWHM_IMAGE'] > 0], 1))
+            # mask &= (sources['CLASS_STAR'] > 0.5)
+            sources = sources[mask]
             mask = (sources['FLUX_AUTO'] > np.percentile(
                 sources['FLUX_AUTO'], 80))
-            mask &= (sources['FLUX_AUTO'] > 5000)
-            mask &= (sources['FLAGS'] < 4)
-            mask &= (sources['FWHM_IMAGE'] > 1)
-            mask &= (sources['FWHM_IMAGE'] < 10)
-            mask &= (sources['CLASS_STAR'] > 0.5)
-
             sources = sources[mask]
 
             # sort sources by flux
@@ -671,7 +678,14 @@ class ProcessFrame:
         while _try_again:
             # run first sextractor and, if no enough sources, try daofinder
             sorted_sources = self.run_sewpy(raw_name, sigma_clip=_sigma_clip)
-            _fwhm_median = np.median(sorted_sources['FWHM_IMAGE'])
+            try:
+                _fwhm_median = np.median(sorted_sources['FWHM_IMAGE'])
+                self.logger.info(
+                    'Median FWHM of detected sources: %.2f', _fwhm_median)
+            except Exception as e:
+                self.logger.warning(
+                    'Could not compute median FWHM: %s', str(e))
+                _fwhm_median = 0.0
             if sorted_sources is None or len(sorted_sources) < self.min_sources:
                 self.logger.warning(
                     'Not enough sources detected with SExtractor. Trying DAOStarFinder.')
