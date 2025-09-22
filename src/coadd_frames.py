@@ -88,6 +88,9 @@ class CoaddFrames:
                 data, _ = reproject_interp(
                     (data, wcs), wcs0, shape_out=data_stack[0].shape)
                 print(f"Reprojected {f} %i of %i frames" % (i, len(files) - 1))
+                # subtract sky background
+                sky = np.nanmedian(data)
+                data -= sky
                 data_stack.append(data)
                 i += 1
 
