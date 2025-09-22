@@ -5,6 +5,7 @@ import numpy as np
 from astropy.io import fits
 from astropy.visualization import make_lupton_rgb
 from astropy.wcs import WCS
+from astropy.nddata import Cutout2D
 from reproject import reproject_interp
 from photutils.psf import fit_fwhm
 from photutils.detection import DAOStarFinder
@@ -37,10 +38,14 @@ def parse_arguments():
                         help='High percentile for scaling the image.')
     parser.add_argument('--smooth_factor', type=float, default=20.0,
                         help='Smoothing factor for the coloured image.')
+    parser.add_argument('--cutout', action='store_true',
+                        help='Create a cutout of the central 80 perc of the image.')
     parser.add_argument('--save_output', action='store_true',
                         help='Save the output coloured image to file.')
     parser.add_argument('--degrade_psf', action='store_true',
                         help='Degrade images to the worst PSF before combining.')
+    parser.add_argument('--rgb_weights', type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        help='Weights for B, G, R channels respectively. Default is 1.0 1.0 1.0.')
     parser.add_argument('--isforprint', action='store_true',
                         help='Adjust settings for print quality.')
     parser.add_argument('--verbose', action='store_true',
@@ -61,8 +66,10 @@ class ColouredImageMaker:
         self.low_perc = args.low_perc
         self.up_perc = args.up_perc
         self.smooth_factor = args.smooth_factor
+        self.cutout = args.cutout
         self.save_output = args.save_output
         self.degrade_psf = args.degrade_psf
+        self.rgb_weights = args.rgb_weights
         self.isforprint = args.isforprint
         self.verbose = args.verbose
 
@@ -110,11 +117,11 @@ class ColouredImageMaker:
             reference_img[0]).replace('.fits', '_reproj.fits'))
         hdul.writeto(path_ref, overwrite=True)
 
-    def coadd_imgs_per_channel(self, files_per_channel):
+    def coadd_imgs_per_channel(self, files_per_channel, ref_band='R'):
         hduls_list = {'B': [], 'G': [], 'R': []}
         all_files = [f for files in files_per_channel.values() for f in files]
         reference_img = [
-            f for f in all_files if 'R-Bessel' in os.path.basename(f)]
+            f for f in all_files if ref_band in os.path.basename(f)]
         ref_header = fits.getheader(reference_img[0])
         for band, files in files_per_channel.items():
             if not files:
@@ -152,8 +159,9 @@ class ColouredImageMaker:
                             data = hdul[0].data
                             data_stack.append(data)
                 data_stack = np.array(data_stack)
-                weighted_data = np.nanmedian(data_stack, axis=0)
-                hdu = fits.PrimaryHDU(weighted_data, header=ref_header)
+                # sum the images, ignoring nans
+                stacked_data = np.nansum(data_stack, axis=0)
+                hdu = fits.PrimaryHDU(stacked_data, header=ref_header)
                 hduls_list[band].append(hdu)
 
         return hduls_list
@@ -205,9 +213,28 @@ class ColouredImageMaker:
         if self.isforprint:
             lupton_path_print = lupton_path.replace('.png', '_print.png')
             print('Saving image for print to', lupton_path_print)
-        b_data = b_data / np.nanmedian(b_data)
-        g_data = g_data / np.nanmedian(g_data)
-        r_data = r_data / np.nanmedian(r_data)
+
+        if self.cutout:
+            # make a cut out of the central 80% of the image
+            cutout_size = (
+                int(b_data.shape[0] * 0.8), int(b_data.shape[1] * 0.8))
+            position = (b_data.shape[1] // 2, b_data.shape[0] // 2)
+            cutout = Cutout2D(b_data, position, cutout_size,
+                              wcs=WCS(hdul[0].header))
+            b_data = cutout.data
+            cutout = Cutout2D(g_data, position, cutout_size,
+                              wcs=WCS(hdul[0].header))
+            g_data = cutout.data
+            cutout = Cutout2D(r_data, position, cutout_size,
+                              wcs=WCS(hdul[0].header))
+            r_data = cutout.data
+        # remove sky background
+        b_data = b_data - np.nanmedian(b_data)
+        g_data = g_data - np.nanmedian(g_data)
+        r_data = r_data - np.nanmedian(r_data)
+        b_data = b_data / np.nanmax(b_data) * self.rgb_weights[0]
+        g_data = g_data / np.nanmax(g_data) * self.rgb_weights[1]
+        r_data = r_data / np.nanmax(r_data) * self.rgb_weights[2]
         low_val, up_val = np.nanpercentile(
             np.concatenate([r_data, g_data, b_data]), [self.low_perc, self.up_perc])
         stretch_val = up_val - low_val
@@ -263,9 +290,12 @@ class ColouredImageMaker:
             'R': r_files
         }
 
+        _ref_band = fits.getheader(os.path.join(
+            self.input_dir, g_files[0])).get('FILTER', '')
         self.reproject_into_reference_frame(
-            files_per_channel, ref_band='R-Bessel')
-        hduls_per_channel = self.coadd_imgs_per_channel(files_per_channel)
+            files_per_channel, ref_band=_ref_band)
+        hduls_per_channel = self.coadd_imgs_per_channel(
+            files_per_channel, ref_band=_ref_band)
         b_data, g_data, r_data = self.ajust_image(hduls_per_channel)
         path_reproj_ref = os.path.join(self.output_dir, os.path.basename(
             r_files[0]).replace('.fits', '_reproj.fits'))
