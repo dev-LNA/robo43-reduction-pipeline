@@ -40,6 +40,10 @@ def parse_arguments():
                         help='Smoothing factor for the coloured image.')
     parser.add_argument('--cutout', action='store_true',
                         help='Create a cutout of the central 80 perc of the image.')
+    parser.add_argument('--cutout_centre', type=float, nargs=2, default=None,
+                        help='Centre of the cutout RA and DEC in degrees. Default is image centre.')
+    parser.add_argument('--cutout_size', type=float, nargs=2, default=None,
+                        help='Size of the cutout in arcmin. Default is 80 perc of the image size.')
     parser.add_argument('--save_output', action='store_true',
                         help='Save the output coloured image to file.')
     parser.add_argument('--degrade_psf', action='store_true',
@@ -67,6 +71,8 @@ class ColouredImageMaker:
         self.up_perc = args.up_perc
         self.smooth_factor = args.smooth_factor
         self.cutout = args.cutout
+        self.cutout_centre = args.cutout_centre
+        self.cutout_size = args.cutout_size
         self.save_output = args.save_output
         self.degrade_psf = args.degrade_psf
         self.rgb_weights = args.rgb_weights
@@ -206,6 +212,64 @@ class ColouredImageMaker:
 
         return b_data, g_data, r_data
 
+    def get_cutout_params(self,
+                          rgb_data: np.ndarray | tuple,
+                          hdul: fits.HDUList,
+                          centre: list = None,
+                          size: list = None
+                          ):
+        """Get the cutout parameters."""
+        self.logger.warning("This is tentative and needs testing.")
+        if isinstance(rgb_data, tuple):
+            b_data, g_data, r_data = rgb_data
+            img_shape = b_data.shape
+        else:
+            b_data, g_data, r_data = rgb_data
+            img_shape = rgb_data[0].shape
+
+        if centre is None:
+            position = (img_shape[1] // 2, img_shape[0] // 2)
+            _centre = WCS(hdul[0].header).wcs_pix2world(
+                position[0], position[1], 0)
+            centre = (_centre[0], _centre[1])
+        else:
+            wcs = WCS(hdul[0].header)
+            position = wcs.wcs_world2pix(centre[0], centre[1], 0)
+            position = (int(position[0]), int(position[1]))
+            _centre = WCS(hdul[0].header).wcs_pix2world(
+                position[0], position[1], 0)
+            centre = (_centre[0], _centre[1])
+
+        if size is None:
+            cutout_size = (int(img_shape[0] * 0.8), int(img_shape[1] * 0.8))
+        else:
+            cutout_size = (int(size[1] * 60), int(size[0] * 60))
+
+        # update header with cutout info
+        cut_header = hdul[0].header.copy()
+        cut_header['CUTOUT'] = (True, 'Cutout created')
+        cut_header['CENRA'] = (float(centre[0]) if centre else None,
+                               'Cutout centre RA in degrees')
+        cut_header['CENDEC'] = (float(centre[1]) if centre else None,
+                                'Cutout centre DEC in degrees')
+        cut_header['CUTSIZ1'] = (
+            cutout_size[0], 'Cutout size in pixels axis 1')
+        cut_header['CUTSIZ2'] = (
+            cutout_size[1], 'Cutout size in pixels axis 2')
+        hdul[0].header = cut_header
+
+        cutout = Cutout2D(b_data, position, cutout_size,
+                          wcs=WCS(hdul[0].header))
+        b_data = cutout.data
+        cutout = Cutout2D(g_data, position, cutout_size,
+                          wcs=WCS(hdul[0].header))
+        g_data = cutout.data
+        cutout = Cutout2D(r_data, position, cutout_size,
+                          wcs=WCS(hdul[0].header))
+        r_data = cutout.data
+
+        return b_data, g_data, r_data, hdul
+
     def plot_and_save(self, b_data, g_data, r_data, hdul):
         """Plot and save the coloured image for the correspondent colour at each channel."""
         lupton_path = os.path.join(
@@ -216,18 +280,9 @@ class ColouredImageMaker:
 
         if self.cutout:
             # make a cut out of the central 80% of the image
-            cutout_size = (
-                int(b_data.shape[0] * 0.8), int(b_data.shape[1] * 0.8))
-            position = (b_data.shape[1] // 2, b_data.shape[0] // 2)
-            cutout = Cutout2D(b_data, position, cutout_size,
-                              wcs=WCS(hdul[0].header))
-            b_data = cutout.data
-            cutout = Cutout2D(g_data, position, cutout_size,
-                              wcs=WCS(hdul[0].header))
-            g_data = cutout.data
-            cutout = Cutout2D(r_data, position, cutout_size,
-                              wcs=WCS(hdul[0].header))
-            r_data = cutout.data
+            b_data, g_data, r_data, hdul = self.get_cutout_params(
+                (b_data, g_data, r_data), hdul, self.cutout_centre, self.cutout_size)
+
         # remove sky background
         b_data = b_data - np.nanmedian(b_data)
         g_data = g_data - np.nanmedian(g_data)
