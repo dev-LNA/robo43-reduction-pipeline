@@ -690,6 +690,11 @@ class ProcessFrame:
                 self.logger.warning(
                     'Not enough sources detected with SExtractor. Trying DAOStarFinder.')
                 wcs_header = None
+                _sigma_clip_old = _sigma_clip
+                _sigma_clip -= 0.5
+                self.logger.warning(
+                    'Not enough sources detected with SExtractor. \
+                        Trying lower sigma = %.1f' % (_sigma_clip))
             else:
                 self.logger.info(
                     'Proceeding with %d detected sources from SExtractor.', len(sorted_sources))
@@ -716,7 +721,7 @@ class ProcessFrame:
                             'Entering debug mode at brake point %i' % _brake_point)
                         import pdb
                         pdb.set_trace()
-            if _sigma_clip < 1.5 and wcs_header is None:
+            if _sigma_clip < 1.0 and wcs_header is None:
                 self.logger.warning(
                     "Sigma clipping value too low. Astrometry couldn't be solved.")
                 _try_again = False
@@ -739,7 +744,7 @@ class ProcessFrame:
                 self.logger.warning(
                     'Not enough sources detected with DAOStarFinder. \
                         Trying lower sigma = %.1f' % (_sigma_clip))
-                if _sigma_clip < 1.5:
+                if _sigma_clip < 1.0:
                     self.logger.warning(
                         "Sigma clipping value too low. Astrometry couldn't be solved.")
                     self.proc_status[raw_name]['proc_status'] = 'Astrometry solving failed'
@@ -777,7 +782,7 @@ class ProcessFrame:
                             'Entering debug mode at brake point %i' % _brake_point)
                         import pdb
                         pdb.set_trace()
-                if _sigma_clip < 2.0 and wcs_header is None:
+                if _sigma_clip < 1.0 and wcs_header is None:
                     self.logger.warning(
                         "Sigma clipping value too low. Astrometry couldn't be solved.")
                     _try_again = False
