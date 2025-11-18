@@ -180,6 +180,8 @@ class CalibrationMaker:
                 header = fits.getheader(filter_files[0])
                 header['NCOMBINE'] = (
                     len(filter_files), 'Number of combined frames')
+                if 'slot' in filter_name.lower():
+                    filter_name = 'CLEAR'
                 header['FILTER'] = (filter_name, 'Filter name')
                 hdul = fits.PrimaryHDU(master_flat, header=header)
                 master_flats[filter_name] = hdul
