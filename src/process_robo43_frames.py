@@ -871,7 +871,7 @@ class ProcessFrame:
         if self.debug or self.runtest or self.np < 1:
             show = True
         if self.save_processed:
-            plt.savefig(png_file_name)
+            plt.savefig(png_file_name.strip())
             self.logger.info('Saved plot to: %s', png_file_name)
             if show:
                 plt.show()
@@ -964,7 +964,8 @@ class ProcessFrame:
 
             if self.save_processed:
                 proc_file_name = os.path.join(
-                    self.output_dir, os.path.basename(fits_file).replace(self.post_fix, '_proc' + self.post_fix))
+                    self.output_dir, os.path.basename(fits_file).replace(
+                        self.post_fix, '_proc' + self.post_fix)).strip()
                 processed_data.writeto(proc_file_name, overwrite=self.clobber)
                 self.proc_status[os.path.basename(
                     fits_file)]['proc_file'] = os.path.basename(proc_file_name)
