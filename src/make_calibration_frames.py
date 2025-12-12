@@ -128,6 +128,8 @@ class CalibrationMaker:
         self.logger.info('Creating master flat frame...')
         flat_frames = []
         master_flats = {}
+        valid_filters = ['U-Bessell', 'B-Bessell', 'V-Bessell', 'R-Bessell',
+                         'I-Bessell', 'Clear', 'NoFilter', 'Halpha', 'Methane']
         # remove master_bias from the images before combining
         master_bias_path = os.path.join(self.output_dir, 'master_bias.fits')
         if os.path.exists(master_bias_path):
@@ -136,12 +138,18 @@ class CalibrationMaker:
                 master_bias = hdul[0].data
         else:
             self.logger.error(
-                f'Master bias frame not found at {master_bias_path}. Cannot proceed with flat creation.')
+                f'Master bias frame not found at {master_bias_path}. \
+                Cannot proceed with flat creation.')
             raise FileNotFoundError(
-                f'Master bias frame not found at {master_bias_path}. Cannot proceed with flat creation.')
+                f'Master bias frame not found at {master_bias_path}. \
+                Cannot proceed with flat creation.')
 
         for filter_name in filters_list:
             self.logger.info(f'Processing filter: {filter_name}')
+            if filter_name not in valid_filters:
+                self.logger.warning(
+                    f'Filter {filter_name} not in valid filters list. Skipping.')
+                continue
             filter_files = [f for f in filelist if fits.getheader(
                 f).get('FILTER', 'Unknown') == filter_name]
             if len(filter_files) == 0:
