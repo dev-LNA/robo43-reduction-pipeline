@@ -1,0 +1,4 @@
+photutils
+astropy
+numpy
+astroquery
