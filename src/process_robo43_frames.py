@@ -387,6 +387,12 @@ class ProcessFrame:
             sorted_sources = sorted_sources[:150]
             self.logger.warning(
                 'Limiting to top 150 sources for astrometry solving.')
+
+        if ':' in hdul[0].header['RA']:
+            _coordinates = SkyCoord(
+                hdul[0].header['RA'], hdul[0].header['DEC'], unit=('hour', 'deg'))
+            _ra_deg, _dec_deg = _coordinates.ra.deg, _coordinates.dec.deg
+
         with astrometry.Solver(
             astrometry.series_5200.index_files(
                 cache_directory="/home/herpich/Documents/.astrometry",
@@ -409,9 +415,8 @@ class ProcessFrame:
                                         lower_arcsec_per_pixel=0.2,
                                         upper_arcsec_per_pixel=1.0),
                                     position_hint=astrometry.PositionHint(
-                                        ra_deg=hdul[0].header.get('RA', None),
-                                        dec_deg=hdul[0].header.get(
-                                            'DEC', None),
+                                        ra_deg=_ra_deg,
+                                        dec_deg=_dec_deg,
                                         radius_deg=2.0),
                                     solution_parameters=astrometry.SolutionParameters())
             if self.debug:
@@ -573,7 +578,7 @@ class ProcessFrame:
                 pdb.set_trace()
             return e
 
-    def run_sewpy(self, raw_name, sigma_clip=3.0):
+    def run_sewpy(self, raw_name, sigma_clip=2.0):
         proc_path = os.path.join(
             self.output_dir, raw_name.replace(self.post_fix, f'_proc{self.post_fix}'))
         out_params = ['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'FLUX_AUTO',
@@ -598,7 +603,7 @@ class ProcessFrame:
             "PHOT_AUTOAPERS": "0.0, 0.0",
             # "PHOT_PETROPARAMS": '2.0,2.73',
             # "PHOT_FLUXFRAC": '0.2,0.5,0.7,0.9',
-            "SATUR_LEVEL": 50000,
+            "SATUR_LEVEL": 200000,
             "SATUR_KEY": 'SATURATE',
             "MAG_ZEROPOINT": 20,
             "MAG_GAMMA": 4.0,
@@ -976,6 +981,8 @@ class ProcessFrame:
                 processed_data = self.guess_ra_dec(proc_path, fits_file)
 
             if 'RA' in processed_data[0].header and 'DEC' in processed_data[0].header:
+                import pdb
+                pdb.set_trace()
                 self.logger.info(
                     'RA and DEC found in header: RA=%s, DEC=%s',
                     processed_data[0].header['RA'], processed_data[0].header['DEC'])
