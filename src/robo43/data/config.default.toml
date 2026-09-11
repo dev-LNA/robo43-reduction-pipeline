@@ -1,0 +1,137 @@
+# Packaged default configuration for the robo43 pipeline.
+#
+# This is the lowest-precedence layer.  Override it with
+# ~/.config/robo43/config.toml, a --config file, ROBO43_<SECTION>_<FIELD>
+# environment variables, or a CLI flag -- in that increasing order.
+#
+# Values that vary from telescope to telescope (plate scale, gain, saturation,
+# filter map, site) are NOT here: they belong to an instrument profile under
+# robo43/data/instruments/.
+
+[paths]
+fits_patterns = ["*.fits", "*.fit", "*.fts",
+                 "*.fits.fz", "*.fits.gz", "*.fit.fz", "*.fit.gz",
+                 "*.fts.fz", "*.fts.gz"]
+
+[astrometry]
+# index_dir is deliberately unset: there is no sensible default location for
+# the astrometry.net index files, and the legacy hard-coded
+# /home/herpich/Documents/.astrometry only ever worked on one machine.
+search_radius_deg = 0.5
+scale_tolerance = 0.03
+solve_timeout_s = 120.0
+frame_budget_s = 300.0
+max_sources = 150
+min_sources = 20
+rms_max_arcsec = 0.3
+refine_with_gaia = true
+sip_order = 3
+use_web_fallback = false
+grid_sample = true
+
+[photometry]
+instrumental_zp = 20.0
+aperture_radii_arcsec = [2.0, 3.0, 4.0, 6.0, 8.0]
+detect_thresh = 1.5
+analysis_thresh = 1.5
+detect_minarea = 5
+detect_filter = "tophat_3.0_3x3.conv"
+deblend_nthresh = 32
+deblend_mincont = 0.005
+back_size = 64
+back_filtersize = 3
+seeing_fwhm_arcsec = 4.0
+snr_min = 5.0
+fwhm_min_arcsec = 0.5
+fwhm_max_arcsec = 8.0
+ellipticity_max = 0.3
+edge_margin_px = 20
+edge_margin_fwhm = 3.0
+saturation_fraction = 0.9
+nonlinearity_fraction = 0.8
+isolation_radius_arcsec = 3.0
+class_star_min = 0.8
+reference_catalog = "gaia"
+zp_sigma_clip = 3.0
+zp_min_stars = 10
+zp_rms_max = 0.05
+catalog_format = "mef"
+write_catalog = true
+
+[calib]
+combine_method = "mean"
+sigma_clip_low = 3.0
+sigma_clip_high = 3.0
+sigma_clip_maxiters = 5
+max_memory_mb = 2048.0
+flat_min_level_frac = 0.20
+flat_max_level_frac = 0.70
+flat_norm_region_frac = 0.5
+dark_temp_tolerance_c = 0.5
+dark_exptime_tolerance_s = 0.5
+dark_doubling_temp_c = 6.5
+dark_temp_extrap_max_c = 5.0
+hot_pixel_nmad = 5.0
+dead_pixel_frac = 0.5
+unstable_pixel_nmad = 5.0
+bad_column_frac = 0.10
+cosmic_ray_rejection = true
+cosmic_ray_sigclip = 4.5
+overscan_correct = true
+overscan_detect = true
+overscan_bias_tol_frac = 0.10
+overscan_min_line_frac = 0.0015
+apply_gain = true
+nonlinearity_correct = false
+separate_dome_and_sky_flats = true
+
+[coadd]
+scale_by = "exptime"
+sky_subtract = false
+reject_sigma = 3.0
+combine = "weighted_mean"
+min_frames = 2
+
+[diagnostics]
+level = "summary"
+decimate = 4
+figsize = [10.0, 8.0]
+dpi = 100
+
+[db]
+enabled = false
+statement_timeout_ms = 60000
+pool_pre_ping = true
+pool_size = 5
+schema_raw = "raw"
+schema_reduced = "reduced"
+
+[service]
+settle_seconds = 10.0
+rescan_seconds = 300.0
+workers = 4
+max_attempts = 3
+backoff_base_s = 30.0
+metrics_port = 9109
+metrics_enabled = true
+strict = true
+lock_key = 4304043
+
+[targets]
+calibration_object_names = ["flat", "dark", "bias", "trash"]
+
+[targets.aliases]
+"eta car" = ["etacar", "eta carinae", "etacarnebula"]
+"m42" = ["orion nebula", "ngc1976", "m42"]
+"eso 97-g13" = ["circinus galaxy", "circinus", "cir galaxy"]
+"tyc 4663-974-1" = ["saturn"]
+
+[runtime]
+nprocs = 1
+loglevel = "INFO"
+json_logs = false
+strict = false
+assume_profile_defaults = false
+dry_run = false
+clobber = false
+pdb = false

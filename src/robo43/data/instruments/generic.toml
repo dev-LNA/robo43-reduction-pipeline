@@ -1,0 +1,15 @@
+[instrument]
+name = "generic"
+matches = { TELESCOP = ["*"] }
+pixel_scale_arcsec = "derive"
+binning_keyword = "XBINNING"
+
+[instrument.layout]
+science_hdu = 0
+
+[instrument.filters]
+valid = []
+
+[instrument.astrometry]
+index_scales = "derive"
+search_radius_deg = 0.5

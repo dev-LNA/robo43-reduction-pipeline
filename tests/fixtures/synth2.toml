@@ -1,0 +1,37 @@
+[instrument]
+name = "synth2"
+matches = { TELESCOP = ["SYNTH2-TEL"], INSTRUME = ["*"] }
+pixel_scale_arcsec = "derive"
+gain_e_per_adu = 2.0
+read_noise_e = 6.0
+saturation_adu = 65000
+nonlinearity_adu = 55250
+
+binning_keyword = "XBINNING"
+
+[instrument.layout]
+science_hdu = "SCI"
+n_amplifiers = 1
+flip_y = false
+
+[instrument.filters]
+valid = ["V", "B", "R"]
+
+[instrument.filters.map]
+
+[instrument.keywords]
+exptime = ["EXPOSURE"]
+imagetyp = ["IMGTYPE"]
+ccd_temp = ["SET-TEMP"]
+ra = ["OBJCTRA"]
+dec = ["OBJCTDEC"]
+
+[instrument.imagetyp_map]
+"bias" = "bias"
+"dark" = "dark"
+"flat" = "flat"
+"object" = "science"
+
+[instrument.astrometry]
+index_scales = "derive"
+search_radius_deg = 0.5

@@ -1,0 +1,58 @@
+[instrument]
+name = "robo43"
+matches = { TELESCOP = ["ROBO43", "Robo-43"], INSTRUME = ["*"] }
+pixel_scale_arcsec = 0.529
+gain_e_per_adu = 10.0
+read_noise_e = 7.0
+# process_robo43_frames.py used SATUR_LEVEL=200000, get_photometry.py used 55000;
+# the two legacy configs disagreed. 55000 ADU is the physically plausible full-well
+# for this detector and is what the refactor plan (§1B.2) specifies -- used here.
+saturation_adu = 55000
+nonlinearity_adu = 45000
+binning_keyword = "XBINNING"
+
+# Overscan and trim regions are deliberately not hardcoded here because they
+# vary with observation mode and with the instrument+telescope combination.
+# These regions are detected at runtime from flat and bias frames by
+# src/robo43/calib/overscan.py.
+[instrument.layout]
+science_hdu = 0
+n_amplifiers = 1
+flip_y = false
+
+[instrument.filters]
+valid = ["U-Bessell", "B-Bessell", "V-Bessell", "R-Bessell", "I-Bessell", "Clear", "Halpha", "Methane"]
+
+[instrument.filters.map]
+"Slot 0/Slot 1" = "U-Bessell"
+"Slot 0/Slot 2" = "B-Bessell"
+"Slot 0/Slot 3" = "V-Bessell"
+"Slot 0/Slot 4" = "R-Bessell"
+"Slot 0/Slot 5" = "I-Bessell"
+"Slot 0/Slot 6" = "Clear"
+"Slot 1/Slot 0" = "Halpha"
+"Slot 2/Slot 0" = "Methane"
+
+[instrument.keywords]
+exptime = ["EXPTIME", "EXPOSURE"]
+imagetyp = ["IMAGETYP", "IMGTYPE", "OBSTYPE", "FRAMETYP"]
+ccd_temp = ["CCD-TEMP", "CCDTEMP", "SET-TEMP", "TEMPERAT"]
+ra = ["RA", "OBJCTRA", "TELRA", "CRVAL1"]
+dec = ["DEC", "OBJCTDEC", "TELDEC", "CRVAL2"]
+
+[instrument.imagetyp_map]
+"Light Frame" = "science"
+"Bias Frame" = "bias"
+"Dark Frame" = "dark"
+"Flat Field" = "flat"
+"zero" = "bias"
+"object" = "science"
+
+[instrument.site]
+lat_deg = -22.53
+lon_deg = -45.58
+elevation_m = 1864
+
+[instrument.astrometry]
+index_scales = "derive"
+search_radius_deg = 0.5

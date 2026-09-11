@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robo43"
+dynamic = ["version"]
+description = "Telescope-agnostic photometric reduction pipeline for ROBO43 data."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{name = "F. R. Herpich", email = "fherpich@lna.br"}]
+dependencies = [
+    "numpy>=2.0",
+    "astropy>=7.0",
+    "scipy>=1.14",
+    "pandas>=2.2",
+    "matplotlib>=3.9",
+    "photutils>=2.0",
+    "astroquery>=0.4.10",
+    "reproject>=0.14",
+    "sewpy @ git+https://github.com/megalut/sewpy.git",
+    "astrometry>=4.0",
+    "astroscrappy>=1.2",
+]
+
+[project.optional-dependencies]
+db = ["sqlalchemy>=2.0", "psycopg[binary]>=3.2", "alembic>=1.13"]
+service = ["watchdog>=4.0"]
+dev = ["pytest>=8", "pytest-cov", "ruff", "mypy"]
+all = [
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "watchdog>=4.0",
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+robo43 = "robo43.cli.main:main"
+
+[tool.hatch.version]
+path = "src/robo43/__init__.py"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robo43"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PTH", "C4", "ARG", "TID"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# Make the suite runnable straight from a checkout with no install step:
+# `python3 -m pytest` then works without PYTHONPATH gymnastics, and CI can
+# lint and test before it builds the wheel.
+pythonpath = ["src"]
+markers = [
+    "needs_sextractor: requires the source-extractor binary",
+    "needs_db: requires a database connection",
+    "needs_astrometry_index: requires local astrometry.net index files",
+    "slow: slow-running test",
+]

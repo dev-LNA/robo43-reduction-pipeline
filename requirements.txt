@@ -1,4 +1,14 @@
-photutils
-astropy
-numpy
-astroquery
+# `pip install .` (from the repo root) is the supported installation path;
+# this file exists only for convenience (e.g. `pip install -r requirements.txt`
+# in an existing environment).
+numpy>=2.0
+astropy>=7.0
+scipy>=1.14
+pandas>=2.2
+matplotlib>=3.9
+photutils>=2.0
+astroquery>=0.4.10
+reproject>=0.14
+sewpy @ git+https://github.com/megalut/sewpy.git
+astrometry>=4.0
+astroscrappy>=1.2
