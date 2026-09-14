@@ -19,11 +19,11 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from robo43.calib.bias import apply_overscan_trim, select_frames
+from robo43.calib.bias import apply_overscan_trim, resolve_common_gain, select_frames
 from robo43.calib.combine import combine_stack
 from robo43.calib.master import MasterFrame
 from robo43.config import Settings
@@ -31,6 +31,9 @@ from robo43.exceptions import CalibrationError
 from robo43.instruments.profile import InstrumentProfile
 from robo43.io.fits_io import read_image
 from robo43.io.meta import FrameMeta
+
+if TYPE_CHECKING:
+    from robo43.calib.gain import GainMeasurementSet
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +103,20 @@ def build_master_darks(
     profile: InstrumentProfile,
     outdir: str | Path,
     bias: MasterFrame | None = None,
+    gain_measurements: GainMeasurementSet | None = None,
 ) -> tuple[dict[tuple[float, float | None], MasterFrame], MasterFrame]:
     """Build and write one master dark per (exptime, ccd_temp) group, plus a
-    composite dark-current map."""
+    composite dark-current map.
+
+    ``gain_measurements`` is the night's runtime PTC measurement (see
+    :mod:`robo43.calib.gain`); each group's e-/ADU value is looked up from it
+    by that group's own (readout_mode, gain_setting, binning) and is
+    ``None`` when unmeasured -- never a profile fallback. The composite
+    dark-current map (e-/s) needs a numeric gain to convert from ADU/s; a
+    group with no measurement falls back to 1.0 (i.e. contributes an
+    ADU/s-equivalent, not a true e-/s current) and is logged as such, rather
+    than raising or silently invoking the profile.
+    """
     dark_metas_all = select_frames(metas, "dark")
     if not dark_metas_all:
         msg = "no dark frames found to build master darks"
@@ -130,10 +144,23 @@ def build_master_darks(
     group_temps: list[float] = []
     group_temp_n_combines: list[int] = []
 
-    gain = profile.gain_e_per_adu or 1.0
-
     for g in groups:
         group_metas: list[FrameMeta] = g["metas"]
+        gain_setting, _gain_setting_origin = resolve_common_gain(group_metas, profile=profile)
+        readout_mode = next(
+            (m.readout_mode for m in group_metas if m.readout_mode is not None), None
+        )
+        binning = next((m.binning for m in group_metas if m.binning is not None), 1)
+        measurement = (
+            gain_measurements.get(readout_mode, gain_setting, binning)
+            if gain_measurements is not None
+            else None
+        )
+        gain_e_per_adu = measurement.gain_e_per_adu if measurement is not None else None
+        read_noise_e = (
+            measurement.read_noise_e if measurement is not None else profile.read_noise_e
+        )
+
         frames: list[np.ndarray] = []
         for meta in group_metas:
             data, _header = read_image(meta.path, profile)
@@ -152,8 +179,8 @@ def build_master_darks(
             result = combine_stack(
                 frames,
                 settings.calib,
-                read_noise_e=profile.read_noise_e,
-                gain_e_per_adu=profile.gain_e_per_adu,
+                read_noise_e=read_noise_e,
+                gain_e_per_adu=gain_e_per_adu,
             )
             group_data = result.data
             group_variance = result.variance
@@ -178,6 +205,12 @@ def build_master_darks(
             bias.path.name if bias is not None and bias.path is not None else "NONE"
         )
         header_cards.append(("BIASFIL", bias_filename, "Master bias applied"))
+        if measurement is not None:
+            header_cards.extend(measurement.header_cards())
+        else:
+            from robo43.calib.gain import no_measurement_cards
+
+            header_cards.extend(no_measurement_cards(gain_setting, readout_mode))
         header_cards.extend(combine_cards)
 
         group_master = MasterFrame(
@@ -193,7 +226,14 @@ def build_master_darks(
 
         masters[(mean_exp, mean_temp)] = group_master
 
-        current_e_per_s = (group_data * gain) / mean_exp
+        if gain_e_per_adu is None:
+            logger.warning(
+                "dark group readout=%s setting=%g: no measured gain; "
+                "dark-current map contribution for this group is an "
+                "ADU/s-equivalent, not true e-/s.",
+                readout_mode, gain_setting,
+            )
+        current_e_per_s = (group_data * (gain_e_per_adu if gain_e_per_adu is not None else 1.0)) / mean_exp
         group_currents.append(current_e_per_s)
         group_n_combines.append(n_combine)
         if mean_temp is not None:
@@ -236,8 +276,19 @@ def select_dark(
     *,
     settings: Settings,
     profile: InstrumentProfile,
+    gain: float | None = None,
 ) -> DarkSelection:
-    """Choose the best available master dark for a target exptime/temperature."""
+    """Choose the best available master dark for a target exptime/temperature.
+
+    ``gain`` is the *target* frame's own measured e-/ADU value (from
+    :mod:`robo43.calib.gain`, looked up by the caller for this frame's own
+    (readout_mode, gain_setting, binning)) -- used only in the
+    ``current_map`` branch, to convert the physical electron/s dark-current
+    map back into the ADU units of the frame it will be subtracted from.
+    There is no profile fallback: when the frame's group has no
+    measurement, ``gain`` is ``None`` and the conversion instead treats the
+    map as ADU/s-equivalent (see the warning logged where this is applied).
+    """
     for entry in darks:
         exp_ok = abs(entry.exptime - exptime) <= settings.calib.dark_exptime_tolerance_s
         temp_ok = (ccd_temp is None and entry.ccd_temp is None) or (
@@ -283,8 +334,13 @@ def select_dark(
             )
             return DarkSelection(entry=None, scale=0.0, method="none", reason=reason)
 
-        gain = profile.gain_e_per_adu or 1.0
-        map_adu_per_s = dark_current_map / gain
+        if gain is None:
+            logger.warning(
+                "no measured gain for this frame's group; converting the "
+                "dark-current map assuming it is already ADU/s-equivalent."
+            )
+        effective_gain = gain if gain is not None else 1.0
+        map_adu_per_s = dark_current_map / effective_gain
         wrapper = DarkEntry(
             path=Path("dark_current_map.fits"),
             exptime=1.0,

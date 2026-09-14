@@ -2,7 +2,9 @@
 
 Orchestrates the full reduction pipeline: inventories input frames, detects or
 applies overscan geometry, builds or reuses calibration masters (bias, darks,
-flats), reduces all valid science frames to *_proc.fits, and writes a status CSV.
+flats), reduces all valid science frames to *_proc.fits, writes a status CSV,
+and appends one entry per frame to change_log.jsonl recording every change
+made to its data and header (see robo43.reduce.changelog).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import TYPE_CHECKING
 from robo43.calib.bias import build_master_bias, select_frames
 from robo43.calib.dark import build_master_darks
 from robo43.calib.flat import build_master_flats, group_flats_by_filter
+from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurementSet, measure_gain
 from robo43.calib.masks import MaskSet
 from robo43.calib.overscan import detect_overscan
 from robo43.calib.set import CalibrationSet
@@ -25,6 +28,7 @@ from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header
 from robo43.io.headers import read_meta
 from robo43.io.validate import OverrideSet
+from robo43.reduce.changelog import append_change_log
 from robo43.reduce.frame import reduce_frame
 
 if TYPE_CHECKING:
@@ -214,6 +218,30 @@ def _run(args: argparse.Namespace) -> int:
         logger.error("failed to create directories: %s", exc)
         return 2
 
+    # Gain measurement (runtime photon-transfer from this night's own flats
+    # and biases; see robo43.calib.gain). Cached alongside the other masters
+    # so a rerun does not re-measure. A group with no measurement (e.g. no
+    # flats/biases at that GAIN setting) is absent from the set entirely --
+    # reduce_frame() then reduces frames in that group in ADU.
+    gain_file = calibdir_path / DEFAULT_GAIN_MEASUREMENTS_NAME
+    if gain_file.exists():
+        logger.info("%s exists, loading cached gain measurements", gain_file.name)
+        gain_measurements = GainMeasurementSet.read(gain_file)
+    else:
+        try:
+            gain_measurements = measure_gain(
+                metas, settings=settings, profile=profile, overscan=overscan_geometry
+            )
+            gain_measurements.write(gain_file)
+            logger.info(
+                "measured gain for %d group(s): %s",
+                len(gain_measurements.measurements),
+                sorted(gain_measurements.measurements),
+            )
+        except Exception as exc:
+            logger.error("failed to measure gain: %s", exc)
+            gain_measurements = GainMeasurementSet({})
+
     # Build master bias
     bias_master = None
     bias_metas = select_frames(metas, "bias")
@@ -234,6 +262,7 @@ def _run(args: argparse.Namespace) -> int:
                         profile=profile,
                         outdir=calibdir_path,
                         overscan=overscan_geometry,
+                        gain_measurements=gain_measurements,
                     )
                 except Exception as exc:
                     logger.error("failed to build master_bias: %s", exc)
@@ -247,6 +276,7 @@ def _run(args: argparse.Namespace) -> int:
                     profile=profile,
                     outdir=calibdir_path,
                     overscan=overscan_geometry,
+                    gain_measurements=gain_measurements,
                 )
             except Exception as exc:
                 logger.error("failed to build master_bias: %s", exc)
@@ -275,6 +305,7 @@ def _run(args: argparse.Namespace) -> int:
                     profile=profile,
                     outdir=calibdir_path,
                     bias=bias_master,
+                    gain_measurements=gain_measurements,
                 )
             except Exception as exc:
                 logger.error("failed to build master_darks: %s", exc)
@@ -343,6 +374,7 @@ def _run(args: argparse.Namespace) -> int:
                         bias=bias_master,
                         mask=mask_obj,
                         overscan=overscan_geometry,
+                        gain_measurements=gain_measurements,
                     )
                 except Exception as exc:
                     logger.error("failed to build master_flats: %s", exc)
@@ -412,6 +444,21 @@ def _run(args: argparse.Namespace) -> int:
                 status.proc_code = 4
                 status.proc_status = "FAILED"
                 status.error = str(exc)
+
+            # Append this frame's entry to the per-frame change log. Never
+            # allowed to fail the reduction: append_change_log catches its
+            # own errors, but re-reading the raw header here can also raise
+            # (e.g. the raw file vanished between reduction and now), so
+            # that is guarded too.
+            try:
+                raw_header_for_log = read_header(sci_meta.path, profile)
+                append_change_log(
+                    outdir_path, sci_meta, raw_header_for_log, product.header, status
+                )
+            except Exception as exc:
+                logger.warning(
+                    "failed to write change-log entry for %s: %s", sci_meta.path, exc
+                )
 
             # Tally status
             if status.proc_code == 0:

@@ -70,6 +70,12 @@ class InstrumentProfile:
     name: str
     matches: dict[str, tuple[str, ...]]
     pixel_scale_arcsec: float | None
+    # A static e-/ADU conversion, loadable for an instrument whose gain truly
+    # is a fixed constant. ROBO43's profile omits it: the QHY600M's GAIN
+    # header keyword is a vendor setting index, not a conversion factor, so
+    # nothing may fall back to this field for it -- the physical value is
+    # measured at runtime instead (see robo43.calib.gain). ``None`` here
+    # means "not a fixed instrument property"; it is never silently assumed.
     gain_e_per_adu: float | None
     read_noise_e: float | None
     saturation_adu: float | None

@@ -658,3 +658,126 @@ def test_reduce_rebuilds_masters_with_clobber(tmp_path):
     # With clobber, master should be rebuilt (may have different content or mtime)
     # We just verify the file still exists after the rebuild
     assert master_flat_path.exists()
+
+
+def test_reduce_writes_change_log_jsonl(tmp_path):
+    """change_log.jsonl is written to the output directory, one line per reduced frame."""
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    calib_dir = tmp_path / "calib"
+    _create_synthetic_masters(calib_dir, _profile())
+
+    _write_synthetic_frame(frame_dir / "science_1.fits", frame_type="science", filter_name="R")
+    _write_synthetic_frame(frame_dir / "science_2.fits", frame_type="science", filter_name="R")
+
+    outdir = tmp_path / "output"
+
+    result = main([
+        "reduce",
+        str(frame_dir),
+        "--calibdir", str(calib_dir),
+        "--outdir", str(outdir),
+        "--loglevel", "INFO",
+    ])
+    assert result == 0
+
+    log_path = outdir / "change_log.jsonl"
+    assert log_path.exists()
+
+    import json
+
+    with log_path.open() as f:
+        lines = [line for line in f if line.strip()]
+    assert len(lines) == 2
+
+    records = [json.loads(line) for line in lines]
+    for record in records:
+        assert "raw_path" in record
+        assert "header_changes" in record
+        assert "steps" in record
+        assert "field_provenance" in record
+
+        step_names = {s["step"] for s in record["steps"]}
+        assert "bias" in step_names
+        assert "gain" in step_names
+
+        bias_step = next(s for s in record["steps"] if s["step"] == "bias")
+        assert bias_step["applied"] is True
+        assert bias_step["data_before"] is not None
+        assert bias_step["data_after"] is not None
+
+        # No flat/bias raw frames were present alongside these science
+        # frames (masters were pre-built directly), so this GAIN=2.0 setting
+        # was never measured by photon transfer -- the change log must make
+        # that unambiguous rather than reporting a guessed e-/ADU value.
+        gain_step = next(s for s in record["steps"] if s["step"] == "gain")
+        assert gain_step["applied"] is False
+        assert gain_step["params"]["GAINVAL"] == "NONE"
+        assert gain_step["params"]["GAINSRC"] == "none"
+
+
+def _write_frame_with_level(
+    path: Path, *, frame_type: str, level: float, filter_name: str = "R"
+) -> None:
+    """Like _write_synthetic_frame, but with a controllable pixel level --
+    _write_synthetic_frame's fixed 1000.0 for every frame type makes a flat
+    minus a same-level bias zero everywhere, which is fine for tests that
+    never combine raw bias+flat frames but wrong for one that does."""
+    shape = (128, 128)
+    data = np.ones(shape, dtype=np.float32) * level
+    hdu = fits.PrimaryHDU(data=data)
+    hdu.header["IMAGETYP"] = frame_type.upper()
+    hdu.header["EXPTIME"] = 10.0
+    hdu.header["FILTER"] = filter_name
+    hdu.header["VALID"] = True
+    hdu.header["DATE-OBS"] = "2024-01-01T00:00:00"
+    hdu.header["NAXIS1"] = shape[1]
+    hdu.header["NAXIS2"] = shape[0]
+    hdu.header["GAIN"] = 2.0
+    hdu.header["READNOISE"] = 5.0
+    hdu.header["SATURATE"] = 60000.0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu.writeto(path, overwrite=True)
+
+
+def test_reduce_caches_gain_measurements_json(tmp_path):
+    """gain_measurements.json is written to calibdir; with noiseless synthetic
+    data no group has a positive variance excess, so it caches an empty set
+    rather than a guessed value -- and the science frame still reduces (in
+    ADU) rather than failing."""
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    calib_dir = tmp_path / "calib"
+
+    _write_frame_with_level(frame_dir / "bias_1.fits", frame_type="bias", level=100.0)
+    _write_frame_with_level(frame_dir / "bias_2.fits", frame_type="bias", level=100.0)
+    _write_frame_with_level(frame_dir / "flat_1.fits", frame_type="flat", level=20000.0)
+    _write_frame_with_level(frame_dir / "flat_2.fits", frame_type="flat", level=20000.0)
+    _write_synthetic_frame(frame_dir / "science_1.fits", frame_type="science", filter_name="R")
+
+    outdir = tmp_path / "output"
+
+    result = main([
+        "reduce",
+        str(frame_dir),
+        "--calibdir", str(calib_dir),
+        "--outdir", str(outdir),
+        "--no-overscan",
+        "--loglevel", "INFO",
+    ])
+    assert result == 0
+
+    gain_file = calib_dir / "gain_measurements.json"
+    assert gain_file.exists()
+
+    import json
+
+    with gain_file.open() as f:
+        records = json.load(f)
+    assert records == []  # noiseless synthetic data: no positive variance excess
+
+    assert (outdir / "science_1_proc.fits").exists()
+    with fits.open(outdir / "science_1_proc.fits") as hdul:
+        assert hdul["SCI"].header["BUNIT"] == "adu"
+        assert hdul["SCI"].header["GAINSRC"] == "none"

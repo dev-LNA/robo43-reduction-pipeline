@@ -14,12 +14,13 @@ import pytest
 from astropy.io import fits
 
 from robo43.calib.dark import DarkEntry
+from robo43.calib.gain import GainMeasurement, GainMeasurementSet
 from robo43.calib.masks import MaskSet, minimal_mask
 from robo43.calib.overscan import OverscanGeometry
 from robo43.calib.set import CalibrationSet
 from robo43.config import CalibSettings, RuntimeSettings, Settings
 from robo43.instruments.profile import InstrumentLayout, InstrumentProfile
-from robo43.io.meta import FrameMeta
+from robo43.io.meta import FieldOrigin, FrameMeta, Source
 from robo43.products.dq import DQ, DQ_DTYPE
 from robo43.reduce.frame import reduce_frame
 
@@ -85,7 +86,7 @@ def _meta(path: Path, shape: tuple[int, int], **kwargs) -> FrameMeta:
         "dec_deg": None,
         "pixel_scale": None,
         "ccd_temp": 20.0,
-        "gain": None,
+        "gain_setting": 10.0,
         "read_noise": None,
         "saturation": None,
         "airmass": None,
@@ -94,6 +95,7 @@ def _meta(path: Path, shape: tuple[int, int], **kwargs) -> FrameMeta:
         "instrument": None,
         "observer": None,
         "binning": None,
+        "readout_mode": None,
         "focal_length_mm": None,
         "site_lat_deg": None,
         "site_lon_deg": None,
@@ -106,6 +108,30 @@ def _meta(path: Path, shape: tuple[int, int], **kwargs) -> FrameMeta:
     }
     defaults.update(kwargs)
     return FrameMeta(**defaults)
+
+
+def _gain_measurements(
+    gain_e_per_adu: float,
+    *,
+    read_noise_e: float = 5.0,
+    readout_mode: str = "UNKNOWN",
+    gain_setting: float = 10.0,
+    binning: int = 1,
+) -> GainMeasurementSet:
+    """A GainMeasurementSet with one measurement matching ``_meta()``'s
+    default (readout_mode, gain_setting, binning), for tests that need
+    reduce_frame to resolve a specific e-/ADU value."""
+    measurement = GainMeasurement(
+        readout_mode=readout_mode,
+        gain_setting=gain_setting,
+        binning=binning,
+        gain_e_per_adu=gain_e_per_adu,
+        read_noise_e=read_noise_e,
+        n_pairs=3,
+        scatter_frac=0.0,
+    )
+    key = (readout_mode, float(gain_setting), int(binning))
+    return GainMeasurementSet({key: measurement})
 
 
 def test_reduce_frame_full_path(tmp_path):
@@ -168,6 +194,7 @@ def test_reduce_frame_full_path(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=_gain_measurements(2.0),
     )
 
     # Create metadata
@@ -232,6 +259,7 @@ def test_reduce_frame_no_mask_fallback_to_minimal_with_nan(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=None,  # No static mask -> will use minimal_mask
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -298,6 +326,7 @@ def test_reduce_frame_signal_recovery(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=_gain_measurements(1.5),
     )
 
     # Create metadata
@@ -354,6 +383,7 @@ def test_reduce_frame_no_bias(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -402,6 +432,7 @@ def test_reduce_frame_no_flat_for_filter(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape, filter="R")
@@ -454,6 +485,7 @@ def test_reduce_frame_no_mask_fallback_to_minimal(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=None,  # No static mask
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -499,6 +531,7 @@ def test_reduce_frame_apply_gain_true_vs_false(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=_gain_measurements(2.5),
     )
 
     meta = _meta(raw_path, shape)
@@ -552,6 +585,7 @@ def test_reduce_frame_err_is_1sigma(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=_gain_measurements(2.0),
     )
 
     meta = _meta(raw_path, shape, exptime=10.0)
@@ -611,6 +645,7 @@ def test_reduce_frame_all_header_cards_finite(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -666,6 +701,7 @@ def test_reduce_frame_as_row_picklable_scalars(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -709,6 +745,7 @@ def test_reduce_frame_result_is_picklable(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -758,6 +795,7 @@ def test_reduce_frame_with_overscan_geometry(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=mask,
+        gain_measurements=_gain_measurements(2.0),
     )
 
     meta = _meta(raw_path, raw_shape)
@@ -839,6 +877,7 @@ def test_reduce_frame_with_overscan_and_no_mask_fallback(tmp_path):
         dark_current_map=None,
         dark_current_path=None,
         mask=None,  # Triggers minimal_mask fallback
+        gain_measurements=GainMeasurementSet({}),
     )
 
     meta = _meta(raw_path, shape)
@@ -883,3 +922,286 @@ def test_reduce_frame_with_overscan_and_no_mask_fallback(tmp_path):
 
     # mask should be in steps_skipped (because no static mask was provided)
     assert "mask" in status.steps_skipped
+
+
+def test_reduce_frame_resolves_gain_from_calibration_set_measurement(tmp_path):
+    """The e-/ADU value comes from the CalibrationSet's runtime measurement
+    for this frame's own (readout_mode, gain_setting, binning) -- never from
+    the raw GAIN header setting, and never from the instrument profile."""
+    shape = (64, 64)
+
+    raw_data = np.ones(shape) * 1000.0
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.ones(shape) * 100.0
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    mask = minimal_mask(raw_data, saturation=60000.0)
+
+    # Deliberately distinct from the GAIN setting (5.0) to prove the setting
+    # index and the measured e-/ADU value are never conflated.
+    measured_gain = 0.706
+    measurement = GainMeasurement(
+        readout_mode="High Gain Mode 16BIT", gain_setting=5.0, binning=1,
+        gain_e_per_adu=measured_gain, read_noise_e=7.01, n_pairs=6, scatter_frac=0.004,
+    )
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={},
+        flat_var={},
+        flat_paths={},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=GainMeasurementSet(
+            {("High Gain Mode 16BIT", 5.0, 1): measurement}
+        ),
+    )
+
+    meta = _meta(
+        raw_path, shape,
+        gain_setting=5.0,
+        readout_mode="High Gain Mode 16BIT",
+        binning=1,
+        origins={"gain_setting": FieldOrigin(Source.HEADER, "GAIN")},
+    )
+    profile = _profile(gain=2.0)  # must be ignored entirely
+    settings = _settings(apply_gain=True)
+
+    product, _status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    expected_signal = (1000.0 - 100.0) * measured_gain
+    actual_signal = np.median(product.sci)
+    assert abs(actual_signal - expected_signal) < expected_signal * 0.01, \
+        f"expected ~{expected_signal}, got {actual_signal}"
+
+    assert product.header["GAINVAL"] == pytest.approx(measured_gain)
+    assert product.header["GAINSRC"] == "measured"
+    assert product.header["GAINSET"] == 5.0
+    assert product.header["READOUTM"] == "High Gain Mode 16BIT"
+
+
+def test_reduce_frame_no_measurement_reduces_in_adu_and_degrades(tmp_path):
+    """A gain setting with no measurement: gain skipped, BUNIT stays 'adu',
+    and proc_code is degraded -- exactly like a missing bias/dark/flat/mask,
+    never a guessed conversion factor."""
+    shape = (64, 64)
+
+    raw_data = np.ones(shape) * 1000.0
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.ones(shape) * 100.0
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    flat_data = np.ones(shape) * 1.0
+    flat_path = tmp_path / "master_flat_R.fits"
+    _write_fits(flat_path, flat_data)
+
+    mask = minimal_mask(raw_data, saturation=60000.0)
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={"R": flat_data.astype(np.float32)},
+        flat_var={},
+        flat_paths={"R": flat_path},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=GainMeasurementSet({}),  # setting 30 never measured
+    )
+
+    meta = _meta(raw_path, shape, gain_setting=30.0, readout_mode="High Gain Mode 16BIT")
+    profile = _profile()
+    settings = _settings(apply_gain=True)
+
+    product, status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    assert product.bunit == "adu"
+    assert "gain" in status.steps_skipped
+    assert status.proc_code == 3
+    assert status.proc_status == "reduced_degraded"
+    assert product.header["GAINVAL"] == "NONE"
+    assert product.header["GAINSRC"] == "none"
+    assert product.header["GAINSET"] == 30.0
+
+
+def test_reduce_frame_cosmics_skipped_for_missing_gain_logs_warning_not_error(
+    tmp_path, caplog
+):
+    """Cosmic-ray rejection with no measured gain: skipped explicitly at
+    WARNING level (never falling through to the generic ERROR-level
+    'cosmic-ray rejection failed' path), and -- because cosmics is a
+    pipeline step, not a calibration -- this alone must not degrade
+    proc_code, unlike a missing bias/dark/flat/mask/gain."""
+    shape = (64, 64)
+
+    raw_data = np.ones(shape) * 1000.0
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.ones(shape) * 100.0
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    dark_data = np.ones(shape) * 20.0
+    dark_path = tmp_path / "master_dark_10s_20C.fits"
+    hdu = fits.PrimaryHDU(data=dark_data.astype(np.float32))
+    hdu.header["EXPTIME"] = 10.0
+    hdu.header["CCDTEMP"] = 20.0
+    hdu.writeto(dark_path, overwrite=True)
+
+    flat_data = np.ones(shape) * 1.0
+    flat_path = tmp_path / "master_flat_R.fits"
+    _write_fits(flat_path, flat_data)
+
+    mask = minimal_mask(raw_data, saturation=60000.0)
+
+    dark_entry = DarkEntry(
+        path=dark_path,
+        exptime=10.0,
+        ccd_temp=20.0,
+        data=dark_data.astype(np.float32),
+        variance=None,
+        n_combine=1,
+    )
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={"R": flat_data.astype(np.float32)},
+        flat_var={},
+        flat_paths={"R": flat_path},
+        darks=(dark_entry,),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=GainMeasurementSet({}),  # setting 30 never measured
+    )
+
+    meta = _meta(
+        raw_path, shape, exptime=10.0, ccd_temp=20.0,
+        gain_setting=30.0, readout_mode="High Gain Mode 16BIT",
+    )
+    profile = _profile()
+    # apply_gain=False so the "gain" skip (also caused by the unmeasured
+    # setting) does not itself degrade proc_code, isolating what the
+    # "cosmics" skip alone does to it.
+    settings = _settings(apply_gain=False, cosmic_ray_rejection=True)
+
+    with caplog.at_level("WARNING"):
+        product, status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    assert "cosmics" in status.steps_skipped
+    assert product.header["CRREJ"] is False
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("cosmic-ray rejection" in r.message for r in warning_records)
+    assert not any("cosmic-ray rejection failed" in r.message for r in error_records)
+
+    # bias, dark, flat, and mask all applied; apply_gain=False makes the
+    # "gain" skip a deliberate setting rather than a missing calibration
+    # (see the calib_steps_skipped logic in reduce_frame) -- so "cosmics"
+    # being skipped is the only thing that could degrade proc_code, and it
+    # must not: proc_code stays 0, exactly like the fully-reduced case.
+    assert status.proc_code == 0
+    assert status.proc_status == "reduced"
+
+
+def test_reduce_frame_gain_cards_present_even_when_apply_gain_false(tmp_path):
+    """GAINVAL/GAINSRC/GAINSET/READOUTM are recorded even when apply_gain is
+    False, since cosmics and the read-noise-in-ADU variance term still
+    consume the resolved gain -- and a deliberate apply_gain=False is not a
+    degraded reduction."""
+    shape = (64, 64)
+
+    raw_data = np.ones(shape) * 1000.0
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.ones(shape) * 100.0
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    mask = minimal_mask(raw_data, saturation=60000.0)
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={},
+        flat_var={},
+        flat_paths={},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=_gain_measurements(2.0),
+    )
+
+    meta = _meta(raw_path, shape)
+    profile = _profile(gain=2.0)  # irrelevant: never consulted
+    settings = _settings(apply_gain=False)
+
+    product, status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    assert product.bunit == "adu"
+    assert "gain" in status.steps_skipped
+    assert product.header["GAINVAL"] == pytest.approx(2.0)
+    assert product.header["GAINSRC"] == "measured"
+
+
+def test_reduce_frame_records_per_step_median_cards(tmp_path):
+    """Every MED* card is present and reflects the running data median."""
+    shape = (64, 64)
+
+    raw_data = np.ones(shape) * 1000.0
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.ones(shape) * 100.0
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    mask = minimal_mask(raw_data, saturation=60000.0)
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={},
+        flat_var={},
+        flat_paths={},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=_gain_measurements(2.0),
+    )
+
+    meta = _meta(raw_path, shape)
+    profile = _profile(gain=2.0)
+    settings = _settings(apply_gain=True)
+
+    product, _status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    for key in ("MEDRAW", "MEDOSC", "MEDBIAS", "MEDDARK", "MEDFLAT", "MEDCOSM", "MEDGAIN"):
+        assert key in product.header, f"missing {key} in product header"
+
+    assert product.header["MEDRAW"] == pytest.approx(1000.0)
+    assert product.header["MEDBIAS"] == pytest.approx(900.0)
+    # No dark or flat master supplied, so those steps are no-ops on the data.
+    assert product.header["MEDDARK"] == pytest.approx(900.0)
+    assert product.header["MEDFLAT"] == pytest.approx(900.0)
+    assert product.header["MEDGAIN"] == pytest.approx(1800.0)

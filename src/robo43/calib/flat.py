@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from robo43.calib.bias import apply_overscan_trim, select_frames
+from robo43.calib.bias import apply_overscan_trim, resolve_common_gain, select_frames
 from robo43.calib.combine import combine_lazy, combine_stack
 from robo43.calib.master import MasterFrame
 from robo43.config import Settings
@@ -27,6 +27,7 @@ from robo43.io.meta import FrameMeta
 from robo43.products.dq import DQ, DQ_DTYPE, FATAL_FLAGS
 
 if TYPE_CHECKING:
+    from robo43.calib.gain import GainMeasurementSet
     from robo43.calib.masks import MaskSet
     from robo43.calib.overscan import OverscanGeometry
 
@@ -120,6 +121,7 @@ def build_master_flats(
     dark_current_map: np.ndarray | None = None,
     mask: MaskSet | None = None,
     overscan: OverscanGeometry | None = None,
+    gain_measurements: GainMeasurementSet | None = None,
 ) -> dict[str, MasterFrame]:
     """Build and write master flat frames, one per filter (and illumination source).
 
@@ -245,6 +247,28 @@ def build_master_flats(
             logger.warning("No frames in group %s survive level cut; skipping", group_key)
             continue
 
+        accepted_metas = [group_metas[i] for i in accepted_indices]
+        gain_setting, _gain_setting_origin = resolve_common_gain(accepted_metas, profile=profile)
+        readout_mode = next(
+            (m.readout_mode for m in accepted_metas if m.readout_mode is not None), None
+        )
+        binning = next((m.binning for m in accepted_metas if m.binning is not None), 1)
+        measurement = (
+            gain_measurements.get(readout_mode, gain_setting, binning)
+            if gain_measurements is not None
+            else None
+        )
+        gain_e_per_adu = measurement.gain_e_per_adu if measurement is not None else None
+        read_noise_e = (
+            measurement.read_noise_e if measurement is not None else profile.read_noise_e
+        )
+        if measurement is not None:
+            gain_cards = measurement.header_cards()
+        else:
+            from robo43.calib.gain import no_measurement_cards
+
+            gain_cards = no_measurement_cards(gain_setting, readout_mode)
+
         # Combine frames
         if n_accepted >= 2:
             # Check if we need lazy loading
@@ -265,16 +289,16 @@ def build_master_flats(
                     loaders,
                     accepted_frames[0].shape,
                     settings.calib,
-                    read_noise_e=profile.read_noise_e,
-                    gain_e_per_adu=profile.gain_e_per_adu,
+                    read_noise_e=read_noise_e,
+                    gain_e_per_adu=gain_e_per_adu,
                 )
             else:
                 # Use stack combination
                 result = combine_stack(
                     accepted_frames,
                     settings.calib,
-                    read_noise_e=profile.read_noise_e,
-                    gain_e_per_adu=profile.gain_e_per_adu,
+                    read_noise_e=read_noise_e,
+                    gain_e_per_adu=gain_e_per_adu,
                 )
 
             combine_cards = result.header_cards()
@@ -324,6 +348,7 @@ def build_master_flats(
             + bias_cards
             + dark_cards
             + level_cut_cards
+            + gain_cards
             + combine_cards
             + norm_cards
             + mask_cards

@@ -83,9 +83,15 @@ def detect_cosmics(
       gain), ``gain=1.0`` is passed to astroscrappy instead (the data must
       not be re-multiplied); ``read_noise_e`` is still in electrons.
     - ``saturation``, when given, is in the same units as ``data`` (ADU if
-      ``in_electrons=False``, electrons if ``in_electrons=True``) and is
-      passed through unchanged as ``satlevel``. When ``None``, ``satlevel``
-      is left at astroscrappy's own default.
+      ``in_electrons=False``, electrons if ``in_electrons=True``). astroscrappy
+      always compares its ``satlevel`` parameter against its own internal
+      ``data * gain`` array (its docstring calls ``satlevel`` "Saturation of
+      level of the image (electrons)"), so ``saturation`` is multiplied by
+      the same ``gain`` passed to astroscrappy before being forwarded as
+      ``satlevel`` -- it is not passed through unchanged. When
+      ``in_electrons=True`` that ``gain`` is 1.0, so ``saturation`` is
+      unaffected. When ``None``, ``satlevel`` is left at astroscrappy's own
+      default.
 
     If cosmic-ray rejection is disabled (``settings.cosmic_ray_rejection`` is
     False), astroscrappy is never called; ``cleaned`` is returned as a
@@ -137,7 +143,10 @@ def detect_cosmics(
         "sigclip": settings.cosmic_ray_sigclip,
     }
     if saturation is not None:
-        kwargs["satlevel"] = saturation
+        # astroscrappy's satlevel is compared against its own internal
+        # data * gain array (always electrons), so it must be scaled by the
+        # same gain -- not passed through in the caller's input units.
+        kwargs["satlevel"] = saturation * gain
     if dq is not None:
         kwargs["inmask"] = (dq & int(FATAL_FLAGS)) != 0
 

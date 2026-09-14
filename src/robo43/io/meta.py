@@ -7,6 +7,16 @@ also carries a :class:`FieldOrigin` recording which layer supplied it --
 raw header, alias lookup, an override file, the instrument profile, a
 derived computation, or a hard-coded default -- so a surprising number can
 be traced back to its source (``robo43 config show``'s per-frame cousin).
+
+``gain_setting`` and ``readout_mode`` are the camera's own dimensionless
+GAIN index and READOUTM string, resolved per frame exactly like any other
+tier-2 field.  Neither is a physical e-/ADU conversion factor: the QHY600M
+camera's ``GAIN`` keyword is a vendor setting index, not a gain, so no field
+here holds an e-/ADU value.  The physical conversion is measured at runtime
+by :mod:`robo43.calib.gain` from that night's flats and biases, keyed by
+``(readout_mode, gain_setting, binning)``, and is looked up from the
+:class:`~robo43.calib.set.CalibrationSet` at reduction time -- never carried
+on ``FrameMeta`` itself.
 """
 
 from __future__ import annotations
@@ -53,7 +63,7 @@ class FrameMeta:
     dec_deg: float | None
     pixel_scale: float | None
     ccd_temp: float | None
-    gain: float | None
+    gain_setting: float | None
     read_noise: float | None
     saturation: float | None
     airmass: float | None
@@ -63,6 +73,7 @@ class FrameMeta:
     instrument: str | None
     observer: str | None
     binning: int | None
+    readout_mode: str | None
     focal_length_mm: float | None
     site_lat_deg: float | None
     site_lon_deg: float | None

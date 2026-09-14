@@ -28,6 +28,7 @@ from astropy.table import Table
 
 from robo43.io.fits_io import write_fits
 from robo43.products.dq import DQ_DTYPE, dq_bintable
+from robo43.products.weight import weight_header_cards
 from robo43.provenance import provenance_cards, sha256_file
 
 if TYPE_CHECKING:
@@ -43,8 +44,8 @@ class ReducedProduct:
     """The full contents of one reduced frame's multi-extension FITS file.
 
     HDU layout (exact order, on :meth:`to_hdulist`/write):
-    ``SCI`` (primary), ``ERR``, ``DQ``, then the optional ``CATALOG`` and
-    ``CATFLAGS`` extensions.
+    ``SCI`` (primary), ``ERR``, ``DQ``, then the optional ``WEIGHT``
+    extension, then the optional ``CATALOG`` and ``CATFLAGS`` extensions.
     """
 
     sci: np.ndarray
@@ -54,6 +55,7 @@ class ReducedProduct:
     catalog: Table | None = None
     catalog_header: fits.Header | None = None
     bunit: str = "electron"
+    weight: np.ndarray | None = None
 
     def to_hdulist(self, *, include_catflags: bool = True) -> fits.HDUList:
         """Assemble the full MEF ``HDUList`` for this product."""
@@ -76,6 +78,18 @@ class ReducedProduct:
             err_hdu,
             dq_hdu,
         ]
+
+        if self.weight is not None:
+            weight_header = fits.Header()
+            for key, value, comment in weight_header_cards(self.weight, bunit=self.bunit):
+                weight_header[key] = (value, comment)
+            weight_header["COMMENT"] = "Inverse-variance weight; zero at flagged pixels"
+            weight_hdu = fits.ImageHDU(
+                data=np.asarray(self.weight, dtype=np.float32),
+                header=weight_header,
+                name="WEIGHT",
+            )
+            hdus.append(weight_hdu)
 
         if self.catalog is not None:
             cat_header = (
@@ -107,6 +121,10 @@ class ReducedProduct:
             catalog = Table(hdul["CATALOG"].data)
             catalog_header = hdul["CATALOG"].header.copy()
 
+        weight: np.ndarray | None = None
+        if "WEIGHT" in hdul:
+            weight = np.array(hdul["WEIGHT"].data, dtype=np.float32)
+
         return cls(
             sci=sci,
             err=err,
@@ -115,6 +133,7 @@ class ReducedProduct:
             catalog=catalog,
             catalog_header=catalog_header,
             bunit=bunit,
+            weight=weight,
         )
 
     def write(

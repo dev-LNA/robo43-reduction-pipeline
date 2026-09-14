@@ -15,7 +15,13 @@ import pytest
 from astropy.io import fits
 from astropy.io.fits.verify import VerifyWarning
 
-from robo43.calib.bias import apply_overscan_trim, build_master_bias, select_frames
+from robo43.calib.bias import (
+    apply_overscan_trim,
+    build_master_bias,
+    resolve_common_gain,
+    select_frames,
+)
+from robo43.calib.gain import GainMeasurement, GainMeasurementSet
 from robo43.calib.master import MasterFrame
 from robo43.calib.overscan import OverscanGeometry
 from robo43.config import CalibSettings, RuntimeSettings, Settings
@@ -71,7 +77,7 @@ def _meta(path, shape) -> FrameMeta:
         dec_deg=None,
         pixel_scale=None,
         ccd_temp=None,
-        gain=None,
+        gain_setting=10.0,
         read_noise=None,
         saturation=None,
         airmass=None,
@@ -80,6 +86,7 @@ def _meta(path, shape) -> FrameMeta:
         instrument=None,
         observer=None,
         binning=None,
+        readout_mode=None,
         focal_length_mm=None,
         site_lat_deg=None,
         site_lon_deg=None,
@@ -381,3 +388,113 @@ def test_masterframe_load_nonexistent_raises_calibrationerror(tmp_path):
     path = tmp_path / "nonexistent.fits"
     with pytest.raises(CalibrationError, match="Master frame not found"):
         MasterFrame.load(path)
+
+
+def test_resolve_common_gain_uses_header_setting_when_present(tmp_path):
+    """When every meta agrees on the GAIN setting, that value is returned."""
+    meta_a = dataclasses.replace(_meta(tmp_path / "a.fits", (5, 5)), gain_setting=10.0)
+    meta_b = dataclasses.replace(_meta(tmp_path / "b.fits", (5, 5)), gain_setting=10.0)
+    profile = _profile()
+
+    setting, origin = resolve_common_gain([meta_a, meta_b], profile=profile)
+
+    assert setting == 10.0
+    assert origin == "header"
+
+
+def test_resolve_common_gain_raises_when_no_frame_has_a_setting(tmp_path):
+    """There is no profile fallback for a per-frame GAIN setting."""
+    meta = dataclasses.replace(_meta(tmp_path / "a.fits", (5, 5)), gain_setting=None)
+    profile = _profile()
+
+    with pytest.raises(CalibrationError, match="no gain-setting value"):
+        resolve_common_gain([meta], profile=profile)
+
+
+def test_resolve_common_gain_raises_on_inconsistent_setting(tmp_path):
+    meta_a = dataclasses.replace(_meta(tmp_path / "a.fits", (5, 5)), gain_setting=10.0)
+    meta_b = dataclasses.replace(_meta(tmp_path / "b.fits", (5, 5)), gain_setting=30.0)
+    profile = _profile()
+
+    with pytest.raises(CalibrationError, match="inconsistent"):
+        resolve_common_gain([meta_a, meta_b], profile=profile)
+
+
+def test_build_master_bias_records_measured_gain_cards(tmp_path):
+    """GAINVAL/GAINSRC come from the runtime measurement for this group's
+    (readout_mode, gain_setting, binning), never from the header setting or
+    the profile."""
+    rng = np.random.default_rng(707)
+    n = 6
+    h, w = 16, 16
+    metas = []
+    for i in range(n):
+        frame = 500.0 + rng.normal(0.0, 5.0, size=(h, w))
+        path = tmp_path / f"bias_{i:02d}.fits"
+        _write_fits(path, frame)
+        metas.append(dataclasses.replace(_meta(path, (h, w)), gain_setting=10.0, binning=1))
+
+    profile = _profile()  # gain_e_per_adu=2.0 -- must be ignored entirely
+    settings = _settings()
+    measurement = GainMeasurement(
+        readout_mode="UNKNOWN",
+        gain_setting=10.0,
+        binning=1,
+        gain_e_per_adu=0.706,
+        read_noise_e=7.01,
+        n_pairs=6,
+        scatter_frac=0.005,
+    )
+    gain_measurements = GainMeasurementSet({("UNKNOWN", 10.0, 1): measurement})
+    master = build_master_bias(
+        metas, settings=settings, profile=profile, outdir=tmp_path,
+        gain_measurements=gain_measurements,
+    )
+
+    card_dict = {c[0]: c[1] for c in master.header_cards}
+    assert card_dict["GAINVAL"] == pytest.approx(0.706)
+    assert card_dict["GAINSRC"] == "measured"
+    assert card_dict["GAINSET"] == 10.0
+
+
+def test_build_master_bias_with_no_measurement_records_none_cards(tmp_path):
+    """A group with no runtime measurement records GAINVAL=NONE/GAINSRC=none,
+    never a guessed value."""
+    rng = np.random.default_rng(709)
+    n = 6
+    h, w = 16, 16
+    metas = []
+    for i in range(n):
+        frame = 500.0 + rng.normal(0.0, 5.0, size=(h, w))
+        path = tmp_path / f"bias_{i:02d}.fits"
+        _write_fits(path, frame)
+        metas.append(dataclasses.replace(_meta(path, (h, w)), gain_setting=30.0, binning=1))
+
+    profile = _profile()
+    settings = _settings()
+    master = build_master_bias(
+        metas, settings=settings, profile=profile, outdir=tmp_path,
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    card_dict = {c[0]: c[1] for c in master.header_cards}
+    assert card_dict["GAINVAL"] == "NONE"
+    assert card_dict["GAINSRC"] == "none"
+    assert card_dict["GAINSET"] == 30.0
+
+
+def test_build_master_bias_raises_on_inconsistent_gain_setting(tmp_path):
+    rng = np.random.default_rng(708)
+    h, w = 16, 16
+    metas = []
+    for i, setting in enumerate([10.0, 10.0, 30.0]):
+        frame = 500.0 + rng.normal(0.0, 5.0, size=(h, w))
+        path = tmp_path / f"bias_{i:02d}.fits"
+        _write_fits(path, frame)
+        metas.append(dataclasses.replace(_meta(path, (h, w)), gain_setting=setting))
+
+    profile = _profile()
+    settings = _settings()
+
+    with pytest.raises(CalibrationError, match="inconsistent"):
+        build_master_bias(metas, settings=settings, profile=profile, outdir=tmp_path)

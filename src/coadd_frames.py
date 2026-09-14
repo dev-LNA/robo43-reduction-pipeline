@@ -50,7 +50,8 @@ class CoaddFrames:
 
     def select_frames(self):
         selected_files = []
-        files_list = glob.glob(os.path.join(self.workdir, "*_proc.fits"))
+        files_list = sorted(
+            glob.glob(os.path.join(self.workdir, "*_proc.fits")))
         for f in files_list:
             w = WCS(fits.getheader(f))
             if w.has_celestial:
@@ -74,15 +75,33 @@ class CoaddFrames:
         return filter_dict
 
     def coadd_images(self, files):
-        header0 = fits.getheader(files[0])
-        wcs0 = WCS(header0)
+        _wcs_is_not_valid = True
+        j = 0
+        while _wcs_is_not_valid:
+            header0 = fits.getheader(files[j])
+            wcs0 = WCS(header0)
+            # check if wcs0 is valid
+            if wcs0.has_celestial:
+                _wcs_is_not_valid = False
+            else:
+                print(f"Skipping {files[j]} due to invalid WCS.")
+                j += 1
+                if j >= len(files):
+                    print(
+                        "No valid WCS found in any of the frames. Cannot coadd.")
+                    sys.exit(1)
         data_stack = [fits.getdata(files[0])]
         exptimes = []
         i = 1
-        for f in files[1:]:
+        for f in files:
+            if i == j:
+                continue  # skip the first frame as it is already in data_stack
             with fits.open(f) as hdul:
-                data = hdul[0].data
                 wcs = WCS(hdul[0].header)
+                if not wcs.has_celestial:
+                    print(f"Skipping {f} due to invalid WCS.")
+                    continue
+                data = hdul[0].data
                 exptime = hdul[0].header.get('EXPTIME', 1.0)
                 exptimes.append(exptime)
                 data, _ = reproject_interp(
@@ -153,7 +172,7 @@ class CoaddFrames:
         filter_dict = self.gatter_frames_per_filter()
         for filt, files in filter_dict.items():
             if self.runtest:
-                files = files[:3]
+                files = files[:10]
             print(f"Coadding {len(files)} frames for filter '{filt}'...")
             _obj_name = ''.join(
                 c for c in self.object_name if c.isalnum())

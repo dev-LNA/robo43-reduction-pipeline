@@ -45,16 +45,16 @@ def _profile(**overrides) -> InstrumentProfile:
 
 
 def _meta(*, naxis1=512, naxis2=512, pixel_scale=1.0, saturation=50000.0,
-          gain=2.0, **overrides) -> FrameMeta:
+          **overrides) -> FrameMeta:
     defaults = {
         "path": Path("test.fits"),
         "naxis1": naxis1, "naxis2": naxis2,
         "frame_type": "science", "exptime": 30.0, "date_obs": None,
         "filter": "V", "ra_deg": None, "dec_deg": None,
         "pixel_scale": pixel_scale, "ccd_temp": None,
-        "gain": gain, "read_noise": 5.0, "saturation": saturation, "airmass": None,
+        "gain_setting": None, "read_noise": 5.0, "saturation": saturation, "airmass": None,
         "object": "test", "telescope": "robo43", "instrument": "robo43", "observer": None,
-        "binning": 1, "focal_length_mm": None,
+        "binning": 1, "readout_mode": None, "focal_length_mm": None,
         "site_lat_deg": None, "site_lon_deg": None, "site_elevation_m": None,
         "mjd": None, "night": None, "is_valid": True, "profile_name": "test", "origins": {},
     }
@@ -123,28 +123,46 @@ def test_one_row_per_class():
 def test_saturated_only():
     profile = _profile(nonlinearity_adu=None)
     table = Table([_row(FLUX_MAX=95000.0)])
-    report = assess(table, settings=_settings(), profile=profile, meta=_meta())
+    report = assess(
+        table, settings=_settings(), profile=profile, meta=_meta(), gain_e_per_adu=2.0
+    )
     assert report.mask[0] == int(Reject.SATURATED)
     assert "NONLINEAR" in report.skipped
 
 
 def test_nonlinear_only():
     table = Table([_row(FLUX_MAX=70000.0)])
-    report = assess(table, settings=_settings(), profile=_profile(), meta=_meta())
+    report = assess(
+        table, settings=_settings(), profile=_profile(), meta=_meta(), gain_e_per_adu=2.0
+    )
     assert report.mask[0] == int(Reject.NONLINEAR)
     assert not (report.mask[0] & int(Reject.SATURATED))
+
+
+def test_saturated_and_nonlinear_skipped_without_a_measured_gain():
+    """apply_gain=True but no gain_e_per_adu supplied (e.g. unmeasured setting):
+    the cuts are skipped, never guessed at via the profile or the GAIN header."""
+    profile = _profile(saturation_adu=50000.0, nonlinearity_adu=40000.0)
+    table = Table([_row(FLUX_MAX=95000.0)])
+    report = assess(table, settings=_settings(apply_gain=True), profile=profile, meta=_meta())
+    assert not (report.mask[0] & int(Reject.SATURATED))
+    assert not (report.mask[0] & int(Reject.NONLINEAR))
+    assert "SATURATED" in report.skipped
+    assert "NONLINEAR" in report.skipped
 
 
 def test_saturation_both_unit_conventions_agree():
     profile = _profile(saturation_adu=50000.0, gain_e_per_adu=2.0)
 
     settings_e = _settings(apply_gain=True)
-    meta_e = _meta(gain=2.0, saturation=50000.0)
+    meta_e = _meta(saturation=50000.0)
     table_e = Table([_row(FLUX_MAX=95000.0)])
-    report_e = assess(table_e, settings=settings_e, profile=profile, meta=meta_e)
+    report_e = assess(
+        table_e, settings=settings_e, profile=profile, meta=meta_e, gain_e_per_adu=2.0
+    )
 
     settings_adu = _settings(apply_gain=False)
-    meta_adu = _meta(gain=2.0, saturation=50000.0)
+    meta_adu = _meta(saturation=50000.0)
     table_adu = Table([_row(FLUX_MAX=47500.0)])
     report_adu = assess(table_adu, settings=settings_adu, profile=profile, meta=meta_adu)
 
@@ -152,7 +170,9 @@ def test_saturation_both_unit_conventions_agree():
     assert report_adu.mask[0] & int(Reject.SATURATED)
 
     table_e_safe = Table([_row(FLUX_MAX=95000.0 * 0.5)])
-    report_e_safe = assess(table_e_safe, settings=settings_e, profile=profile, meta=meta_e)
+    report_e_safe = assess(
+        table_e_safe, settings=settings_e, profile=profile, meta=meta_e, gain_e_per_adu=2.0
+    )
     table_adu_safe = Table([_row(FLUX_MAX=47500.0 * 0.5)])
     report_adu_safe = assess(table_adu_safe, settings=settings_adu, profile=profile, meta=meta_adu)
 

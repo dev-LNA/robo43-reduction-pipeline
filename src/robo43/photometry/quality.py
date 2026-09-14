@@ -143,28 +143,30 @@ def _check_required_columns(table: Table) -> None:
 
 
 def _saturation_level(
-    meta: FrameMeta,
-    profile: InstrumentProfile,
     settings: Settings,
     *,
     level_adu: float | None,
+    gain_e_per_adu: float | None,
 ) -> float | None:
     """Convert an ADU saturation/nonlinearity level to the data's own units.
 
     ``level_adu`` is always in ADU (from the header/profile). The
     catalogue's ``FLUX_MAX`` is in electrons when ``settings.calib.apply_gain``
-    is True, ADU otherwise. This converts ADU to the data's own units
-    exactly once, returning ``None`` when the level -- or, for the
-    gain-applied case, the gain itself -- cannot be determined.
+    is True, ADU otherwise. ``gain_e_per_adu`` is the *measured* e-/ADU value
+    for this frame's own group (see :mod:`robo43.calib.gain`), resolved by
+    the caller -- never the raw ``GAIN`` header setting and never a profile
+    fallback, since neither is a physical conversion factor. This converts
+    ADU to the data's own units exactly once, returning ``None`` when the
+    level -- or, for the gain-applied case, the measured gain itself --
+    is unavailable.
     """
     if level_adu is None:
         return None
     if not settings.calib.apply_gain:
         return level_adu
-    gain = meta.gain if meta.gain is not None else profile.gain_e_per_adu
-    if gain is None:
+    if gain_e_per_adu is None:
         return None
-    return level_adu * gain
+    return level_adu * gain_e_per_adu
 
 
 def _sky_columns(table: Table) -> tuple[str, str] | None:
@@ -193,10 +195,15 @@ def assess(
     wcs: WCS | None = None,
     reference: Table | None = None,
     stellar: bool = True,
+    gain_e_per_adu: float | None = None,
 ) -> QualityReport:
     # `dq` and `wcs` are reserved for future per-pixel / per-coordinate
     # checks; `wcs` is used opportunistically by rule 11 below, `dq` is
-    # currently unused by any rule.
+    # currently unused by any rule. `gain_e_per_adu` is this frame's own
+    # measured gain (robo43.calib.gain), resolved by the caller from the
+    # CalibrationSet -- never the raw GAIN header setting -- and used only
+    # by the SATURATED/NONLINEAR cuts below when settings.calib.apply_gain
+    # is True.
     _check_required_columns(table)
 
     ps = settings.photometry
@@ -263,7 +270,7 @@ def assess(
         flux_max = np.asarray(table["FLUX_MAX"], dtype=float)
 
         sat_level_adu = meta.saturation if meta.saturation is not None else profile.saturation_adu
-        sat_level = _saturation_level(meta, profile, settings, level_adu=sat_level_adu)
+        sat_level = _saturation_level(settings, level_adu=sat_level_adu, gain_e_per_adu=gain_e_per_adu)
         if sat_level is not None:
             tripped = flux_max > ps.saturation_fraction * sat_level
             _apply("SATURATED", tripped, Reject.SATURATED)
@@ -271,7 +278,7 @@ def assess(
             _skip("SATURATED", reason="saturation level could not be determined")
 
         nonlin_level = _saturation_level(
-            meta, profile, settings, level_adu=profile.nonlinearity_adu
+            settings, level_adu=profile.nonlinearity_adu, gain_e_per_adu=gain_e_per_adu
         )
         if nonlin_level is not None:
             tripped = flux_max > ps.nonlinearity_fraction * nonlin_level

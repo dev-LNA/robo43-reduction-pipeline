@@ -76,6 +76,17 @@ CATALOG_COLUMNS: dict[str, tuple[str, str]] = {
     "QUALITY_MASK": ("J", ""),
     "GAIA_SOURCE_ID": ("K", ""),
     "GAIA_SEP_ARCSEC": ("E", "arcsec"),
+    # Convenience aliases of the canonical SExtractor-style columns above,
+    # requested by name; each is an exact copy of its canonical column (or,
+    # for FWHM, that column converted to arcsec), not an independent
+    # measurement.
+    "RA": ("D", "deg"),  # alias of ALPHA_J2000
+    "DEC": ("D", "deg"),  # alias of DELTA_J2000
+    "FWHM": ("E", "arcsec"),  # FWHM_IMAGE converted to arcsec
+    "FLUX": ("E", "count"),  # alias of FLUX_AUTO
+    "FLUX_ERR": ("E", "count"),  # alias of FLUXERR_AUTO
+    "MAG": ("E", "mag"),  # alias of MAG_AUTO
+    "MAG_ERR": ("E", "mag"),  # alias of MAGERR_AUTO
 }
 
 

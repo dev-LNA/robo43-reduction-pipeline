@@ -6,11 +6,14 @@ tests/conftest.py.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 from astropy.io import fits
 
 from robo43.calib.flat import build_master_flats, group_flats_by_filter, normalise_flat
+from robo43.calib.gain import GainMeasurement, GainMeasurementSet
 from robo43.calib.overscan import OverscanGeometry
 from robo43.config import CalibSettings, RuntimeSettings, Settings
 from robo43.exceptions import CalibrationError
@@ -68,7 +71,7 @@ def _meta(path, shape, *, filter, exptime=1.0, object=None) -> FrameMeta:
         dec_deg=None,
         pixel_scale=None,
         ccd_temp=None,
-        gain=None,
+        gain_setting=10.0,
         read_noise=None,
         saturation=None,
         airmass=None,
@@ -77,6 +80,7 @@ def _meta(path, shape, *, filter, exptime=1.0, object=None) -> FrameMeta:
         instrument=None,
         observer=None,
         binning=None,
+        readout_mode=None,
         focal_length_mm=None,
         site_lat_deg=None,
         site_lon_deg=None,
@@ -605,3 +609,97 @@ def test_level_cut_skipped_when_saturation_adu_is_none(tmp_path):
     # Check that FLATLCUT is False
     assert card_dict["FLATLCUT"] is False, \
         f"Expected FLATLCUT=False but got {card_dict['FLATLCUT']}"
+
+
+def test_build_master_flats_records_measured_gain_cards(tmp_path):
+    """GAINVAL/GAINSRC come from the runtime measurement for this group's
+    own (readout_mode, gain_setting, binning), never the header setting or
+    the profile."""
+    rng = np.random.default_rng(711)
+    h, w = 32, 32
+    shape = (h, w)
+    metas = []
+    for i in range(4):
+        path = tmp_path / f"flat_{i:02d}.fits"
+        frame = 20000.0 + rng.normal(0.0, 50.0, size=shape)
+        _write_fits(path, frame)
+        metas.append(
+            dataclasses.replace(
+                _meta(path, shape, filter="R-Bessell", object="DomeFlat"),
+                gain_setting=10.0, binning=1,
+            )
+        )
+
+    profile = _profile()  # gain_e_per_adu=2.0 -- must be ignored entirely
+    settings = _settings()
+    measurement = GainMeasurement(
+        readout_mode="UNKNOWN", gain_setting=10.0, binning=1,
+        gain_e_per_adu=0.706, read_noise_e=7.01, n_pairs=6, scatter_frac=0.005,
+    )
+    gain_measurements = GainMeasurementSet({("UNKNOWN", 10.0, 1): measurement})
+    outdir = tmp_path / "masters"
+    masters = build_master_flats(
+        metas, settings=settings, profile=profile, outdir=outdir,
+        gain_measurements=gain_measurements,
+    )
+
+    master = masters["R-Bessell:dome"]
+    card_dict = {c[0]: c[1] for c in master.header_cards}
+    assert card_dict["GAINVAL"] == pytest.approx(0.706)
+    assert card_dict["GAINSRC"] == "measured"
+    assert card_dict["GAINSET"] == 10.0
+
+
+def test_build_master_flats_with_no_measurement_records_none_cards(tmp_path):
+    """A group with no runtime measurement records GAINVAL=NONE/GAINSRC=none."""
+    rng = np.random.default_rng(713)
+    h, w = 32, 32
+    shape = (h, w)
+    metas = []
+    for i in range(4):
+        path = tmp_path / f"flat_{i:02d}.fits"
+        frame = 20000.0 + rng.normal(0.0, 50.0, size=shape)
+        _write_fits(path, frame)
+        metas.append(
+            dataclasses.replace(
+                _meta(path, shape, filter="R-Bessell", object="DomeFlat"),
+                gain_setting=30.0, binning=1,
+            )
+        )
+
+    profile = _profile()
+    settings = _settings()
+    outdir = tmp_path / "masters"
+    masters = build_master_flats(
+        metas, settings=settings, profile=profile, outdir=outdir,
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    master = masters["R-Bessell:dome"]
+    card_dict = {c[0]: c[1] for c in master.header_cards}
+    assert card_dict["GAINVAL"] == "NONE"
+    assert card_dict["GAINSRC"] == "none"
+    assert card_dict["GAINSET"] == 30.0
+
+
+def test_build_master_flats_raises_on_inconsistent_gain_setting(tmp_path):
+    rng = np.random.default_rng(712)
+    h, w = 32, 32
+    shape = (h, w)
+    metas = []
+    for i, setting in enumerate([10.0, 10.0, 30.0]):
+        path = tmp_path / f"flat_{i:02d}.fits"
+        frame = 20000.0 + rng.normal(0.0, 50.0, size=shape)
+        _write_fits(path, frame)
+        metas.append(
+            dataclasses.replace(
+                _meta(path, shape, filter="R-Bessell", object="DomeFlat"), gain_setting=setting
+            )
+        )
+
+    profile = _profile()
+    settings = _settings()
+    outdir = tmp_path / "masters"
+
+    with pytest.raises(CalibrationError, match="inconsistent"):
+        build_master_flats(metas, settings=settings, profile=profile, outdir=outdir)

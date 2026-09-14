@@ -60,7 +60,7 @@ def _frame_meta() -> FrameMeta:
         dec_deg=-20.0,
         pixel_scale=0.5,
         ccd_temp=-10.0,
-        gain=1.2,
+        gain_setting=1.2,
         read_noise=5.0,
         saturation=60000.0,
         airmass=1.1,
@@ -69,6 +69,7 @@ def _frame_meta() -> FrameMeta:
         instrument="cam1",
         observer=None,
         binning=1,
+        readout_mode=None,
         focal_length_mm=None,
         site_lat_deg=None,
         site_lon_deg=None,
@@ -78,7 +79,7 @@ def _frame_meta() -> FrameMeta:
         is_valid=True,
         profile_name="test-instrument",
         origins={
-            "gain": FieldOrigin(source=Source.OVERRIDE, detail="overrides.toml"),
+            "gain_setting": FieldOrigin(source=Source.OVERRIDE, detail="overrides.toml"),
             "airmass": FieldOrigin(source=Source.DERIVED, detail="computed from date_obs"),
             "filter": FieldOrigin(source=Source.HEADER, detail=""),
         },
@@ -125,7 +126,7 @@ def test_calibration_cards_kwsrc_filtering():
     kwsrc = {key: value for key, value, _comment in cards if key.startswith("KWSRC")}
     assert len(kwsrc) == 2
     values = list(kwsrc.values())
-    assert any(v.startswith("gain=override:overrides.toml") for v in values)
+    assert any(v.startswith("gain_setting=override:overrides.toml") for v in values)
     assert any(v.startswith("airmass=derived:") for v in values)
     assert not any(v.startswith("filter=") for v in values)
 

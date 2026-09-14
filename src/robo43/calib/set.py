@@ -6,7 +6,8 @@ once at the start of a run, passes the ``CalibrationSet`` around to workers,
 and avoids redundant I/O.
 
 The ``CalibrationSet`` instance is **picklable and cheap to send to a worker**:
-it holds only NumPy arrays, Path objects, and DarkEntry tuples — never a logger,
+it holds only NumPy arrays, Path objects, DarkEntry tuples, and a
+GainMeasurementSet (itself plain floats/strs/ints) — never a logger,
 file handle, Settings instance, or InstrumentProfile. Missing calibration files
 are ``None``, never exceptions, following the graceful-degradation rule in §1B.5.
 
@@ -16,6 +17,13 @@ the actual implementation requires ``profile`` to delegate to ``select_dark()``.
 Since ``CalibrationSet`` cannot store a profile (it must stay picklable),
 ``dark_for()`` takes ``profile`` as a required keyword-only parameter as well,
 deviating from the contract signature. This is documented here and in the method.
+
+``gain_measurements`` holds the night's runtime PTC gain measurements (see
+``robo43.calib.gain``), one GainMeasurement per (readout_mode, gain_setting,
+binning) group, loaded from ``gain_measurements.json`` in ``calibdir`` if
+present. ``gain_for()`` looks up a frame's own group in it, returning
+``None`` -- meaning "reduce this frame in ADU" -- when that group was never
+measured.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from robo43.calib.dark import DarkEntry, DarkSelection, select_dark
+from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurement, GainMeasurementSet
 from robo43.calib.masks import MaskSet
 from robo43.io.fits_io import read_header, read_image
 from robo43.provenance import sha256_file
@@ -60,6 +69,9 @@ class CalibrationSet:
         dark_current_map: Composite dark-current map (e-/s/pixel), or None.
         dark_current_path: Path to the dark-current map file, or None.
         mask: Static bad-pixel mask (MaskSet), or None if absent or unreadable.
+        gain_measurements: The night's runtime PTC gain measurements, keyed by
+            (readout_mode, gain_setting, binning); empty if none were measured
+            or the cache file was absent.
     """
 
     bias: np.ndarray | None
@@ -72,6 +84,7 @@ class CalibrationSet:
     dark_current_map: np.ndarray | None
     dark_current_path: Path | None
     mask: MaskSet | None
+    gain_measurements: GainMeasurementSet
 
     @classmethod
     def load(
@@ -110,6 +123,7 @@ class CalibrationSet:
         dark_current_map = None
         dark_current_path = None
         mask = None
+        gain_measurements = GainMeasurementSet({})
 
         if calibdir is None:
             calibdir_path = None
@@ -274,6 +288,11 @@ class CalibrationSet:
                     logger.warning("failed to read mask %s: %s", mask_file, e)
                     mask = None
 
+            # Load gain measurements
+            gain_file = calibdir_path / DEFAULT_GAIN_MEASUREMENTS_NAME
+            if gain_file.exists():
+                gain_measurements = GainMeasurementSet.read(gain_file)
+
         return cls(
             bias=bias,
             bias_var=bias_var,
@@ -285,6 +304,7 @@ class CalibrationSet:
             dark_current_map=dark_current_map,
             dark_current_path=dark_current_path,
             mask=mask,
+            gain_measurements=gain_measurements,
         )
 
     def flat_for(self, filter_name: str) -> tuple[np.ndarray | None, Path | None]:
@@ -300,6 +320,21 @@ class CalibrationSet:
             return (self.flats[filter_name], self.flat_paths[filter_name])
         return (None, None)
 
+    def gain_for(
+        self,
+        readout_mode: str | None,
+        gain_setting: float | None,
+        binning: int | None,
+    ) -> GainMeasurement | None:
+        """Return the measured gain for a frame's own group, or ``None``.
+
+        ``None`` means this ``(readout_mode, gain_setting, binning)`` group
+        was never measured (no flats/biases at that setting, or fewer than
+        the configured minimum) -- the caller must reduce the frame in ADU
+        rather than invent a conversion factor.
+        """
+        return self.gain_measurements.get(readout_mode, gain_setting, binning)
+
     def dark_for(
         self,
         exptime: float,
@@ -307,6 +342,7 @@ class CalibrationSet:
         *,
         settings: Settings,
         profile: InstrumentProfile,
+        gain: float | None = None,
     ) -> DarkSelection:
         """Choose and scale the best available dark for a frame.
 
@@ -321,6 +357,10 @@ class CalibrationSet:
             ccd_temp: Target CCD temperature in Celsius, or None.
             settings: Settings tree (for tolerance parameters).
             profile: Instrument profile (for gain and temperature aliases).
+            gain: The reducing frame's own measured e-/ADU gain, already
+                looked up by the caller via :meth:`gain_for` (``None`` when
+                its group has no measurement), passed through to
+                ``select_dark`` for its ``current_map`` branch.
 
         Returns:
             A DarkSelection with the chosen entry (or None) and scaling
@@ -363,6 +403,7 @@ class CalibrationSet:
             ccd_temp,
             settings=settings,
             profile=profile,
+            gain=gain,
         )
 
     def checksums(self) -> dict[str, str]:

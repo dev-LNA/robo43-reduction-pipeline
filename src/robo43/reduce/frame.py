@@ -29,6 +29,7 @@ from robo43.calib.masks import minimal_mask
 from robo43.calib.overscan import apply_overscan
 from robo43.products.dq import DQ, DQ_DTYPE
 from robo43.products.mef import ReducedProduct, calibration_cards
+from robo43.products.weight import build_weight
 from robo43.reduce.cosmics import apply_to_dq, detect_cosmics
 
 if TYPE_CHECKING:
@@ -141,6 +142,29 @@ def reduce_frame(
         )
         raise  # Propagate the error; the caller's exception handler will record it
 
+    # Gain: looked up once, from the night's runtime PTC measurement (see
+    # robo43.calib.gain) for this frame's own (readout_mode, gain_setting,
+    # binning) -- never from the frame's header or the instrument profile,
+    # since the QHY600M's GAIN keyword is a vendor setting index, not an
+    # e-/ADU conversion factor. Reused for every gain-derived quantity below
+    # -- cosmic-ray detection, the ADU/e- gain-to-electrons step, and the
+    # read-noise-in-ADU variance term -- so the same value is applied
+    # exactly once and consistently throughout. ``None`` means this frame's
+    # group was never measured (e.g. no flats/biases at that setting); the
+    # frame is then reduced in ADU rather than guessed at.
+    gain_measurement = calib.gain_for(meta.readout_mode, meta.gain_setting, meta.binning)
+    gain = gain_measurement.gain_e_per_adu if gain_measurement is not None else None
+    read_noise_e = (
+        gain_measurement.read_noise_e if gain_measurement is not None else profile.read_noise_e
+    )
+    if gain_measurement is not None:
+        header_cards.extend(gain_measurement.header_cards())
+    else:
+        from robo43.calib.gain import no_measurement_cards
+
+        header_cards.extend(no_measurement_cards(meta.gain_setting, meta.readout_mode))
+    header_cards.append(("MEDRAW", float(np.nanmedian(data)), "median of the raw frame (ADU)"))
+
     # --- Step 1: Overscan and Trim ---
     oscan_cards: list[tuple[str, Any, str]] = []
     if overscan is not None:
@@ -159,6 +183,9 @@ def reduce_frame(
         oscan_cards.append(("TRIMMED", False, "Frame trimmed to science region"))
 
     header_cards.extend(oscan_cards)
+    header_cards.append(
+        ("MEDOSC", float(np.nanmedian(data)), "median after overscan/trim (ADU)")
+    )
 
     # Initialize DQ plane (all pixels good initially) after overscan/trim
     # so its shape matches the (possibly trimmed) science data
@@ -194,12 +221,16 @@ def reduce_frame(
         steps_skipped.append("bias")
         header_cards.append(("BIASFIL", "NONE", "no master bias applied"))
 
+    header_cards.append(
+        ("MEDBIAS", float(np.nanmedian(data)), "median after bias subtraction (ADU)")
+    )
+
     # --- Step 3: Dark Subtraction (scaled) ---
     dark_cards: list[tuple[str, Any, str]] = []
     dark_scale: float | None = None
     try:
         dark_selection = calib.dark_for(meta.exptime, meta.ccd_temp,
-                                        settings=settings, profile=profile)
+                                        settings=settings, profile=profile, gain=gain)
         if dark_selection.method == "none" or dark_selection.entry is None:
             logger.warning("dark current is uncorrected: %s", dark_selection.reason)
             steps_skipped.append("dark")
@@ -233,6 +264,9 @@ def reduce_frame(
         ]
 
     header_cards.extend(dark_cards)
+    header_cards.append(
+        ("MEDDARK", float(np.nanmedian(data)), "median after dark subtraction (ADU)")
+    )
 
     # --- Step 4: Flat Fielding ---
     flat_array, flat_path = calib.flat_for(meta.filter)
@@ -273,6 +307,10 @@ def reduce_frame(
             is_photometric = False
             header_cards.append(("FLATFIL", "NONE", "no master flat applied"))
 
+    header_cards.append(
+        ("MEDFLAT", float(np.nanmedian(data)), "median after flat fielding")
+    )
+
     # --- Step 5: Bad-Pixel Mask ---
     if calib.mask is not None:
         try:
@@ -312,26 +350,43 @@ def reduce_frame(
     # --- Step 6: Cosmic-Ray Rejection ---
     cr_cards: list[tuple[str, Any, str]] = []
     if settings.calib.cosmic_ray_rejection:
-        try:
-            cr_result = detect_cosmics(
-                data,
-                settings=settings.calib,
-                gain_e_per_adu=profile.gain_e_per_adu,
-                read_noise_e=profile.read_noise_e,
-                saturation=profile.saturation_adu,
-                dq=dq,
-                in_electrons=False,
+        if gain is None:
+            # No runtime PTC measurement for this frame's group (e.g. no
+            # flats/biases at this readout/gain-setting/binning combination):
+            # an expected, known condition -- not an astroscrappy failure --
+            # so it is handled explicitly here rather than via the ValueError
+            # path below, mirroring Step 7's identical gain-is-None handling.
+            logger.warning(
+                "cosmic-ray rejection requires a measured gain; no measured "
+                "gain for readout=%s setting=%s binning=%s; skipping "
+                "cosmic-ray rejection for this frame.",
+                meta.readout_mode, meta.gain_setting, meta.binning,
             )
-            data = cr_result.cleaned
-            dq = apply_to_dq(dq, cr_result.mask)
-            steps_applied.append("cosmics")
-            cr_cards = cr_result.header_cards()
-        except Exception as e:
-            logger.error("cosmic-ray rejection failed: %s", e)
             steps_skipped.append("cosmics")
             cr_cards = [
                 ("CRREJ", False, "cosmic-ray rejection applied"),
             ]
+        else:
+            try:
+                cr_result = detect_cosmics(
+                    data,
+                    settings=settings.calib,
+                    gain_e_per_adu=gain,
+                    read_noise_e=read_noise_e,
+                    saturation=profile.saturation_adu,
+                    dq=dq,
+                    in_electrons=False,
+                )
+                data = cr_result.cleaned
+                dq = apply_to_dq(dq, cr_result.mask)
+                steps_applied.append("cosmics")
+                cr_cards = cr_result.header_cards()
+            except Exception as e:
+                logger.error("cosmic-ray rejection failed: %s", e)
+                steps_skipped.append("cosmics")
+                cr_cards = [
+                    ("CRREJ", False, "cosmic-ray rejection applied"),
+                ]
     else:
         steps_skipped.append("cosmics")
         cr_cards = [
@@ -339,21 +394,35 @@ def reduce_frame(
         ]
 
     header_cards.extend(cr_cards)
+    header_cards.append(
+        ("MEDCOSM", float(np.nanmedian(data)), "median after cosmic-ray rejection (ADU)")
+    )
 
     # --- Step 7: Gain to Electrons ---
     bunit = "adu"
-    if settings.calib.apply_gain and profile.gain_e_per_adu is not None:
-        try:
-            data = data * profile.gain_e_per_adu
-            bunit = "electron"
-            steps_applied.append("gain")
-        except Exception as e:
-            logger.error("gain conversion failed: %s", e)
+    if settings.calib.apply_gain:
+        if gain is not None:
+            try:
+                data = data * gain
+                bunit = "electron"
+                steps_applied.append("gain")
+            except Exception as e:
+                logger.error("gain conversion failed: %s", e)
+                steps_skipped.append("gain")
+        else:
+            logger.warning(
+                "gain requested but no measured gain for readout=%s setting=%s "
+                "binning=%s; reducing this frame in ADU.",
+                meta.readout_mode, meta.gain_setting, meta.binning,
+            )
             steps_skipped.append("gain")
     else:
         steps_skipped.append("gain")
 
     header_cards.append(("BUNIT", bunit, "Unit of the SCI plane"))
+    header_cards.append(
+        ("MEDGAIN", float(np.nanmedian(data)), "median after gain conversion (final SCI median)")
+    )
 
     # --- Step 8: Variance and Error Plane ---
     # Build a variance estimate from read noise and photon noise.
@@ -362,15 +431,16 @@ def reduce_frame(
 
     variance = np.zeros_like(data, dtype=np.float32)
 
-    # Read noise contribution (always in electrons, convert to data units if needed)
+    # Read noise contribution (always in electrons, convert to data units if
+    # needed). ``read_noise_e`` prefers the runtime PTC measurement over the
+    # profile's static value; see the gain resolution above.
     read_noise_var = 0.0
-    if profile.read_noise_e is not None:
+    if read_noise_e is not None:
         if bunit == "electron":
-            read_noise_var = profile.read_noise_e ** 2
+            read_noise_var = read_noise_e ** 2
         else:
             # In ADU: read_noise_e / gain
-            gain = profile.gain_e_per_adu or 1.0
-            read_noise_var = (profile.read_noise_e / gain) ** 2
+            read_noise_var = (read_noise_e / (gain or 1.0)) ** 2
 
     variance += read_noise_var
 
@@ -386,6 +456,18 @@ def reduce_frame(
 
     # Guard against non-finite values in error plane
     err[~np.isfinite(err)] = 0.0
+
+    # --- Step 9: Weight Plane ---
+    # Inverse-variance weight, derived from the final ERR/DQ planes (mask and
+    # cosmic-ray flagging already folded into dq above). Not a calibration
+    # step: its success or failure must never affect proc_code.
+    try:
+        weight = build_weight(err, dq)
+        steps_applied.append("weight")
+    except Exception as e:
+        logger.error("weight plane construction failed: %s", e)
+        steps_skipped.append("weight")
+        weight = None
 
     # --- Build Product Header ---
     product_header = raw_header.copy()
@@ -434,15 +516,22 @@ def reduce_frame(
         catalog=None,  # Filled by photometry phase
         catalog_header=None,
         bunit=bunit,
+        weight=weight,
     )
 
     # Build status
     duration_s = time.monotonic() - start_time
 
     # proc_code is determined by whether any *calibrations* were skipped.
-    # Pipeline steps (overscan, trim, cosmics, gain) are not calibrations.
-    # Calibrations are: bias, dark, flat, mask.
+    # Pipeline steps (overscan, trim, cosmics) are not calibrations.
+    # Calibrations are: bias, dark, flat, mask -- and, now that gain is a
+    # runtime-measured calibration product rather than a profile constant,
+    # "gain" too, but only when apply_gain was requested and skipped for
+    # want of a measurement (or a conversion failure); a deliberate
+    # apply_gain=False is a settings choice, not a missing calibration.
     calib_steps_skipped = [s for s in steps_skipped if s in ("bias", "dark", "flat", "mask")]
+    if "gain" in steps_skipped and settings.calib.apply_gain:
+        calib_steps_skipped.append("gain")
     if calib_steps_skipped:
         proc_code = 3  # Reduced but with missing calibrations
         proc_status = "reduced_degraded"

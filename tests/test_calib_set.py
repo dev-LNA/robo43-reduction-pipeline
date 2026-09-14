@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
+from robo43.calib.gain import GainMeasurement, GainMeasurementSet
 from robo43.calib.masks import MaskSet
 from robo43.calib.set import CalibrationSet
 from robo43.config import CalibSettings, RuntimeSettings, Settings
@@ -75,6 +76,7 @@ def test_empty_directory(tmp_path):
     assert calset.dark_current_map is None
     assert calset.dark_current_path is None
     assert calset.mask is None
+    assert calset.gain_measurements.measurements == {}
 
     flat, path = calset.flat_for("R-Bessell")
     assert flat is None
@@ -484,6 +486,32 @@ def test_no_logger_in_slots():
         "dark_current_map",
         "dark_current_path",
         "mask",
+        "gain_measurements",
     }
     actual_slots = set(CalibrationSet.__slots__)
     assert actual_slots == expected_slots
+
+
+def test_gain_measurements_absent_defaults_empty(tmp_path):
+    """No gain_measurements.json in calibdir: empty set, gain_for() is None."""
+    calset = CalibrationSet.load(tmp_path, settings=_settings(), profile=_profile())
+    assert calset.gain_measurements.measurements == {}
+    assert calset.gain_for("UNKNOWN", 10.0, 1) is None
+
+
+def test_gain_measurements_loaded_from_cache_file(tmp_path):
+    """gain_measurements.json in calibdir is loaded and queryable via gain_for()."""
+    measurement = GainMeasurement(
+        readout_mode="High Gain Mode 16BIT", gain_setting=10.0, binning=2,
+        gain_e_per_adu=0.706, read_noise_e=7.01, n_pairs=6, scatter_frac=0.004,
+    )
+    GainMeasurementSet({("High Gain Mode 16BIT", 10.0, 2): measurement}).write(
+        tmp_path / "gain_measurements.json"
+    )
+
+    calset = CalibrationSet.load(tmp_path, settings=_settings(), profile=_profile())
+
+    found = calset.gain_for("High Gain Mode 16BIT", 10.0, 2)
+    assert found is not None
+    assert found.gain_e_per_adu == pytest.approx(0.706)
+    assert calset.gain_for("High Gain Mode 16BIT", 30.0, 2) is None

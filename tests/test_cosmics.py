@@ -206,3 +206,92 @@ def test_header_cards() -> None:
         cards_by_kw = {kw: value for kw, value, _ in cards}
         assert cards_by_kw["CRREJ"] is enabled
         assert cards_by_kw["CRSOFT"] == "astroscrappy"
+
+
+def test_satlevel_scaled_to_astroscrappys_internal_electron_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """astroscrappy compares its ``satlevel`` against its own internal
+    ``data * gain`` array (always electrons; see its docstring: "Saturation
+    of level of the image (electrons)"). ``detect_cosmics`` must therefore
+    forward ``saturation * gain`` as ``satlevel``, not ``saturation``
+    unchanged -- regardless of whether the caller's gain is above or below
+    1.0.
+    """
+    import astroscrappy
+
+    data = np.full((10, 10), 500.0, dtype=np.float32)
+    captured: dict = {}
+
+    def fake_detect_cosmics(indat: np.ndarray, **kwargs):
+        captured.update(kwargs)
+        return np.zeros(indat.shape, dtype=bool), indat.astype(np.float32).copy()
+
+    monkeypatch.setattr(astroscrappy, "detect_cosmics", fake_detect_cosmics)
+
+    settings = CalibSettings()
+    sat_adu = 55000.0
+
+    # Sub-unity gain, matching ROBO43's real photon-transfer-measured regime.
+    gain = 0.7
+    detect_cosmics(
+        data,
+        settings=settings,
+        gain_e_per_adu=gain,
+        read_noise_e=7.0,
+        saturation=sat_adu,
+        in_electrons=False,
+    )
+    assert captured["satlevel"] == pytest.approx(sat_adu * gain)
+
+    # in_electrons=True forces astroscrappy's own gain to 1.0, so saturation
+    # (already in electrons) must be passed through unchanged.
+    captured.clear()
+    data_e = (data * gain).astype(np.float32)
+    detect_cosmics(
+        data_e,
+        settings=settings,
+        gain_e_per_adu=None,
+        read_noise_e=7.0,
+        saturation=sat_adu * gain,
+        in_electrons=True,
+    )
+    assert captured["satlevel"] == pytest.approx(sat_adu * gain)
+
+
+def test_saturated_star_not_flagged_as_cosmic_ray_with_subunity_gain() -> None:
+    """Regression test for the satlevel unit bug, using real astroscrappy
+    (not mocked).
+
+    ROBO43's real photon-transfer-measured gain is sub-unity (~0.7 e-/ADU).
+    With an unscaled ADU-space ``satlevel``, astroscrappy's internal
+    ``data * gain`` array never reaches it, so saturated-star protection
+    never triggers, and pixels in the flat-topped core of a saturated star
+    get treated as candidate cosmic rays and cleaned away. With the fix,
+    none of the saturated core's pixels are flagged.
+    """
+    rng = np.random.default_rng(1)
+    ny, nx = 80, 80
+    bg = 500.0
+    sat_adu = 55000.0
+    gain = 0.7
+    rn_e = 7.0
+
+    data = rng.normal(bg, np.sqrt(bg) * gain, (ny, nx)).astype(np.float32)
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    star = 200000 * np.exp(-((xx - 40) ** 2 + (yy - 40) ** 2) / (2 * 4.0**2))
+    data += star
+    data = np.clip(data, None, sat_adu).astype(np.float32)
+
+    settings = CalibSettings()
+    result = detect_cosmics(
+        data,
+        settings=settings,
+        gain_e_per_adu=gain,
+        read_noise_e=rn_e,
+        saturation=sat_adu,
+        in_electrons=False,
+    )
+
+    core = result.mask[36:45, 36:45]
+    assert core.sum() == 0

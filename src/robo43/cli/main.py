@@ -35,6 +35,7 @@ SUBCOMMAND_MODULES: tuple[str, ...] = (
     "fixheader",
     "calib",
     "reduce",
+    "astrometry",
     "coadd",
     "photometry",
     "catalog",

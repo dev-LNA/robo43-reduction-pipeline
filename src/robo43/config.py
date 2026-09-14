@@ -183,6 +183,28 @@ class CalibSettings:
     apply_gain: bool = True
     nonlinearity_correct: bool = False
     separate_dome_and_sky_flats: bool = True
+    # Measure the e-/ADU gain at runtime by photon transfer from that night's
+    # own flats and biases (robo43.calib.gain), per (readout_mode,
+    # gain_setting, binning) group; when False, or when a group has no
+    # measurement, frames in that group are reduced in ADU rather than
+    # guessing a conversion factor.
+    gain_measure: bool = True
+    # Central fraction of the (already overscan-trimmed) frame sampled for
+    # the photon-transfer measurement, avoiding edge vignetting.
+    gain_region_frac: float = 0.25
+    # Minimum number of flat frames and of bias frames required in a
+    # (readout_mode, gain_setting, binning) group before it can be measured.
+    gain_min_frames_per_group: int = 2
+    # Relative scatter of per-filter-pair K estimates within a group above
+    # which a warning is logged (the measurement is still used).
+    gain_scatter_warn_frac: float = 0.02
+    # Guard factor for robo43.calib.gain's raw-vs-MAD-based bias variance
+    # cross-check: a real bias difference's heavy read-noise tails alone
+    # produce a modest raw/MAD-based ratio (~1.1-1.5x on real ROBO43 data);
+    # a ratio further outside [1/factor, factor] is logged as a possible
+    # cosmic-ray storm or light leak (the measurement is still used, and
+    # the ratio is always recorded on GainMeasurement.bias_var_ratio).
+    gain_var_disagreement_factor: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)

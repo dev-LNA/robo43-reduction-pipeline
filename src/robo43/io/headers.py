@@ -41,7 +41,7 @@ _TIER1_FIELDS: tuple[str, ...] = ("naxis1", "naxis2", "frame_type", "exptime", "
 #: ``settings.runtime.assume_profile_defaults`` is set.
 _TIER2_FIELDS: tuple[str, ...] = (
     "filter", "ra_deg", "dec_deg", "pixel_scale", "ccd_temp",
-    "gain", "read_noise", "saturation", "airmass",
+    "gain_setting", "read_noise", "saturation", "airmass",
 )
 
 #: canonical FrameMeta field name -> canonical alias-lookup field name.
@@ -52,7 +52,7 @@ _ALIAS_FIELD_MAP: dict[str, str] = {
     "date_obs": "date_obs",
     "filter": "filter",
     "ccd_temp": "ccd_temp",
-    "gain": "gain",
+    "gain_setting": "gain_setting",
     "read_noise": "read_noise",
     "saturation": "saturation",
     "object": "object",
@@ -60,6 +60,7 @@ _ALIAS_FIELD_MAP: dict[str, str] = {
     "instrument": "instrument",
     "observer": "observer",
     "binning": "binning",
+    "readout_mode": "readout_mode",
     "focal_length_mm": "focal_length",
     "mjd": "mjd",
 }
@@ -297,7 +298,7 @@ def read_meta(
                 origins.pop("date_obs", None)
 
     # simple float fields
-    for field in ("ccd_temp", "gain", "read_noise", "saturation", "focal_length_mm"):
+    for field in ("ccd_temp", "gain_setting", "read_noise", "saturation", "focal_length_mm"):
         if values.get(field) is not None:
             try:
                 values[field] = float(values[field])
@@ -313,6 +314,10 @@ def read_meta(
             values["binning"] = None
             origins.pop("binning", None)
 
+    # readout_mode -> str (a free-text camera setting; no numeric cast)
+    if values.get("readout_mode") is not None:
+        values["readout_mode"] = str(values["readout_mode"])
+
     # mjd -> float (may be overwritten below by header value's own presence)
     if values.get("mjd") is not None:
         try:
@@ -321,9 +326,12 @@ def read_meta(
             values["mjd"] = None
             origins.pop("mjd", None)
 
-    # gain / read_noise / saturation profile fallback (tier 2)
-    if values.get("gain") is None and profile.gain_e_per_adu is not None:
-        _set("gain", profile.gain_e_per_adu, FieldOrigin(Source.PROFILE, profile.name))
+    # read_noise / saturation profile fallback (tier 2). gain_setting has no
+    # profile fallback: it is a raw per-frame GAIN index, not a physical
+    # constant, and the physical e-/ADU conversion is never sourced from the
+    # profile at all -- it is measured at runtime (see robo43.calib.gain) and
+    # looked up from the CalibrationSet at reduction time, keyed by
+    # (readout_mode, gain_setting, binning).
     if values.get("read_noise") is None and profile.read_noise_e is not None:
         _set("read_noise", profile.read_noise_e, FieldOrigin(Source.PROFILE, profile.name))
     if values.get("saturation") is None and profile.saturation_adu is not None:
@@ -458,7 +466,7 @@ def read_meta(
         dec_deg=values.get("dec_deg"),
         pixel_scale=values.get("pixel_scale"),
         ccd_temp=values.get("ccd_temp"),
-        gain=values.get("gain"),
+        gain_setting=values.get("gain_setting"),
         read_noise=values.get("read_noise"),
         saturation=values.get("saturation"),
         airmass=values.get("airmass"),
@@ -467,6 +475,7 @@ def read_meta(
         instrument=values.get("instrument"),
         observer=values.get("observer"),
         binning=values.get("binning"),
+        readout_mode=values.get("readout_mode"),
         focal_length_mm=values.get("focal_length_mm"),
         site_lat_deg=values.get("site_lat_deg"),
         site_lon_deg=values.get("site_lon_deg"),

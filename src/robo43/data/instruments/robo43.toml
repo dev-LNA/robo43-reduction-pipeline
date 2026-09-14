@@ -2,7 +2,30 @@
 name = "robo43"
 matches = { TELESCOP = ["ROBO43", "Robo-43"], INSTRUME = ["*"] }
 pixel_scale_arcsec = 0.529
-gain_e_per_adu = 10.0
+# gain_e_per_adu is deliberately absent for this instrument. The QHY600M's
+# GAIN header keyword (see instrument.keywords / DEFAULT_KEYWORD_ALIASES) is
+# a dimensionless vendor setting index -- 10 or 30 across this camera's real
+# frames -- not an e-/ADU conversion factor; treating it as one previously
+# multiplied setting-30 frames by 30 instead of the true gain. There is no
+# profile fallback for it, exactly like the overscan region above: the
+# physical conversion is measured at runtime, per (readout mode, gain
+# setting, binning), by src/robo43/calib/gain.py, from photon-transfer pairs
+# of that night's own flats and biases. A frame whose setting was never
+# measured (no flats/biases at that setting) is reduced in ADU rather than
+# guessed at.
+#
+# Reference measurement (photon transfer on real dome flats + biases, High
+# Gain Mode 16BIT, gain setting 10, central 800x800 region, six filters
+# spanning 15550-30767 ADU, <1% scatter), using the MAD-based variance
+# estimator that src/robo43/calib/gain.py applies consistently to both the
+# flat and bias PTC terms: K ~= 0.705 e-/ADU (0.702-0.706 across repeated
+# measurements) -- not the falsely precise 0.706 a naive sigma-clipped
+# variance yields, which is biased ~3% high because clipping strips a very
+# different fraction of the tail-heavy bias difference than of the
+# near-Gaussian flat difference. The same measurement's read noise, from the
+# *unclipped* variance of the bias difference, comes out at ~7.0 e-,
+# independently matching read_noise_e below. A correct implementation of
+# calib/gain.py should reproduce both values at setting 10.
 read_noise_e = 7.0
 # process_robo43_frames.py used SATUR_LEVEL=200000, get_photometry.py used 55000;
 # the two legacy configs disagreed. 55000 ADU is the physically plausible full-well

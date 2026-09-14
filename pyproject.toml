@@ -18,6 +18,10 @@ dependencies = [
     "pandas>=2.2",
     "matplotlib>=3.9",
     "photutils>=2.0",
+    # Required at runtime by photutils.segmentation.deblend_sources' watershed
+    # path (skimage.segmentation.watershed), imported lazily and only when a
+    # source actually needs splitting; photutils does not declare it itself.
+    "scikit-image>=0.24",
     "astroquery>=0.4.10",
     "reproject>=0.14",
     "sewpy @ git+https://github.com/megalut/sewpy.git",
