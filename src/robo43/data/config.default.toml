@@ -135,3 +135,5 @@ assume_profile_defaults = false
 dry_run = false
 clobber = false
 pdb = false
+memory_reserve_mb = 8192.0
+release_memory = true

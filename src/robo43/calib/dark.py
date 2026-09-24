@@ -104,6 +104,7 @@ def build_master_darks(
     outdir: str | Path,
     bias: MasterFrame | None = None,
     gain_measurements: GainMeasurementSet | None = None,
+    fallback_source_nights: tuple[str, ...] = (),
 ) -> tuple[dict[tuple[float, float | None], MasterFrame], MasterFrame]:
     """Build and write one master dark per (exptime, ccd_temp) group, plus a
     composite dark-current map.
@@ -212,6 +213,13 @@ def build_master_darks(
 
             header_cards.extend(no_measurement_cards(gain_setting, readout_mode))
         header_cards.extend(combine_cards)
+        header_cards.append(
+            ("CALFBACK", bool(fallback_source_nights), "Calibration borrowed from a previous night")
+        )
+        if fallback_source_nights:
+            header_cards.append(
+                ("DARKNGT", ",".join(fallback_source_nights), "Source night(s) for borrowed dark")
+            )
 
         group_master = MasterFrame(
             data=group_data,
@@ -239,6 +247,12 @@ def build_master_darks(
         if mean_temp is not None:
             group_temps.append(mean_temp)
             group_temp_n_combines.append(n_combine)
+
+        del frames
+        if settings.runtime.release_memory:
+            from robo43.memory import release_memory
+
+            release_memory(f"dark:{mean_exp:g}s_{temp_str}")
 
     composite = np.average(
         np.stack(group_currents), axis=0, weights=group_n_combines

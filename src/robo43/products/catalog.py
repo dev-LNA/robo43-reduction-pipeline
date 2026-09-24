@@ -57,6 +57,17 @@ CATALOG_COLUMNS: dict[str, tuple[str, str]] = {
     "MAGERR_APER": ("E", "mag"),
     "MAG_CALIB": ("E", "mag"),
     "MAGERR_CALIB": ("E", "mag"),
+    # Gaia-referenced absolute calibration (robo43.photometry.gaia_zp,
+    # optional, off by default): MAG_CALIB/MAGERR_CALIB above are the
+    # AUTO-flavoured calibrated magnitude; these two are their _APER
+    # (vector, one value per aperture) counterparts. REFMAG/REFMAGERR are
+    # the matched Gaia reference magnitude and its uncertainty, in the
+    # frame's own filter -- populated for any cross-matched source, whether
+    # or not that source also fed the zero-point fit itself.
+    "MAG_APER_CAL": ("E", "mag"),
+    "MAGERR_APER_CAL": ("E", "mag"),
+    "REFMAG": ("E", "mag"),
+    "REFMAGERR": ("E", "mag"),
     "BACKGROUND": ("E", "count"),
     "FLUX_MAX": ("E", "count"),
     "FLUX_RADIUS": ("E", "pix"),

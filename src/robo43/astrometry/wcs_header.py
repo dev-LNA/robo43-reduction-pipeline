@@ -98,6 +98,8 @@ def apply_solution(hdul: fits.HDUList, solution: AstrometrySolution) -> None:
             header[key] = (value, comment)
         for key, value, comment in cards:
             header[key] = (value, comment)
+        if "WCSSRC" in header:
+            header["WCSSRC"] = ("solved", "WCS from astrometric plate solve")
 
     hdul[present[0]].header.add_history(
         f"astrometry: solved rung={solution.rung} blind={solution.blind} "

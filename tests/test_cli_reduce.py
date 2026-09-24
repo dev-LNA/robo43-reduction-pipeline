@@ -8,6 +8,7 @@ Builds its own synthetic FITS files and metadata; does not use fixtures or conft
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import logging
 from pathlib import Path
@@ -781,3 +782,71 @@ def test_reduce_caches_gain_measurements_json(tmp_path):
     with fits.open(outdir / "science_1_proc.fits") as hdul:
         assert hdul["SCI"].header["BUNIT"] == "adu"
         assert hdul["SCI"].header["GAINSRC"] == "none"
+
+
+def test_reduce_parallel_matches_serial(tmp_path):
+    """--np 2 must reduce the same frames in parallel as --np 1 does serially:
+    identical *_proc.fits pixel data (every HDU) and identical proc_status.csv
+    rows in the same input order, aside from duration_s (which necessarily
+    varies run to run) and path/product_path (which differ only because the
+    two runs use different --outdir values)."""
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    calib_dir = tmp_path / "calib"
+    _create_synthetic_masters(calib_dir, _profile())
+
+    for name in ("science_1", "science_2", "science_3"):
+        _write_synthetic_frame(
+            frame_dir / f"{name}.fits", frame_type="science", filter_name="R"
+        )
+
+    outdir_serial = tmp_path / "out_serial"
+    outdir_parallel = tmp_path / "out_parallel"
+
+    result_serial = main([
+        "reduce",
+        str(frame_dir),
+        "--calibdir", str(calib_dir),
+        "--outdir", str(outdir_serial),
+        "--np", "1",
+        "--loglevel", "INFO",
+    ])
+    assert result_serial == 0
+
+    result_parallel = main([
+        "reduce",
+        str(frame_dir),
+        "--calibdir", str(calib_dir),
+        "--outdir", str(outdir_parallel),
+        "--np", "2",
+        "--loglevel", "INFO",
+    ])
+    assert result_parallel == 0
+
+    proc_files_serial = sorted(outdir_serial.glob("*_proc.fits"))
+    proc_files_parallel = sorted(outdir_parallel.glob("*_proc.fits"))
+    assert len(proc_files_serial) == 3
+    assert [p.name for p in proc_files_serial] == [p.name for p in proc_files_parallel]
+
+    for serial_path, parallel_path in zip(proc_files_serial, proc_files_parallel):
+        with fits.open(serial_path) as h_serial, fits.open(parallel_path) as h_parallel:
+            assert len(h_serial) == len(h_parallel)
+            for ext_serial, ext_parallel in zip(h_serial, h_parallel):
+                if ext_serial.data is not None:
+                    np.testing.assert_array_equal(ext_serial.data, ext_parallel.data)
+
+    def _read_rows(path: Path) -> list[dict]:
+        with path.open() as f:
+            return list(csv.DictReader(f))
+
+    rows_serial = _read_rows(outdir_serial / "proc_status.csv")
+    rows_parallel = _read_rows(outdir_parallel / "proc_status.csv")
+    assert len(rows_serial) == 3
+    assert len(rows_parallel) == 3
+
+    ignore_keys = {"duration_s", "path", "product_path"}
+    for row_serial, row_parallel in zip(rows_serial, rows_parallel):
+        for key in row_serial:
+            if key in ignore_keys:
+                continue
+            assert row_serial[key] == row_parallel[key], key

@@ -1,0 +1,112 @@
+[instrument]
+name = "t80s"
+matches = { TELESCOP = ["T80"], INSTRUME = ["T80Cam"] }
+# The raw header WCS (CD matrix = 0.500"/pix) and HIERARCH T80S INS PIXSCALE
+# = '0.500' are nominal, as are CCDPXSZX = 9.0 um and HIERARCH T80S TEL FOCU
+# LEN = 1000 mm. The e2v CCD290-99 has 10 um pixels and the published T80S
+# plate scale is ~0.55"/pix (1.4 x 1.4 deg field). Needs confirmation from a
+# plate solve; trust_header_wcs = false below overrides derive_pixel_scale's
+# normal preference for the header WCS.
+pixel_scale_arcsec = 0.55
+# The raw CD matrix is nominal, not a plate solve: this also makes reduced
+# output products carry a WCS rescaled to pixel_scale_arcsec instead of the
+# raw header's nominal one (see robo43.products.nominal_wcs).
+trust_header_wcs = false
+# gain_e_per_adu is deliberately absent: PG5_2 ("Gain, (High)") is a readout
+# gain *mode flag*, not e-/ADU. The conversion must be measured at runtime by
+# src/robo43/calib/gain.py from photon-transfer pairs of flats and biases.
+# The CCD has 16 amplifiers, each with its own gain; until per-amplifier gain
+# measurement exists only a single whole-frame value can be measured.
+# 16-bit ADC ceiling (BZERO = 32768 unsigned). Provisional: replace with the
+# measured saturation / non-linearity onset once flats are available.
+saturation_adu = 65535
+# Provisional: stars peaking at 45k-59k e- showed ~2.7x their expected
+# scatter, and a linearity measurement is still needed to pin down the true
+# non-linearity onset.
+nonlinearity_adu = 45000
+binning_keyword = "PG5_4"
+
+# Overscan is not hardcoded: each of the 16 amplifier segments has whole-line
+# prescan/overscan strips (bias ~1000 ADU) at the segment edges and at the
+# chip's horizontal midline, detected at runtime by src/robo43/calib/overscan.py.
+[instrument.layout]
+# fpacked files (.fits.fz): HDU 0 is an empty primary, the image is HDU 1.
+science_hdu = 1
+n_amplifiers = 16
+flip_y = false
+
+[instrument.filters]
+# S-PLUS / Javalambre 12-band system. Only "R" has been seen in real headers
+# so far; the other spellings are assumed and must be checked against data.
+valid = ["U", "F378", "F395", "F410", "F430", "G", "F515", "R", "F660", "I", "F861", "Z"]
+
+[instrument.keywords]
+gain_setting = ["PG5_2"]
+binning = ["PG5_4"]
+ccd_temp = ["CCD-TEMP"]
+
+[instrument.imagetyp_map]
+# T80S writes IMAGETYP = 'sky-flat' for twilight flats (bias frames are
+# already 'ZERO' and science 'OBJECT', which the default map handles).
+"sky-flat" = "flat"
+"skyflat" = "flat"
+
+[instrument.site]
+lat_deg = -30.1678638889
+lon_deg = -70.8056888889
+elevation_m = 2187
+
+[instrument.astrometry]
+index_scales = "derive"
+search_radius_deg = 0.5
+
+[instrument.calib]
+# Flats drift slowly (dust, mirror coatings) but T80S nights routinely lack
+# enough of their own flats per filter: always pool the current night's own
+# flats with the previous flat_pool_min_nights (10) nights' worth (every
+# night in that span, however many frames that already is), extend night by
+# night up to flat_pool_max_nights (20) if still short of
+# flat_pool_target_frames (20) frames, and accept fewer than the target
+# rather than reaching further. Only when NO flat at all falls within 20
+# days does the search fall through to the older-night nearest-neighbour
+# fallback (calib.fallback_max_nights_flat).
+flat_pool = true
+flat_pool_min_nights = 10
+flat_pool_max_nights = 20
+flat_pool_target_frames = 20
+
+[instrument.filters.gaia_xp]
+# GaiaXPy PhotometricSystem.JPLUS band names (confirmed against the
+# installed gaiaxpy 2.1.4 via PhotometricSystem.JPLUS.get_bands(), not
+# guessed): S-PLUS and J-PLUS are twin surveys sharing the same 12-band
+# Javalambre filter set (T80S/T80N are the twin telescopes), so gaiaxpy's
+# JPLUS synthetic-photometry system applies directly to T80S. Used only
+# when the optional gaiaxpy dependency (pyproject.toml [project.optional-
+# dependencies] "gaia" extra) is installed; see robo43.photometry.gaia_zp.
+U = "uJAVA"
+F378 = "J0378"
+F395 = "J0395"
+F410 = "J0410"
+F430 = "J0430"
+G = "gJPLUS"
+F515 = "J0515"
+R = "rJPLUS"
+F660 = "J0660"
+I = "iJPLUS"
+F861 = "J0861"
+Z = "zJPLUS"
+
+[instrument.filters.gaia_transform]
+# Fallback when gaiaxpy is unavailable or the XP query fails: a Gaia DR3
+# G-band colour transform to a Johnson-Cousins/SDSS quantity (Riello et al.
+# 2021, A&A 649, A3, "Gaia Early Data Release 3: Photometric content and
+# validation", arXiv:2012.01916v1, Appendix C, Table C.2; see
+# robo43.photometry.gaia_zp.GAIA_TRANSFORMS for the exact coefficients).
+# Only the three T80S broad bands with both an official Riello+2021
+# relation and a plausible SDSS-like bandpass are mapped here; the nine
+# narrow Javalambre filters and uJAVA have no Gaia broad-band analogue and
+# are deliberately left unmapped -- absolute calibration for them is only
+# ever available via [instrument.filters.gaia_xp] above.
+G = "sdss_g"
+R = "sdss_r"
+I = "sdss_i"

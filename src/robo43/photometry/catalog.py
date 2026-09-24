@@ -95,6 +95,7 @@ __all__ = [
     "FLAG_BAD_PHOTOMETRY",
     "FLAG_DEBLENDED",
     "FLAG_NEIGHBOR",
+    "FLAG_NONLINEAR",
     "FLAG_SATURATED",
     "FLAG_TRUNCATED",
     "PhotometryResult",
@@ -116,6 +117,10 @@ FLAG_SATURATED = 4
 FLAG_TRUNCATED = 8
 FLAG_APERTURE_INCOMPLETE = 16
 FLAG_BAD_PHOTOMETRY = 32
+#: DQ.NONLINEAR within the (dilated) source footprint -- same construction
+#: as FLAG_SATURATED just above, from the same `combined` per-source DQ
+#: union; see the loop below.
+FLAG_NONLINEAR = 64
 
 #: Scalar output columns and their FITS-table-friendly numpy dtypes. Kept
 #: separate from robo43.products.catalog.CATALOG_COLUMNS (which records FITS
@@ -515,6 +520,8 @@ def measure_sources(
         nimaflags_iso[i] = int(np.count_nonzero(dq_sub.astype(np.int64) & int(FATAL_FLAGS)))
         if combined & int(DQ.SATURATED):
             flags[i] |= FLAG_SATURATED
+        if combined & int(DQ.NONLINEAR):
+            flags[i] |= FLAG_NONLINEAR
 
         pre_sub = segm.data[sl][seg_here]  # parent lookup uses the true segment only
         parent = int(pre_sub[0]) if pre_sub.size else 0

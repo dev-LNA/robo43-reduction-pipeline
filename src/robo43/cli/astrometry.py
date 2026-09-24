@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import functools
 import logging
+import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +34,8 @@ from robo43.cli.registry import Subcommand, register
 from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header, write_fits
 from robo43.io.headers import normalise_radec
+from robo43.logging_setup import log_listener, worker_log_config
+from robo43.memory import STAGE_BYTES_PER_PIXEL, log_peak_rss_summary, release_memory, safe_worker_count
 from robo43.products.dq import DQ_DTYPE
 
 if TYPE_CHECKING:
@@ -319,24 +323,59 @@ def _run(args: argparse.Namespace) -> int:
 
     logger.info("solving astrometry for %d frame(s)", len(paths))
 
-    def _one(path: Path) -> dict[str, Any]:
-        return _process_one(
-            path,
-            profile=profile,
-            settings=settings,
-            in_place=args.in_place,
-            outdir=outdir,
-            overwrite=args.overwrite,
-            force_blind=args.no_position_hint,
-            dry_run=settings.runtime.dry_run,
-        )
+    sample_header = read_header(paths[0], profile=None)
+    naxis1 = int(sample_header.get("NAXIS1", 0) or 0)
+    naxis2 = int(sample_header.get("NAXIS2", 0) or 0)
+    per_worker_mb = (
+        naxis1 * naxis2 * STAGE_BYTES_PER_PIXEL["astrometry"] / (1024.0 * 1024.0)
+        if naxis1 and naxis2
+        else 0.0
+    )
+    nprocs = safe_worker_count(
+        max(1, settings.runtime.nprocs),
+        per_worker_mb,
+        settings.runtime.memory_reserve_mb,
+        stage="astrometry",
+    )
 
-    nprocs = max(1, settings.runtime.nprocs)
+    fn = functools.partial(
+        _process_one,
+        profile=profile,
+        settings=settings,
+        in_place=args.in_place,
+        outdir=outdir,
+        overwrite=args.overwrite,
+        force_blind=args.no_position_hint,
+        dry_run=settings.runtime.dry_run,
+    )
+
+    if settings.runtime.release_memory:
+        release_memory("astrometry.before_pool", level=logging.INFO)
+
+    rows: list[dict[str, Any]] = []
     if nprocs > 1:
-        with ThreadPoolExecutor(max_workers=nprocs) as pool:
-            rows = list(pool.map(_one, paths))
+        mp_ctx = multiprocessing.get_context("spawn")
+        mp_queue: multiprocessing.Queue = mp_ctx.Queue()
+        listener = log_listener(mp_queue)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=nprocs,
+                mp_context=mp_ctx,
+                max_tasks_per_child=1,
+                initializer=worker_log_config,
+                initargs=(mp_queue, settings.runtime.loglevel),
+            ) as pool:
+                for row in pool.map(fn, paths):
+                    rows.append(row)
+                    if settings.runtime.release_memory:
+                        release_memory("astrometry.frame")
+        finally:
+            listener.stop()
     else:
-        rows = [_one(path) for path in paths]
+        for path in paths:
+            rows.append(fn(path))
+            if settings.runtime.release_memory:
+                release_memory("astrometry.frame")
 
     status_dir = outdir if outdir is not None else paths[0].parent
     csv_path = status_dir / STATUS_CSV_NAME
@@ -352,6 +391,7 @@ def _run(args: argparse.Namespace) -> int:
 
     n_solved = sum(1 for row in rows if row["solved"])
     logger.info("astrometry complete: %d/%d frame(s) solved", n_solved, len(rows))
+    log_peak_rss_summary("astrometry")
     return 0
 
 

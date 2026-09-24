@@ -14,6 +14,7 @@ import pytest
 from astropy.io import fits
 
 from robo43.calib.gain import GainMeasurement, GainMeasurementSet
+from robo43.calib.master import MasterFrame
 from robo43.calib.masks import MaskSet
 from robo43.calib.set import CalibrationSet
 from robo43.config import CalibSettings, RuntimeSettings, Settings
@@ -487,6 +488,10 @@ def test_no_logger_in_slots():
         "dark_current_path",
         "mask",
         "gain_measurements",
+        "bias_fallback",
+        "bias_source_nights",
+        "flat_fallback",
+        "flat_source_nights",
     }
     actual_slots = set(CalibrationSet.__slots__)
     assert actual_slots == expected_slots
@@ -515,3 +520,65 @@ def test_gain_measurements_loaded_from_cache_file(tmp_path):
     assert found is not None
     assert found.gain_e_per_adu == pytest.approx(0.706)
     assert calset.gain_for("High Gain Mode 16BIT", 30.0, 2) is None
+
+
+def test_master_frames_loaded_from_hdu0_even_with_science_hdu_1(tmp_path):
+    """Regression: masters are always in HDU 0, even when profile.layout.science_hdu=1."""
+    # Create a profile with science_hdu=1 (like T80S raw frames, where HDU 1 is the image)
+    profile = InstrumentProfile(
+        name="t80s-like",
+        matches={},
+        pixel_scale_arcsec=0.5,
+        gain_e_per_adu=2.0,
+        read_noise_e=5.0,
+        saturation_adu=60000.0,
+        nonlinearity_adu=None,
+        binning_keyword="XBINNING",
+        layout=InstrumentLayout(science_hdu=1),  # This is the key: science_hdu=1
+        valid_filters=(),
+        filter_map={},
+        keywords={},
+        imagetyp_map={},
+        site_lat_deg=None,
+        site_lon_deg=None,
+        site_elevation_m=None,
+        index_scales=None,
+        search_radius_deg=0.5,
+    )
+
+    # Create a master bias with data=5.0, variance=99.0
+    bias_master = MasterFrame(
+        data=np.full((10, 10), 5.0, dtype=np.float32),
+        variance=np.full((10, 10), 99.0, dtype=np.float32),
+    )
+    bias_path = tmp_path / "master_bias.fits"
+    bias_master.write(bias_path, overwrite=True)
+
+    # Create a master flat with data=1.0, variance=0.002
+    flat_master = MasterFrame(
+        data=np.full((10, 10), 1.0, dtype=np.float32),
+        variance=np.full((10, 10), 0.002, dtype=np.float32),
+    )
+    flat_path = tmp_path / "master_flat_R_dome.fits"
+    flat_master.write(flat_path, overwrite=True)
+
+    # Load the CalibrationSet
+    calset = CalibrationSet.load(
+        tmp_path,
+        settings=_settings(),
+        profile=profile,
+    )
+
+    # Verify bias was loaded from HDU 0 (image data), not VAR extension
+    assert calset.bias is not None
+    assert float(np.mean(calset.bias)) == pytest.approx(5.0, abs=0.01)
+    assert calset.bias_var is not None
+    assert float(np.mean(calset.bias_var)) == pytest.approx(99.0, abs=0.1)
+
+    # Verify flat was loaded from HDU 0 (image data), not VAR extension
+    flat_array, flat_file = calset.flat_for("R")
+    assert flat_array is not None
+    assert float(np.mean(flat_array)) == pytest.approx(1.0, abs=0.01)
+    # VAR extension should be accessible separately
+    assert "R" in calset.flat_var
+    assert float(np.mean(calset.flat_var["R"])) == pytest.approx(0.002, abs=0.0001)

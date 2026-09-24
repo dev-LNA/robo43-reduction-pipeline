@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import functools
 import logging
+import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +25,10 @@ from robo43.cli.common import configure_from_args
 from robo43.cli.registry import Subcommand, register
 from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header, write_fits
-from robo43.photometry.catalog import measure_sources
+from robo43.logging_setup import log_listener, worker_log_config
+from robo43.memory import STAGE_BYTES_PER_PIXEL, log_peak_rss_summary, release_memory, safe_worker_count
+from robo43.photometry import gaia_zp
+from robo43.photometry.catalog import measure_sources, pixel_scale_arcsec
 from robo43.products.catalog import build_catalog_hdu
 from robo43.products.dq import DQ_DTYPE, dq_bintable
 
@@ -49,6 +54,10 @@ STATUS_FIELDNAMES: tuple[str, ...] = (
     "zp",
     "n_satur",
     "n_badpix",
+    "zp_abs",
+    "zp_abs_err",
+    "zp_abs_n",
+    "zp_abs_rms",
     "catalog_csv",
     "duration_s",
     "error",
@@ -106,6 +115,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         dest="catalog_csv",
         help="also write a sibling <stem>_catalog.csv next to each output",
     )
+    parser.add_argument(
+        "--gaia-zp",
+        action="store_true",
+        default=False,
+        dest="gaia_zp",
+        help=(
+            "also compute an optional Gaia DR3 absolute zero-point calibration "
+            "(overrides settings.photometry.abs_calibration=True)"
+        ),
+    )
 
 
 def _settings_with_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
@@ -116,6 +135,8 @@ def _settings_with_overrides(settings: Settings, args: argparse.Namespace) -> Se
         overrides["detect_thresh"] = args.detect_thresh
     if args.aper is not None:
         overrides["aperture_radii_arcsec"] = tuple(float(a) for a in args.aper.split(","))
+    if getattr(args, "gaia_zp", False):
+        overrides["abs_calibration"] = True
     if not overrides:
         return settings
     return settings.replace(photometry=dataclasses.replace(settings.photometry, **overrides))
@@ -132,6 +153,18 @@ def _resolved_gain(header: fits.Header) -> float | None:
         return float(gainval)
     except (TypeError, ValueError):
         return None
+
+
+def _frame_filter(header: fits.Header, profile: InstrumentProfile) -> str | None:
+    """The frame's canonical filter name, via the profile's own alias/keyword
+    resolution -- the same lookup robo43.io.headers uses for
+    FrameMeta.filter, reused here so gaia_zp's
+    [instrument.filters.gaia_xp]/[gaia_transform] lookup keys match exactly.
+    """
+    for alias in profile.aliases_for("filter"):
+        if alias in header:
+            return profile.canonical_filter(str(header[alias]))
+    return profile.canonical_filter(header.get("FILTER"))
 
 
 def _output_path(path: Path, *, in_place: bool, outdir: Path | None) -> Path:
@@ -154,6 +187,10 @@ def _status_row(path: Path) -> dict[str, Any]:
         "zp": None,
         "n_satur": None,
         "n_badpix": None,
+        "zp_abs": None,
+        "zp_abs_err": None,
+        "zp_abs_n": None,
+        "zp_abs_rms": None,
         "catalog_csv": "",
         "duration_s": None,
         "error": None,
@@ -241,6 +278,27 @@ def _process_one(
                 row["duration_s"] = time.monotonic() - start
                 return row
 
+            if settings.photometry.abs_calibration:
+                scale = pixel_scale_arcsec(header, wcs, profile)
+                filter_name = _frame_filter(header, profile)
+                cache_dir = out_path.parent / gaia_zp.DEFAULT_GAIA_CACHE_DIRNAME
+                gzp, calibrated_table = gaia_zp.calibrate_frame(
+                    result.table, header=header, wcs=wcs, settings=settings, profile=profile,
+                    gain_e_per_adu=gain, scale=scale, filter_name=filter_name, cache_dir=cache_dir,
+                )
+                result = dataclasses.replace(result, table=calibrated_table)
+                result.metrics.zp = gzp.zp
+                result.metrics.zp_err = gzp.zp_err
+                result.metrics.zp_rms = gzp.zp_rms
+                result.metrics.zp_nstar = gzp.n
+                result.metrics.zp_cat = "gaia" if gzp.zp is not None else None
+                result.metrics.zp_band = gzp.filter
+                for key, value, comment in gaia_zp.header_cards(gzp):
+                    header[key] = (value, comment)
+                row.update(
+                    zp_abs=gzp.zp, zp_abs_err=gzp.zp_err, zp_abs_n=gzp.n, zp_abs_rms=gzp.zp_rms,
+                )
+
             catalog_hdu = build_catalog_hdu(
                 result.table, result.metrics, aperture_radii=settings.photometry.aperture_radii_arcsec
             )
@@ -305,24 +363,59 @@ def _run(args: argparse.Namespace) -> int:
 
     logger.info("measuring photometry for %d frame(s)", len(paths))
 
-    def _one(path: Path) -> dict[str, Any]:
-        return _process_one(
-            path,
-            profile=profile,
-            settings=settings,
-            in_place=args.in_place,
-            outdir=outdir,
-            overwrite=args.overwrite,
-            catalog_csv=args.catalog_csv,
-            dry_run=settings.runtime.dry_run,
-        )
+    sample_header = read_header(paths[0], profile=None)
+    naxis1 = int(sample_header.get("NAXIS1", 0) or 0)
+    naxis2 = int(sample_header.get("NAXIS2", 0) or 0)
+    per_worker_mb = (
+        naxis1 * naxis2 * STAGE_BYTES_PER_PIXEL["photometry"] / (1024.0 * 1024.0)
+        if naxis1 and naxis2
+        else 0.0
+    )
+    nprocs = safe_worker_count(
+        max(1, settings.runtime.nprocs),
+        per_worker_mb,
+        settings.runtime.memory_reserve_mb,
+        stage="photometry",
+    )
 
-    nprocs = max(1, settings.runtime.nprocs)
+    fn = functools.partial(
+        _process_one,
+        profile=profile,
+        settings=settings,
+        in_place=args.in_place,
+        outdir=outdir,
+        overwrite=args.overwrite,
+        catalog_csv=args.catalog_csv,
+        dry_run=settings.runtime.dry_run,
+    )
+
+    if settings.runtime.release_memory:
+        release_memory("photometry.before_pool", level=logging.INFO)
+
+    rows: list[dict[str, Any]] = []
     if nprocs > 1:
-        with ThreadPoolExecutor(max_workers=nprocs) as pool:
-            rows = list(pool.map(_one, paths))
+        mp_ctx = multiprocessing.get_context("spawn")
+        mp_queue: multiprocessing.Queue = mp_ctx.Queue()
+        listener = log_listener(mp_queue)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=nprocs,
+                mp_context=mp_ctx,
+                max_tasks_per_child=1,
+                initializer=worker_log_config,
+                initargs=(mp_queue, settings.runtime.loglevel),
+            ) as pool:
+                for row in pool.map(fn, paths):
+                    rows.append(row)
+                    if settings.runtime.release_memory:
+                        release_memory("photometry.frame")
+        finally:
+            listener.stop()
     else:
-        rows = [_one(path) for path in paths]
+        for path in paths:
+            rows.append(fn(path))
+            if settings.runtime.release_memory:
+                release_memory("photometry.frame")
 
     status_dir = outdir if outdir is not None else paths[0].parent
     csv_path = status_dir / STATUS_CSV_NAME
@@ -338,6 +431,7 @@ def _run(args: argparse.Namespace) -> int:
 
     n_ok = sum(1 for row in rows if row["error"] is None)
     logger.info("photometry complete: %d/%d frame(s) measured", n_ok, len(rows))
+    log_peak_rss_summary("photometry")
     return 0
 
 

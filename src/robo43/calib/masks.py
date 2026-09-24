@@ -117,18 +117,23 @@ class MaskSet:
         hdulist = fits.HDUList([primary, dq_hdu, catflags_hdu])
 
         tmp_path = Path(str(path) + ".tmp")
-        hdulist.writeto(tmp_path, overwrite=True)
-        with tmp_path.open("rb+") as f:
-            f.flush()
-            os.fsync(f.fileno())
-        Path(tmp_path).replace(path)
+        try:
+            hdulist.writeto(tmp_path, overwrite=True)
+            with tmp_path.open("rb+") as f:
+                f.flush()
+                os.fsync(f.fileno())
+            Path(tmp_path).replace(path)
+        except BaseException:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
         return path
 
     @classmethod
     def read(cls, path: str | Path) -> MaskSet:
         """Read a mask previously written by :meth:`write`."""
         with fits.open(path) as hdul:
-            dq = np.asarray(hdul["DQ"].data, dtype=DQ_DTYPE)
+            dq = np.array(hdul["DQ"].data, dtype=DQ_DTYPE)
             header = hdul["DQ"].header
 
         full = dq_summary(dq)

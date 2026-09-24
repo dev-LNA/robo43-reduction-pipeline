@@ -10,7 +10,8 @@ flats under the same filter, allowing independent masters per illumination sourc
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +28,7 @@ from robo43.io.meta import FrameMeta
 from robo43.products.dq import DQ, DQ_DTYPE, FATAL_FLAGS
 
 if TYPE_CHECKING:
-    from robo43.calib.gain import GainMeasurementSet
+    from robo43.calib.gain import GainMeasurement, GainMeasurementSet
     from robo43.calib.masks import MaskSet
     from robo43.calib.overscan import OverscanGeometry
 
@@ -111,6 +112,161 @@ def normalise_flat(
     return normalized, cards
 
 
+def _read_and_correct(
+    meta: FrameMeta,
+    *,
+    profile: InstrumentProfile,
+    settings: Settings,
+    overscan: OverscanGeometry | None,
+    bias: MasterFrame | None,
+    dark_current_map: np.ndarray | None,
+    tile_slices: Sequence[tuple[slice, slice]] | None = None,
+    tile_gains: tuple[GainMeasurement, ...] | None = None,
+) -> tuple[np.ndarray, float, list[tuple[str, Any, str]]]:
+    """Read one raw flat frame and apply overscan trim, bias, and dark subtraction.
+
+    Returns ``(corrected_float32, median, oscan_cards)``. The median is
+    computed on the float64 working array *before* it is cast down to
+    float32 (and before any per-tile gain conversion below), matching the
+    precision the pre-streaming code used -- this keeps the level cut
+    numerically identical regardless of which storage path (in-memory list
+    or on-disk memmap) the caller uses, and keeps it comparing an ADU median
+    against ``profile.saturation_adu`` (an ADU quantity) regardless of
+    whether the returned array ends up in ADU or electrons. ``oscan_cards``
+    is only meaningful for a group's first frame.
+
+    When ``tile_gains`` is given (one entry per ``tile_slices`` region, same
+    row-major order, both from the same overscan geometry as
+    :mod:`robo43.calib.gain`'s measurement), each tile of the bias/dark-
+    corrected array is multiplied by its own measured e-/ADU gain here --
+    before the flat level cut and before combining -- so the master flat
+    this frame contributes to is built in electrons, per amplifier tile.
+    The caller only passes ``tile_gains`` for a genuine multi-tile
+    (multi-amplifier) group; for a single-tile group this conversion is a
+    uniform scalar multiply that :func:`normalise_flat` would cancel
+    exactly anyway, so the caller leaves it ``None`` there and this
+    function's output is then byte-for-bit what it always was.
+    """
+    data, _header = read_image(meta.path, profile)
+    if overscan is not None:
+        from robo43.calib.overscan import apply_overscan
+
+        trimmed, oscan_cards = apply_overscan(data, overscan, settings=settings)
+    else:
+        trimmed, oscan_cards = apply_overscan_trim(data, profile=profile, settings=settings)
+
+    working = trimmed.astype(np.float64)
+
+    if bias is not None:
+        if working.shape != bias.data.shape:
+            msg = (
+                f"bias shape {bias.data.shape} does not match trimmed frame "
+                f"shape {working.shape}"
+            )
+            raise CalibrationError(msg)
+        working = working - bias.data
+
+    if dark_current_map is not None and meta.exptime is not None:
+        working = working - (dark_current_map * meta.exptime)
+
+    median = float(np.median(working))
+
+    if tile_gains is not None and tile_slices is not None:
+        for tile_idx, (row_sl, col_sl) in enumerate(tile_slices):
+            if tile_idx >= len(tile_gains):
+                continue
+            working[row_sl, col_sl] = (
+                working[row_sl, col_sl] * tile_gains[tile_idx].gain_e_per_adu
+            )
+
+    return working.astype(np.float32), median, oscan_cards
+
+
+def _flat_level_cut(
+    frame_medians: Sequence[float],
+    group_metas: Sequence[FrameMeta],
+    group_key: str,
+    profile: InstrumentProfile,
+    settings: Settings,
+) -> tuple[list[int], list[tuple[str, Any, str]], bool]:
+    """Indices of ``group_metas`` surviving the flat level cut, plus its cards.
+
+    Accepts frames whose median falls in
+    ``[flat_min_level_frac, flat_max_level_frac] * profile.saturation_adu``.
+    When the profile declares no saturation level, the cut is skipped and
+    every frame is accepted.
+    """
+    if profile.saturation_adu is not None:
+        min_level = settings.calib.flat_min_level_frac * profile.saturation_adu
+        max_level = settings.calib.flat_max_level_frac * profile.saturation_adu
+
+        accepted_indices: list[int] = []
+        for i, med in enumerate(frame_medians):
+            if min_level <= med <= max_level:
+                accepted_indices.append(i)
+            else:
+                logger.warning(
+                    "Rejecting flat frame %s (median=%.2f, range=[%.2f, %.2f])",
+                    group_metas[i].path,
+                    med,
+                    min_level,
+                    max_level,
+                )
+        level_cut_applied = True
+    else:
+        logger.warning(
+            "Skipping level cut for group %s: profile declares no saturation level",
+            group_key,
+        )
+        accepted_indices = list(range(len(frame_medians)))
+        level_cut_applied = False
+
+    n_accepted = len(accepted_indices)
+    n_rejected = len(frame_medians) - n_accepted
+    cards = [
+        ("FLATNACC", n_accepted, "Flat frames accepted after level cut"),
+        ("FLATNREJ", n_rejected, "Flat frames rejected by level cut"),
+        ("FLATLCUT", level_cut_applied, "Flat level cut applied"),
+    ]
+    return accepted_indices, cards, level_cut_applied
+
+
+def _flat_fallback_cards(
+    contributing_nights: tuple[str, ...],
+    borrowed: bool,
+    n_accepted: int,
+) -> list[tuple[str, Any, str]]:
+    """Provenance cards: CALFBACK, source night(s), and frames combined.
+
+    ``contributing_nights`` lists every night (including the current one)
+    that contributed at least one frame to the pool feeding this group;
+    ``borrowed`` is True when any night other than the current one did (set
+    by the caller from the multi-night fallback/pooling result -- this
+    function does not know which night is "current"). A comma-joined night
+    list that would not fit a single FITS string card (68-character limit)
+    is instead recorded as the earliest/latest contributing night plus a
+    count, using <=8-character keywords (FLATN1, FLATN2, FLATNNGT).
+    """
+    cards: list[tuple[str, Any, str]] = [
+        ("CALFBACK", borrowed, "Calibration borrowed from a previous night"),
+    ]
+    if contributing_nights:
+        joined = ",".join(contributing_nights)
+        if len(joined) <= 68:
+            cards.append(
+                ("FLATNGT", joined, "Source night(s) contributing to this master flat")
+            )
+        else:
+            ordered = sorted(contributing_nights)
+            cards.append(("FLATN1", ordered[0], "Earliest contributing night"))
+            cards.append(("FLATN2", ordered[-1], "Latest contributing night"))
+            cards.append(
+                ("FLATNNGT", len(contributing_nights), "Number of contributing nights")
+            )
+    cards.append(("FLATNFRM", n_accepted, "Flat frames actually combined"))
+    return cards
+
+
 def build_master_flats(
     metas: Sequence[FrameMeta],
     *,
@@ -122,19 +278,34 @@ def build_master_flats(
     mask: MaskSet | None = None,
     overscan: OverscanGeometry | None = None,
     gain_measurements: GainMeasurementSet | None = None,
+    fallback_source_nights: Mapping[str, tuple[tuple[str, ...], bool]] | None = None,
 ) -> dict[str, MasterFrame]:
     """Build and write master flat frames, one per filter (and illumination source).
 
     Processes each group in sorted key order:
-    1. Reads and trims each frame (recording overscan cards from the first)
-    2. Subtracts bias if provided
-    3. Subtracts dark current if provided and exptime is known
-    4. Applies level cut: accepts only frames with median in
+    1. Reads and overscan/bias/dark-corrects each frame, computing its median
+       for the level cut. When a group's frames would occupy more than
+       ``settings.calib.max_memory_mb`` (estimated conservatively from each
+       frame's raw ``NAXIS1``/``NAXIS2``, counting both the corrected copy and
+       a working copy), the corrected frames are written to a disk-backed
+       ``np.memmap`` scratch file in ``outdir`` instead of being held in a
+       Python list, and combined from there row-block by row-block; small
+       groups are combined fully in memory exactly as before, so results are
+       numerically identical either way (:func:`robo43.calib.combine.combine_lazy`
+       is bit-identical to :func:`robo43.calib.combine.combine_stack`).
+    2. Applies the level cut: accepts only frames with median in
        [flat_min_level_frac, flat_max_level_frac] * saturation_adu
-    5. Combines accepted frames (or uses the single frame if n==1)
-    6. Normalizes the combined data
-    7. Applies mask and sets fatal pixels to 1.0
-    8. Writes master frame to outdir/master_flat_<key>.fits (: -> _)
+    3. Combines accepted frames (or uses the single frame if n==1)
+    4. Normalizes the combined data
+    5. Applies mask and sets fatal pixels to 1.0
+    6. Writes master frame to outdir/master_flat_<key>.fits (: -> _)
+
+    ``fallback_source_nights`` maps a group key to ``(contributing_nights,
+    borrowed)``: every night (including the current one) that contributed a
+    frame to that group's pool, and whether any night other than the current
+    one did. A group absent from the mapping gets ``CALFBACK=False`` and no
+    ``FLATNGT`` card, exactly as before this parameter's pooling-era meaning
+    was added.
 
     Returns a dict mapping group keys to the written MasterFrame objects.
     Raises CalibrationError if no flat frames are found or if a group has
@@ -150,167 +321,220 @@ def build_master_flats(
     outdir_path.mkdir(parents=True, exist_ok=True)
 
     masters: dict[str, MasterFrame] = {}
+    max_bytes = settings.calib.max_memory_mb * 1024.0 * 1024.0
 
     for group_key in sorted(groups.keys()):
         group_metas = groups[group_key]
-        logger.info("Processing flat group %s with %d frames", group_key, len(group_metas))
+        n_group = len(group_metas)
+        logger.info("Processing flat group %s with %d frames", group_key, n_group)
 
-        # Read and trim all frames
-        trimmed_frames: list[np.ndarray] = []
-        oscan_cards: list[tuple[str, Any, str]] = []
-        for i, meta in enumerate(group_metas):
-            data, _header = read_image(meta.path, profile)
-            if overscan is not None:
-                from robo43.calib.overscan import apply_overscan
-                trimmed, cards = apply_overscan(data, overscan, settings=settings)
-            else:
-                trimmed, cards = apply_overscan_trim(data, profile=profile, settings=settings)
-            trimmed_frames.append(trimmed)
-            if i == 0:
-                oscan_cards = cards
+        # Conservative (raw, untrimmed) estimate of holding both a corrected
+        # copy and a transient working copy of every frame in this group at
+        # once, decided before reading any pixel data.
+        estimated_bytes = 2.0 * n_group * group_metas[0].naxis1 * group_metas[0].naxis2 * 4.0
+        stream = estimated_bytes > max_bytes
 
-        # Subtract bias and dark current, compute medians for level cut
-        processed_frames: list[np.ndarray] = []
-        frame_medians: list[float] = []
-        bias_cards: list[tuple[str, Any, str]] = []
-        dark_cards: list[tuple[str, Any, str]] = []
-
-        for i, (trimmed, meta) in enumerate(zip(trimmed_frames, group_metas, strict=True)):
-            working = trimmed.astype(np.float64)
-
-            if bias is not None:
-                if working.shape != bias.data.shape:
-                    msg = (
-                        f"bias shape {bias.data.shape} does not match trimmed frame "
-                        f"shape {working.shape}"
-                    )
-                    raise CalibrationError(msg)
-                working = working - bias.data
-                if i == 0:
-                    bias_basename = Path(bias.path).name if bias.path else "NONE"
-                    bias_cards.append(("BIASFIL", bias_basename, "Master bias applied"))
-
-            if dark_current_map is not None and meta.exptime is not None:
-                working = working - (dark_current_map * meta.exptime)
-                if i == 0:
-                    dark_cards.append(
-                        ("DARKFIL", "applied", "Dark current scaling applied")
-                    )
-
-            if i == 0 and bias is None:
-                bias_cards.append(("BIASFIL", "NONE", "No bias subtraction"))
-            if i == 0 and dark_current_map is None:
-                dark_cards.append(("DARKFIL", "NONE", "No dark current subtraction"))
-
-            med = float(np.median(working))
-            frame_medians.append(med)
-            processed_frames.append(working.astype(np.float32))
-
-        # Apply level cut
-        level_cut_applied = True
-        if profile.saturation_adu is not None:
-            min_level = settings.calib.flat_min_level_frac * profile.saturation_adu
-            max_level = settings.calib.flat_max_level_frac * profile.saturation_adu
-
-            accepted_frames: list[np.ndarray] = []
-            accepted_indices: list[int] = []
-            for i, (frame, med) in enumerate(zip(processed_frames, frame_medians, strict=True)):
-                if min_level <= med <= max_level:
-                    accepted_frames.append(frame)
-                    accepted_indices.append(i)
-                else:
-                    logger.warning(
-                        "Rejecting flat frame %s (median=%.2f, range=[%.2f, %.2f])",
-                        group_metas[i].path,
-                        med,
-                        min_level,
-                        max_level,
-                    )
-        else:
-            level_cut_applied = False
-            logger.warning(
-                "Skipping level cut for group %s: profile declares no saturation level",
-                group_key,
-            )
-            accepted_frames = processed_frames
-            accepted_indices = list(range(len(processed_frames)))
-
-        n_accepted = len(accepted_frames)
-        n_rejected = len(processed_frames) - n_accepted
-        level_cut_cards = [
-            ("FLATNACC", n_accepted, "Flat frames accepted after level cut"),
-            ("FLATNREJ", n_rejected, "Flat frames rejected by level cut"),
-            ("FLATLCUT", level_cut_applied, "Flat level cut applied"),
-        ]
-
-        if n_accepted == 0:
-            logger.warning("No frames in group %s survive level cut; skipping", group_key)
-            continue
-
-        accepted_metas = [group_metas[i] for i in accepted_indices]
-        gain_setting, _gain_setting_origin = resolve_common_gain(accepted_metas, profile=profile)
-        readout_mode = next(
-            (m.readout_mode for m in accepted_metas if m.readout_mode is not None), None
+        # Resolve this group's (readout_mode, gain_setting, binning) key and
+        # its runtime PTC measurement *before* reading any frame, so each
+        # frame's data can be gain-converted (per amplifier tile) as it is
+        # read below. Raises CalibrationError, exactly as before, when the
+        # group's own frames disagree on gain_setting -- never silently
+        # combined. The level cut afterwards still compares each frame's own
+        # ADU median (computed before that conversion, in _read_and_correct)
+        # against profile.saturation_adu, an ADU quantity, regardless of
+        # whether this group ends up gain-converted or not.
+        group_gain_setting, _group_gain_origin = resolve_common_gain(group_metas, profile=profile)
+        group_readout_mode = next(
+            (m.readout_mode for m in group_metas if m.readout_mode is not None), None
         )
-        binning = next((m.binning for m in accepted_metas if m.binning is not None), 1)
-        measurement = (
-            gain_measurements.get(readout_mode, gain_setting, binning)
+        group_binning = next((m.binning for m in group_metas if m.binning is not None), 1)
+        group_measurement = (
+            gain_measurements.get(group_readout_mode, group_gain_setting, group_binning)
             if gain_measurements is not None
             else None
         )
-        gain_e_per_adu = measurement.gain_e_per_adu if measurement is not None else None
-        read_noise_e = (
-            measurement.read_noise_e if measurement is not None else profile.read_noise_e
+        group_tile_gains = (
+            gain_measurements.tiles_for(group_readout_mode, group_gain_setting, group_binning)
+            if gain_measurements is not None
+            else None
         )
-        if measurement is not None:
-            gain_cards = measurement.header_cards()
-        else:
-            from robo43.calib.gain import no_measurement_cards
+        gain_e_per_adu = group_measurement.gain_e_per_adu if group_measurement is not None else None
+        read_noise_e = (
+            group_measurement.read_noise_e if group_measurement is not None else profile.read_noise_e
+        )
+        from robo43.calib.gain import no_measurement_cards, per_tile_header_cards
 
-            gain_cards = no_measurement_cards(gain_setting, readout_mode)
+        gain_cards = (
+            group_measurement.header_cards()
+            if group_measurement is not None
+            else no_measurement_cards(group_gain_setting, group_readout_mode)
+        )
+        # Applying the per-tile conversion during the read loop below is
+        # worthwhile only for a genuine multi-tile group: for a single tile
+        # it is a uniform scalar multiply that normalise_flat() cancels out
+        # exactly anyway, so leaving it unapplied there keeps a
+        # single-amplifier instrument's (ROBO43's) master flat byte-for-bit
+        # unchanged.
+        apply_tile_gains = (
+            group_tile_gains if group_tile_gains and len(group_tile_gains) > 1 else None
+        )
+        tile_slices = (
+            (overscan.science_tile_slices if overscan is not None else [(slice(None), slice(None))])
+            if apply_tile_gains is not None
+            else None
+        )
+        gain_cards = gain_cards + per_tile_header_cards(group_tile_gains)
+        # When the data fed to combine_* below is already in electrons
+        # (per-tile gain applied during the read loop), gain_e_per_adu=1.0
+        # tells its own variance floor not to convert again; otherwise (no
+        # per-tile measurement) the data stays ADU and this is the
+        # frame-level e-/ADU value exactly as before.
+        combine_gain_e_per_adu = 1.0 if apply_tile_gains is not None else gain_e_per_adu
 
-        # Combine frames
-        if n_accepted >= 2:
-            # Check if we need lazy loading
-            frame_size_bytes = n_accepted * accepted_frames[0].size * 4  # float32
-            max_bytes = settings.calib.max_memory_mb * 1024.0 * 1024.0
+        oscan_cards: list[tuple[str, Any, str]] = []
+        bias_cards: list[tuple[str, Any, str]] = []
+        dark_cards: list[tuple[str, Any, str]] = []
+        frame_medians: list[float] = []
+        frame_shape: tuple[int, int] | None = None
+        processed_frames: list[np.ndarray] = []  # used only when not streaming
 
-            if frame_size_bytes > max_bytes:
-                # Use lazy loading
-                # Create loaders for each accepted frame
-                def make_loader(frame_data):
-                    def loader(slices):
-                        rows, cols = slices
-                        return frame_data[rows, cols]
-                    return loader
+        scratch_path: Path | None = None
+        memmap_arr: np.memmap | None = None
 
-                loaders = [make_loader(frame) for frame in accepted_frames]
-                result = combine_lazy(
-                    loaders,
-                    accepted_frames[0].shape,
-                    settings.calib,
-                    read_noise_e=read_noise_e,
-                    gain_e_per_adu=gain_e_per_adu,
+        try:
+            for i, meta in enumerate(group_metas):
+                processed, median, cards = _read_and_correct(
+                    meta,
+                    profile=profile,
+                    settings=settings,
+                    overscan=overscan,
+                    bias=bias,
+                    dark_current_map=dark_current_map,
+                    tile_slices=tile_slices,
+                    tile_gains=apply_tile_gains,
                 )
+
+                if i == 0:
+                    oscan_cards = cards
+                    frame_shape = processed.shape
+                    if stream:
+                        scratch_path = (
+                            outdir_path
+                            / f".flat_stream_{group_key.replace(':', '_')}_{os.getpid()}.dat"
+                        )
+                        memmap_arr = np.memmap(
+                            scratch_path,
+                            mode="w+",
+                            dtype=np.float32,
+                            shape=(n_group, *frame_shape),
+                        )
+                    if bias is not None:
+                        bias_basename = Path(bias.path).name if bias.path else "NONE"
+                        bias_cards.append(("BIASFIL", bias_basename, "Master bias applied"))
+                    else:
+                        bias_cards.append(("BIASFIL", "NONE", "No bias subtraction"))
+                    if dark_current_map is not None:
+                        dark_cards.append(
+                            ("DARKFIL", "applied", "Dark current scaling applied")
+                        )
+                    else:
+                        dark_cards.append(("DARKFIL", "NONE", "No dark current subtraction"))
+                elif processed.shape != frame_shape:
+                    msg = (
+                        f"flat frame {meta.path} has shape {processed.shape}, expected "
+                        f"{frame_shape} (all frames in a group must share the same shape)"
+                    )
+                    raise CalibrationError(msg)
+
+                frame_medians.append(median)
+
+                if stream:
+                    memmap_arr[i] = processed
+                    del processed
+                else:
+                    processed_frames.append(processed)
+
+            if stream:
+                memmap_arr.flush()
+
+            accepted_indices, level_cut_cards, _level_cut_applied = _flat_level_cut(
+                frame_medians, group_metas, group_key, profile, settings
+            )
+            n_accepted = len(accepted_indices)
+
+            if n_accepted == 0:
+                logger.warning("No frames in group %s survive level cut; skipping", group_key)
+                continue
+
+            accepted_metas = [group_metas[i] for i in accepted_indices]
+
+            group_fallback = (fallback_source_nights or {}).get(group_key)
+            if group_fallback is not None:
+                contributing_nights, borrowed = group_fallback
             else:
-                # Use stack combination
-                result = combine_stack(
-                    accepted_frames,
-                    settings.calib,
-                    read_noise_e=read_noise_e,
-                    gain_e_per_adu=gain_e_per_adu,
-                )
+                contributing_nights, borrowed = (), False
+            fallback_cards = _flat_fallback_cards(contributing_nights, borrowed, n_accepted)
 
-            combine_cards = result.header_cards()
-            master_data = result.data
-            master_variance = result.variance
-            master_weight = result.weight
-        else:
-            # Single frame
-            master_data = accepted_frames[0].astype(np.float32)
-            master_variance = None
-            master_weight = None
-            combine_cards = [("NCOMBINE", 1, "Number of input frames")]
+            if n_accepted >= 2:
+                if stream:
+                    def _make_loader(idx: int):
+                        def loader(slices):
+                            rows, cols = slices
+                            return np.asarray(memmap_arr[idx, rows, cols])
+
+                        return loader
+
+                    loaders = [_make_loader(i) for i in accepted_indices]
+                    result = combine_lazy(
+                        loaders,
+                        frame_shape,
+                        settings.calib,
+                        read_noise_e=read_noise_e,
+                        gain_e_per_adu=combine_gain_e_per_adu,
+                    )
+                else:
+                    accepted_frames = [processed_frames[i] for i in accepted_indices]
+                    frame_size_bytes = n_accepted * accepted_frames[0].size * 4
+                    if frame_size_bytes > max_bytes:
+                        def make_loader(frame_data):
+                            def loader(slices):
+                                rows, cols = slices
+                                return frame_data[rows, cols]
+
+                            return loader
+
+                        loaders = [make_loader(frame) for frame in accepted_frames]
+                        result = combine_lazy(
+                            loaders,
+                            accepted_frames[0].shape,
+                            settings.calib,
+                            read_noise_e=read_noise_e,
+                            gain_e_per_adu=combine_gain_e_per_adu,
+                        )
+                    else:
+                        result = combine_stack(
+                            accepted_frames,
+                            settings.calib,
+                            read_noise_e=read_noise_e,
+                            gain_e_per_adu=combine_gain_e_per_adu,
+                        )
+
+                combine_cards = result.header_cards()
+                master_data = result.data
+                master_variance = result.variance
+                master_weight = result.weight
+            else:
+                single_idx = accepted_indices[0]
+                single = memmap_arr[single_idx] if stream else processed_frames[single_idx]
+                master_data = np.array(single, dtype=np.float32)
+                master_variance = None
+                master_weight = None
+                combine_cards = [("NCOMBINE", 1, "Number of input frames")]
+        finally:
+            if memmap_arr is not None:
+                del memmap_arr
+            if scratch_path is not None and scratch_path.exists():
+                scratch_path.unlink()
 
         # Normalize the flat
         normalized_data, norm_cards = normalise_flat(master_data, settings.calib)
@@ -352,6 +576,7 @@ def build_master_flats(
             + combine_cards
             + norm_cards
             + mask_cards
+            + fallback_cards
         )
 
         # Create history line
@@ -375,5 +600,11 @@ def build_master_flats(
 
         masters[group_key] = master
         logger.info("Wrote master flat to %s", output_path)
+
+        del processed_frames
+        if settings.runtime.release_memory:
+            from robo43.memory import release_memory
+
+            release_memory(f"flat:{group_key}")
 
     return masters

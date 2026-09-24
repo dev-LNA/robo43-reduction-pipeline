@@ -164,8 +164,10 @@ def derive_pixel_scale(
 ) -> tuple[float | None, FieldOrigin]:
     """Derive the plate scale in arcsec/pixel.
 
-    Precedence: XPIXSZ+FOCALLEN+binning, then WCS, then the profile's static
-    ``pixel_scale_arcsec``, then unavailable.
+    Precedence: XPIXSZ+FOCALLEN+binning, then WCS (skipped entirely when
+    ``profile.trust_header_wcs`` is ``False``, because the header WCS is a
+    known-nominal design value rather than a plate solve), then the
+    profile's static ``pixel_scale_arcsec``, then unavailable.
     """
     raw_pixsz, _ = _find_alias_value(header, profile, "pixel_size")
     raw_focallen, _ = _find_alias_value(header, profile, "focal_length")
@@ -182,14 +184,15 @@ def derive_pixel_scale(
             scale = 206.265 * pixsz * binning_val / focallen
             return scale, FieldOrigin(Source.DERIVED, "xpixsz+focallen+binning")
 
-    try:
-        wcs = WCS(header)
-        if wcs.has_celestial:
-            scales_deg = proj_plane_pixel_scales(wcs)
-            scale_arcsec = float(np.mean(scales_deg) * 3600.0)
-            return scale_arcsec, FieldOrigin(Source.DERIVED, "wcs")
-    except Exception as exc:
-        logger.debug("could not derive pixel scale from WCS: %s", exc)
+    if profile.trust_header_wcs:
+        try:
+            wcs = WCS(header)
+            if wcs.has_celestial:
+                scales_deg = proj_plane_pixel_scales(wcs)
+                scale_arcsec = float(np.mean(scales_deg) * 3600.0)
+                return scale_arcsec, FieldOrigin(Source.DERIVED, "wcs")
+        except Exception as exc:
+            logger.debug("could not derive pixel scale from WCS: %s", exc)
 
     if profile.pixel_scale_arcsec is not None:
         return profile.pixel_scale_arcsec, FieldOrigin(Source.PROFILE, profile.name)

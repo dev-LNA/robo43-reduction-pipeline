@@ -703,3 +703,179 @@ def test_build_master_flats_raises_on_inconsistent_gain_setting(tmp_path):
 
     with pytest.raises(CalibrationError, match="inconsistent"):
         build_master_flats(metas, settings=settings, profile=profile, outdir=outdir)
+
+
+# --------------------------------------------------------------------------
+# Streaming (memmap-backed) build path: must be numerically identical to the
+# in-memory path for the same input, only the storage medium differs.
+# --------------------------------------------------------------------------
+
+
+def test_streaming_path_matches_in_memory_combine(tmp_path):
+    """Forcing the memmap-backed path (tiny max_memory_mb) must reproduce the
+    default in-memory path's master flat bit-for-bit."""
+    rng = np.random.default_rng(99)
+    h, w = 32, 32
+    shape = (h, w)
+    metas = _make_flat_group(
+        tmp_path, "flat", n=5, shape=shape, level=20000.0, sigma=50.0,
+        filter="R-Bessell", object="DomeFlat", rng=rng,
+    )
+
+    profile = _profile()
+
+    in_memory_settings = _settings(separate_dome_and_sky_flats=False)
+    in_memory_masters = build_master_flats(
+        list(metas), settings=in_memory_settings, profile=profile,
+        outdir=tmp_path / "masters_inmem",
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    # A max_memory_mb small enough that even one 32x32 float32 frame trips
+    # the "estimated_bytes > max_bytes" streaming decision.
+    streaming_settings = _settings(separate_dome_and_sky_flats=False, max_memory_mb=1e-6)
+    streaming_masters = build_master_flats(
+        list(metas), settings=streaming_settings, profile=profile,
+        outdir=tmp_path / "masters_stream",
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    in_memory = in_memory_masters["R-Bessell"]
+    streaming = streaming_masters["R-Bessell"]
+
+    np.testing.assert_array_equal(in_memory.data, streaming.data)
+    assert in_memory.variance is not None and streaming.variance is not None
+    np.testing.assert_array_equal(in_memory.variance, streaming.variance)
+
+    in_cards = {c[0]: c[1] for c in in_memory.header_cards}
+    stream_cards = {c[0]: c[1] for c in streaming.header_cards}
+    assert in_cards["FLATNACC"] == stream_cards["FLATNACC"] == 5
+    assert in_cards["FLATNORM"] == pytest.approx(stream_cards["FLATNORM"])
+
+    # No scratch file left behind.
+    assert not any((tmp_path / "masters_stream").glob(".flat_stream_*"))
+
+
+def test_streaming_path_single_frame_matches_in_memory(tmp_path):
+    """A single-frame group (no combine) must also match between paths."""
+    rng = np.random.default_rng(7)
+    h, w = 16, 16
+    shape = (h, w)
+    metas = _make_flat_group(
+        tmp_path, "flat", n=1, shape=shape, level=20000.0, sigma=0.0,
+        filter="R-Bessell", object="DomeFlat", rng=rng,
+    )
+
+    profile = _profile()
+    in_memory_masters = build_master_flats(
+        list(metas), settings=_settings(separate_dome_and_sky_flats=False),
+        profile=profile, outdir=tmp_path / "masters_inmem",
+        gain_measurements=GainMeasurementSet({}),
+    )
+    streaming_masters = build_master_flats(
+        list(metas),
+        settings=_settings(separate_dome_and_sky_flats=False, max_memory_mb=1e-6),
+        profile=profile, outdir=tmp_path / "masters_stream",
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    np.testing.assert_array_equal(
+        in_memory_masters["R-Bessell"].data, streaming_masters["R-Bessell"].data
+    )
+
+
+# --------------------------------------------------------------------------
+# Flat-pool provenance cards (FLATNGT / FLATN1+FLATN2+FLATNNGT / FLATNFRM)
+# --------------------------------------------------------------------------
+
+
+def _simple_group(tmp_path, rng):
+    h, w = 32, 32
+    return _make_flat_group(
+        tmp_path, "flat", n=3, shape=(h, w), level=20000.0, sigma=50.0,
+        filter="R-Bessell", object="DomeFlat", rng=rng,
+    )
+
+
+def test_fallback_cards_absent_group_is_not_borrowed(tmp_path):
+    """A group key missing from fallback_source_nights: CALFBACK False, no
+    FLATNGT card, but FLATNFRM is always recorded."""
+    metas = _simple_group(tmp_path, np.random.default_rng(1))
+    masters = build_master_flats(
+        list(metas), settings=_settings(separate_dome_and_sky_flats=False),
+        profile=_profile(), outdir=tmp_path / "masters",
+        gain_measurements=GainMeasurementSet({}), fallback_source_nights={},
+    )
+    cards = {c[0]: c[1] for c in masters["R-Bessell"].header_cards}
+    assert cards["CALFBACK"] is False
+    assert "FLATNGT" not in cards
+    assert cards["FLATNFRM"] == 3
+
+
+def test_fallback_cards_short_night_list(tmp_path):
+    """A short contributing-night list fits a single FLATNGT card."""
+    metas = _simple_group(tmp_path, np.random.default_rng(2))
+    masters = build_master_flats(
+        list(metas), settings=_settings(separate_dome_and_sky_flats=False),
+        profile=_profile(), outdir=tmp_path / "masters",
+        gain_measurements=GainMeasurementSet({}),
+        fallback_source_nights={
+            "R-Bessell": (("20251104", "20251102", "20251101"), True)
+        },
+    )
+    cards = {c[0]: c[1] for c in masters["R-Bessell"].header_cards}
+    assert cards["CALFBACK"] is True
+    assert cards["FLATNGT"] == "20251104,20251102,20251101"
+    assert "FLATN1" not in cards
+    assert cards["FLATNFRM"] == 3
+
+
+def test_fallback_cards_long_night_list_uses_compact_form(tmp_path):
+    """A contributing-night list too long for one FITS card (>68 chars)
+    falls back to FLATN1/FLATN2/FLATNNGT (all <=8-character keywords)."""
+    metas = _simple_group(tmp_path, np.random.default_rng(3))
+    nights = (
+        "20251104", "20251103", "20251102", "20251101", "20251031",
+        "20251030", "20251029", "20251028", "20251027",
+    )
+    assert len(",".join(nights)) > 68  # sanity check on the test's own premise
+    masters = build_master_flats(
+        list(metas), settings=_settings(separate_dome_and_sky_flats=False),
+        profile=_profile(), outdir=tmp_path / "masters",
+        gain_measurements=GainMeasurementSet({}),
+        fallback_source_nights={"R-Bessell": (nights, True)},
+    )
+    cards = {c[0]: c[1] for c in masters["R-Bessell"].header_cards}
+    assert cards["CALFBACK"] is True
+    assert "FLATNGT" not in cards
+    assert cards["FLATN1"] == "20251027"
+    assert cards["FLATN2"] == "20251104"
+    assert cards["FLATNNGT"] == 9
+    assert cards["FLATNFRM"] == 3
+
+
+def test_fallback_cards_frm_counts_only_accepted_frames(tmp_path):
+    """FLATNFRM counts frames actually combined, not the whole pool: one
+    frame here is rejected by the level cut."""
+    rng = np.random.default_rng(4)
+    h, w = 32, 32
+    metas = _make_flat_group(
+        tmp_path, "flat", n=3, shape=(h, w), level=20000.0, sigma=50.0,
+        filter="R-Bessell", object="DomeFlat", rng=rng,
+    )
+    # A 4th frame far outside the accepted level range (saturation_adu is
+    # 60000, accepted range is [12000, 42000]).
+    bad_path = tmp_path / "flat_bad.fits"
+    _write_fits(bad_path, np.full((h, w), 100.0, dtype=np.float32))
+    metas.append(_meta(bad_path, (h, w), filter="R-Bessell", object="DomeFlat"))
+
+    masters = build_master_flats(
+        list(metas), settings=_settings(separate_dome_and_sky_flats=False),
+        profile=_profile(), outdir=tmp_path / "masters",
+        gain_measurements=GainMeasurementSet({}),
+        fallback_source_nights={"R-Bessell": (("20251104",), False)},
+    )
+    cards = {c[0]: c[1] for c in masters["R-Bessell"].header_cards}
+    assert cards["FLATNACC"] == 3
+    assert cards["FLATNFRM"] == 3
+    assert cards["FLATNREJ"] == 1

@@ -15,7 +15,7 @@ import logging
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +42,8 @@ _KNOWN_INSTRUMENT_KEYS = {
     "saturation_adu",
     "nonlinearity_adu",
     "binning_keyword",
+    "trust_header_wcs",
+    "calib",
     "layout",
     "filters",
     "keywords",
@@ -61,6 +63,29 @@ class InstrumentLayout:
     overscan: str | None = None
     trim: str | None = None
     flip_y: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentCalibOptions:
+    """Optional per-instrument calibration-fallback policy (``[instrument.calib]``).
+
+    Defaults mean "pooling off": an instrument profile that omits this table
+    keeps today's zero-trigger flat fallback
+    (:func:`robo43.calib.fallback.collect_fallback_frames`) unchanged.
+    Setting ``flat_pool = true`` switches every filter's flat build to the
+    always-on multi-night pooling policy
+    (:func:`robo43.calib.fallback.pool_flat_frames`): pool the current
+    night's own flats with every matching flat from the previous
+    ``flat_pool_min_nights`` calendar days, extend night by night up to
+    ``flat_pool_max_nights`` days if the pool is still short of
+    ``flat_pool_target_frames``, and accept fewer than the target rather
+    than searching further within that window.
+    """
+
+    flat_pool: bool = False
+    flat_pool_min_nights: int = 10
+    flat_pool_max_nights: int = 20
+    flat_pool_target_frames: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +116,22 @@ class InstrumentProfile:
     site_elevation_m: float | None
     index_scales: tuple[int, ...] | None
     search_radius_deg: float
+    # Optional Gaia-referenced absolute-calibration maps (robo43.photometry.gaia_zp):
+    # canonical filter name -> gaiaxpy PhotometricSystem.JPLUS band name, and
+    # canonical filter name -> robo43.photometry.gaia_zp.GAIA_TRANSFORMS key.
+    # Empty dicts (the default, so every pre-existing InstrumentProfile(...)
+    # call site keeps working unchanged) mean "no Gaia reference mapping for
+    # any filter of this instrument" -- absolute calibration then reports
+    # "unavailable" for every frame rather than raising.
+    filter_gaia_xp: dict[str, str] = field(default_factory=dict)
+    filter_gaia_transform: dict[str, str] = field(default_factory=dict)
+    # Whether the raw header's WCS (CD matrix, or CDELT/PC pair) can be
+    # trusted as a real plate solve. False for an instrument whose header
+    # WCS is a known-nominal design value (see t80s.toml): derive_pixel_scale
+    # then skips the header-WCS step, and reduced products get their WCS
+    # rescaled to pixel_scale_arcsec instead of carrying the nominal one.
+    trust_header_wcs: bool = True
+    calib: InstrumentCalibOptions = field(default_factory=InstrumentCalibOptions)
     version: str = "1"
     source: str = "packaged"
 
@@ -200,6 +241,16 @@ def _profile_from_toml_dict(
     saturation_adu = _float_or_none(instrument, "saturation_adu", path_for_errors)
     nonlinearity_adu = _float_or_none(instrument, "nonlinearity_adu", path_for_errors)
     binning_keyword = instrument.get("binning_keyword", "XBINNING")
+    trust_header_wcs = bool(instrument.get("trust_header_wcs", True))
+
+    raw_calib = instrument.get("calib", {})
+    calib_options = InstrumentCalibOptions(
+        flat_pool=bool(raw_calib.get("flat_pool", False)),
+        flat_pool_min_nights=int(raw_calib.get("flat_pool_min_nights", 10)),
+        flat_pool_max_nights=int(raw_calib.get("flat_pool_max_nights", 20)),
+        flat_pool_target_frames=int(raw_calib.get("flat_pool_target_frames", 20)),
+    )
+
     version = instrument.get("version", "1")
 
     raw_layout = instrument.get("layout", {})
@@ -214,6 +265,8 @@ def _profile_from_toml_dict(
     raw_filters = instrument.get("filters", {})
     valid_filters = tuple(raw_filters.get("valid", ()))
     filter_map = dict(raw_filters.get("map", {}))
+    filter_gaia_xp = dict(raw_filters.get("gaia_xp", {}))
+    filter_gaia_transform = dict(raw_filters.get("gaia_transform", {}))
 
     raw_keywords = instrument.get("keywords", {})
     keywords = {k: tuple(v) for k, v in raw_keywords.items()}
@@ -246,6 +299,8 @@ def _profile_from_toml_dict(
         layout=layout,
         valid_filters=valid_filters,
         filter_map=filter_map,
+        filter_gaia_xp=filter_gaia_xp,
+        filter_gaia_transform=filter_gaia_transform,
         keywords=keywords,
         imagetyp_map=imagetyp_map,
         site_lat_deg=site_lat_deg,
@@ -253,6 +308,8 @@ def _profile_from_toml_dict(
         site_elevation_m=site_elevation_m,
         index_scales=index_scales,
         search_radius_deg=search_radius_deg,
+        trust_header_wcs=trust_header_wcs,
+        calib=calib_options,
         version=str(version),
         source=source,
     )

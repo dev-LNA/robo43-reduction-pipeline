@@ -106,6 +106,16 @@ def iter_fits_files(
     yield from unique
 
 
+def _is_dataless(header: fits.Header) -> bool:
+    """True when a header describes no pixel data.
+
+    Real T80S primaries declare ``NAXIS = 1`` with ``NAXIS1 = 0`` rather
+    than ``NAXIS = 0``, so both forms must count as empty.
+    """
+    naxis = int(header.get("NAXIS", 0) or 0)
+    return naxis == 0 or any(int(header.get(f"NAXIS{i}", 0) or 0) == 0 for i in range(1, naxis + 1))
+
+
 @contextmanager
 def open_fits(path: str | os.PathLike[str], mode: str = "readonly") -> Iterator[fits.HDUList]:
     """Open a FITS file as a context manager, guaranteeing it is closed."""
@@ -154,7 +164,18 @@ def read_image(
 def read_header(
     path: str | os.PathLike[str], profile: InstrumentProfile | None = None
 ) -> fits.Header:
-    """Read a file's header once, merging in science-extension cards if needed."""
+    """Read a file's header once, merging in science-extension cards if needed.
+
+    When ``profile`` is given, cards are merged in from its declared science
+    extension (unless that is HDU 0 or ``"all"``). When ``profile`` is
+    ``None`` -- profile auto-detection's own header read, before any profile
+    is known -- and HDU 0 has no data (``NAXIS == 0``, an empty primary such
+    as a fpacked file's), cards are instead merged in from the first image
+    extension (``CompImageHDU`` or ``ImageHDU``) found, so instrument-match
+    keywords living only on that extension (e.g. T80S's ``TELESCOP``/
+    ``INSTRUME``) are visible to
+    :func:`robo43.instruments.profile.resolve_profile`.
+    """
     with open_fits(path) as hdul:
         header = hdul[0].header.copy()
         if profile is not None:
@@ -166,6 +187,11 @@ def read_header(
                     ext = None
                 if ext is not None and ext is not hdul[0]:
                     header.update(ext.header)
+        elif _is_dataless(header) and len(hdul) > 1:
+            for ext in hdul[1:]:
+                if isinstance(ext, (fits.ImageHDU, fits.CompImageHDU)):
+                    header.update(ext.header)
+                    break
         return header
 
 
@@ -248,7 +274,7 @@ def write_fits(
             fh.flush()
             os.fsync(fh.fileno())
         tmp_path.replace(final_path)
-    except Exception:
+    except BaseException:
         if tmp_path.exists():
             tmp_path.unlink()
         raise

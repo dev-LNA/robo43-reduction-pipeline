@@ -142,6 +142,7 @@ def build_master_bias(
     outdir: str | Path,
     overscan: OverscanGeometry | None = None,
     gain_measurements: GainMeasurementSet | None = None,
+    fallback_source_nights: tuple[str, ...] = (),
 ) -> MasterFrame:
     """Build and write a master bias frame from ``metas``.
 
@@ -210,7 +211,15 @@ def build_master_bias(
 
         gain_cards = no_measurement_cards(gain_setting, readout_mode)
 
-    header_cards = oscan_cards + combine_cards + gain_cards
+    fallback_cards: list[tuple[str, Any, str]] = [
+        ("CALFBACK", bool(fallback_source_nights), "Calibration borrowed from a previous night"),
+    ]
+    if fallback_source_nights:
+        fallback_cards.append(
+            ("BIASNGT", ",".join(fallback_source_nights), "Source night(s) for borrowed bias")
+        )
+
+    header_cards = oscan_cards + combine_cards + gain_cards + fallback_cards
 
     master = MasterFrame(
         data=master_data,

@@ -25,7 +25,7 @@ from robo43.products.dq import DQ, DQ_DTYPE
 from robo43.reduce.frame import reduce_frame
 
 
-def _profile(gain=2.0) -> InstrumentProfile:
+def _profile(gain=2.0, *, saturation_adu=60000.0, nonlinearity_adu=None) -> InstrumentProfile:
     """Create a minimal test instrument profile."""
     return InstrumentProfile(
         name="test-instrument",
@@ -33,8 +33,8 @@ def _profile(gain=2.0) -> InstrumentProfile:
         pixel_scale_arcsec=0.5,
         gain_e_per_adu=gain,
         read_noise_e=5.0,
-        saturation_adu=60000.0,
-        nonlinearity_adu=None,
+        saturation_adu=saturation_adu,
+        nonlinearity_adu=nonlinearity_adu,
         binning_keyword="XBINNING",
         layout=InstrumentLayout(),
         valid_filters=("R",),
@@ -1201,7 +1201,169 @@ def test_reduce_frame_records_per_step_median_cards(tmp_path):
 
     assert product.header["MEDRAW"] == pytest.approx(1000.0)
     assert product.header["MEDBIAS"] == pytest.approx(900.0)
-    # No dark or flat master supplied, so those steps are no-ops on the data.
+    # No dark master supplied, so that step is a no-op on the data (still
+    # ADU: gain is applied in Step 4, right after dark subtraction).
     assert product.header["MEDDARK"] == pytest.approx(900.0)
-    assert product.header["MEDFLAT"] == pytest.approx(900.0)
     assert product.header["MEDGAIN"] == pytest.approx(1800.0)
+    # No flat master supplied either, so MEDFLAT is also a no-op on the
+    # data -- but Step 4 (gain to electrons) now runs *before* Step 5 (flat
+    # fielding), so by the time MEDFLAT is recorded the data is already the
+    # post-gain 1800 electrons, not the pre-gain 900 ADU: this is the
+    # intended effect of moving gain before flat (robo43.calib.gain /
+    # robo43.calib.flat's per-amplifier-tile build), not a regression.
+    assert product.header["MEDFLAT"] == pytest.approx(1800.0)
+
+
+
+# --- Regression tests: saturation/non-linearity must be evaluated on the RAW
+# ADU frame (before overscan/bias/dark), and must be set whether or not a
+# master bad-pixel mask is present. See the module docstring's bug history:
+# previously `data_for_saturation` was a post-bias/dark snapshot, so a raw
+# pixel at the ADC ceiling could never trip SATURATED once its ~1000 ADU
+# bias pedestal was subtracted, and the check ran only inside the no-mask
+# fallback, so a frame with a master mask got no saturation flagging at all.
+
+_SAT_ADU = 65535.0
+_NONLIN_ADU = 45000.0
+_BIAS_PEDESTAL = 1000.0
+_BACKGROUND_ADU = 500.0  # bias + background, well below _NONLIN_ADU
+
+
+def _raw_frame_with_saturation_blocks(shape: tuple[int, int]) -> np.ndarray:
+    """Bias pedestal + flat background, with a saturated block and a
+    non-linear-but-not-saturated block, in raw ADU (pre-overscan/bias/dark)."""
+    raw = np.full(shape, _BIAS_PEDESTAL + _BACKGROUND_ADU, dtype=np.float64)
+    raw[10:15, 10:15] = _SAT_ADU  # saturated (and, incidentally, non-linear)
+    raw[30:35, 30:35] = 50000.0  # non-linear only: > _NONLIN_ADU, < _SAT_ADU
+    return raw
+
+
+@pytest.mark.parametrize("with_mask", [True, False])
+def test_reduce_frame_saturation_flagged_on_raw_frame(tmp_path, with_mask):
+    """A raw pixel at the ADC ceiling must end up SATURATED in the output
+    DQ, whether or not a master bad-pixel mask is present -- and a raw pixel
+    above the non-linearity threshold but below saturation must end up
+    NONLINEAR without SATURATED."""
+    shape = (64, 64)
+
+    raw_data = _raw_frame_with_saturation_blocks(shape)
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.full(shape, _BIAS_PEDESTAL)
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    mask = None
+    if with_mask:
+        mask = MaskSet(dq=np.zeros(shape, dtype=DQ_DTYPE), summary={"any": 0.0, "fatal": 0.0})
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={},
+        flat_var={},
+        flat_paths={},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=mask,
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    meta = _meta(raw_path, shape)
+    profile = _profile(saturation_adu=_SAT_ADU, nonlinearity_adu=_NONLIN_ADU)
+    settings = _settings()
+
+    product, status = reduce_frame(meta, calib, settings=settings, profile=profile)
+
+    assert product.dq.shape == shape
+
+    saturated_block = product.dq[10:15, 10:15]
+    assert np.all((saturated_block & int(DQ.SATURATED)) != 0), (
+        f"expected SATURATED on the 65535-ADU block, got:\n{saturated_block}"
+    )
+
+    nonlinear_block = product.dq[30:35, 30:35]
+    assert np.all((nonlinear_block & int(DQ.NONLINEAR)) != 0), (
+        f"expected NONLINEAR on the 50000-ADU block, got:\n{nonlinear_block}"
+    )
+    assert np.all((nonlinear_block & int(DQ.SATURATED)) == 0), (
+        f"expected NO SATURATED on the 50000-ADU block, got:\n{nonlinear_block}"
+    )
+
+    # A background pixel far from either block must be clean.
+    assert (product.dq[0, 0] & int(DQ.SATURATED)) == 0
+    assert (product.dq[0, 0] & int(DQ.NONLINEAR)) == 0
+
+    if with_mask:
+        assert "mask" in status.steps_applied
+    else:
+        assert "mask" in status.steps_skipped
+
+
+def test_reduce_frame_saturation_mask_trimmed_with_overscan(tmp_path):
+    """The raw-domain saturation mask must be trimmed by the exact same
+    geometry apply_overscan applies to the science data, so it stays
+    pixel-aligned after overscan/trim -- and a saturated pixel inside the
+    (removed) overscan region must not appear, or crash the pipeline."""
+    raw_shape = (256, 256)
+    trimmed_shape = (246, 246)
+
+    raw_data = _raw_frame_with_saturation_blocks(raw_shape)
+    # A saturated pixel inside the region that gets trimmed away as overscan.
+    raw_data[250, 250] = _SAT_ADU
+    raw_path = tmp_path / "raw.fits"
+    _write_fits(raw_path, raw_data)
+
+    bias_data = np.full(trimmed_shape, _BIAS_PEDESTAL)
+    bias_path = tmp_path / "master_bias.fits"
+    _write_fits(bias_path, bias_data)
+
+    calib = CalibrationSet(
+        bias=bias_data.astype(np.float32),
+        bias_var=None,
+        bias_path=bias_path,
+        flats={},
+        flat_var={},
+        flat_paths={},
+        darks=(),
+        dark_current_map=None,
+        dark_current_path=None,
+        mask=None,
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    meta = _meta(raw_path, raw_shape)
+    profile = _profile(saturation_adu=_SAT_ADU, nonlinearity_adu=_NONLIN_ADU)
+    settings = _settings()
+
+    overscan = OverscanGeometry(
+        shape=raw_shape,
+        columns=tuple(range(246, 256)),
+        rows=tuple(range(246, 256)),
+        bias_level=_BIAS_PEDESTAL,
+        flat_level=1.0,
+        detected=True,
+        source="detected",
+    )
+
+    product, status = reduce_frame(
+        meta, calib, settings=settings, profile=profile, overscan=overscan
+    )
+
+    assert product.sci.shape == trimmed_shape
+    assert product.dq.shape == trimmed_shape
+
+    # The saturated block at raw [10:15, 10:15] survives the trim at the
+    # same indices (the trim removes only the last 10 rows/cols).
+    saturated_block = product.dq[10:15, 10:15]
+    assert np.all((saturated_block & int(DQ.SATURATED)) != 0)
+
+    # The saturated pixel that lived inside the removed overscan strip
+    # (raw [250, 250]) must not appear anywhere in the trimmed DQ plane.
+    assert np.count_nonzero(product.dq & int(DQ.SATURATED)) == 25, (
+        "expected exactly the 5x5 in-bounds saturated block, nothing from "
+        "the trimmed-away overscan pixel"
+    )

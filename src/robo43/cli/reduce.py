@@ -10,13 +10,23 @@ made to its data and header (see robo43.reduce.changelog).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import logging
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from robo43.calib.bias import build_master_bias, select_frames
 from robo43.calib.dark import build_master_darks
+from robo43.calib.fallback import (
+    collect_fallback_frames,
+    dominant_camera_config,
+    parse_night_dirname,
+    pool_flat_frames,
+)
 from robo43.calib.flat import build_master_flats, group_flats_by_filter
 from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurementSet, measure_gain
 from robo43.calib.masks import MaskSet
@@ -28,16 +38,172 @@ from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header
 from robo43.io.headers import read_meta
 from robo43.io.validate import OverrideSet
+from robo43.logging_setup import log_listener, worker_log_config
+from robo43.memory import STAGE_BYTES_PER_PIXEL, log_peak_rss_summary, release_memory, safe_worker_count
 from robo43.reduce.changelog import append_change_log
 from robo43.reduce.frame import reduce_frame
 
 if TYPE_CHECKING:
+    from robo43.calib.overscan import OverscanGeometry
+    from robo43.config import Settings
+    from robo43.instruments.profile import InstrumentProfile
     from robo43.io.meta import FrameMeta
 
 
 __all__ = ["SUBCOMMAND"]
 
 logger = logging.getLogger(__name__)
+
+#: Populated once per worker -- by ``_init_science_worker`` in a pooled
+#: (``nprocs > 1``) run, or directly by ``_run`` for the ``nprocs == 1``
+#: in-process fallback -- so ``reduce_frame_worker`` never has to receive
+#: them as per-task arguments. ``calib_set`` in particular (master bias,
+#: flats, gain maps: several hundred MB) must never be pickled once per
+#: frame; re-loading it from ``calibdir_path`` once per worker process,
+#: inside the pool's initializer, avoids that without relying on any
+#: fork-specific memory sharing (see ``_init_science_worker``'s docstring for
+#: why "fork" is not used here).
+_worker_calib: CalibrationSet | None = None
+_worker_settings: Settings | None = None
+_worker_profile: InstrumentProfile | None = None
+_worker_overscan: OverscanGeometry | None = None
+_worker_outdir: Path | None = None
+_worker_changelog_lock: Any = None
+
+
+def _init_science_worker(
+    calibdir_path: Path,
+    settings: Settings,
+    profile: InstrumentProfile,
+    overscan_geometry: OverscanGeometry | None,
+    outdir_path: Path,
+    filters: list[str] | None,
+    changelog_lock: Any,
+    log_queue: Any,
+    loglevel: str,
+) -> None:
+    """Pool initializer: build this worker's own ``CalibrationSet`` once.
+
+    Runs exactly once per worker process (as long as the pool's
+    ``max_tasks_per_child`` stays at its default of "never recycle"), not
+    once per frame. ``calib_set`` is loaded fresh from ``calibdir_path``
+    here -- the same call ``_run`` itself made to build the parent's
+    ``calib_set`` -- rather than being pickled from the parent and sent
+    through the per-task call queue: the "fork" start method would let a
+    worker inherit the parent's already-loaded ``calib_set`` copy-on-write
+    for free, but ``ProcessPoolExecutor`` itself already runs its own
+    ``_ExecutorManagerThread`` (and a queue-feeder thread) in the parent by
+    the time any worker process is spawned -- a longstanding, acknowledged
+    CPython hazard (https://github.com/python/cpython/issues/90622) where a
+    'fork' worker can be created from an already multi-threaded parent, with
+    a real (if low-probability) deadlock risk. Re-loading per worker instead
+    avoids that risk entirely, matching this stage's ``settings``/``profile``
+    to whatever the parent resolved, at the cost of ``CalibrationSet.load()``
+    running ``nprocs`` times (from files the parent has almost certainly just
+    read or written, so mostly page-cache-warm) instead of once.
+    """
+    global _worker_calib, _worker_settings, _worker_profile
+    global _worker_overscan, _worker_outdir, _worker_changelog_lock
+
+    worker_log_config(log_queue, loglevel)
+    _worker_calib = CalibrationSet.load(
+        calibdir_path, settings=settings, profile=profile, filters=filters
+    )
+    _worker_settings = settings
+    _worker_profile = profile
+    _worker_overscan = overscan_geometry
+    _worker_outdir = outdir_path
+    _worker_changelog_lock = changelog_lock
+
+
+def reduce_frame_worker(sci_meta: FrameMeta) -> tuple[dict[str, Any], int]:
+    """Reduce one science frame, using the module-level globals set by
+    ``_init_science_worker`` (pooled run) or directly by ``_run`` (serial
+    ``nprocs == 1`` run).
+
+    This is the exact per-frame body the serial science loop used to run
+    inline, now called identically either way, so output is identical
+    either way. ``changelog_lock`` only serializes concurrent appends onto
+    the shared ``change_log.jsonl`` between sibling worker processes; it
+    changes nothing about what gets written.
+
+    Returns ``(row, proc_code)``: ``row`` is exactly what
+    ``ReductionStatus.as_row()`` produces (or the minimal failure fallback
+    below), and ``proc_code`` is returned alongside it so the caller can
+    tally n_success/n_degraded/n_failed without re-parsing the row.
+    """
+    calib_set = _worker_calib
+    settings = _worker_settings
+    profile = _worker_profile
+    overscan_geometry = _worker_overscan
+    outdir_path = _worker_outdir
+    changelog_lock = _worker_changelog_lock
+
+    try:
+        product, status = reduce_frame(
+            sci_meta,
+            calib_set,
+            settings=settings,
+            profile=profile,
+            overscan=overscan_geometry,
+        )
+
+        # Determine output filename
+        raw_stem = sci_meta.path.stem.rsplit(".", 1)[0]  # Remove .fits if present
+        if raw_stem.endswith(".fit"):
+            raw_stem = raw_stem[:-4]
+        proc_filename = f"{raw_stem}_proc.fits"
+        proc_path = outdir_path / proc_filename
+
+        # Write product
+        try:
+            product.write(proc_path, overwrite=settings.runtime.clobber)
+            status.product_path = proc_path
+        except Exception as exc:
+            logger.error("failed to write %s: %s", proc_path, exc)
+            status.proc_code = 4
+            status.proc_status = "FAILED"
+            status.error = str(exc)
+
+        # Append this frame's entry to the per-frame change log. Never
+        # allowed to fail the reduction: append_change_log catches its
+        # own errors, but re-reading the raw header here can also raise
+        # (e.g. the raw file vanished between reduction and now), so
+        # that is guarded too. The lock only serializes this append
+        # against sibling worker processes writing the same
+        # change_log.jsonl; it does not change what gets written.
+        try:
+            raw_header_for_log = read_header(sci_meta.path, profile)
+            with changelog_lock:
+                append_change_log(
+                    outdir_path, sci_meta, raw_header_for_log, product.header, status
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to write change-log entry for %s: %s", sci_meta.path, exc
+            )
+
+        return status.as_row(), status.proc_code
+
+    except Exception as exc:
+        logger.error("failed to reduce %s: %s", sci_meta.path, exc)
+        row = {
+            "path": str(sci_meta.path),
+            "raw_name": sci_meta.path.name,
+            "proc_code": 4,
+            "proc_status": "FAILED",
+            "steps_applied": "",
+            "steps_skipped": "",
+            "error": str(exc),
+            "product_path": None,
+            "wcs_solved": False,
+            "astrom_rms_arcsec": None,
+            "fwhm_arcsec": None,
+            "zeropoint": None,
+            "is_photometric": None,
+            "duration_s": None,
+        }
+        return row, 4
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -64,6 +230,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="reduce only these filters (repeatable; default: all filters)",
     )
+    parser.add_argument(
+        "--no-calib-fallback",
+        action="store_true",
+        dest="no_calib_fallback",
+        help="disable multi-night calibration fallback for missing bias/dark/flat frames",
+    )
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -77,6 +249,16 @@ def _run(args: argparse.Namespace) -> int:
     outdir_path = Path(args.outdir) if args.outdir else (
         Path(settings.paths.resolved_outdir()) if settings.paths else first_input.parent
     )
+
+    # Multi-night calibration fallback (T80S): only active when the input
+    # is a single night directory named YYYYMMDD.
+    night_dir: Path | None = None
+    current_night: date | None = None
+    if first_input.is_dir():
+        parsed_night = parse_night_dirname(first_input.name)
+        if parsed_night is not None:
+            night_dir = first_input
+            current_night = parsed_night
 
     # Collect input files to discover profile from first file if needed
     logger.info("inventorying input frames from %d locations", len(args.inputs))
@@ -130,6 +312,244 @@ def _run(args: argparse.Namespace) -> int:
         frame_type_counts[frame_type] = frame_type_counts.get(frame_type, 0) + 1
     logger.info("frame inventory: %s", frame_type_counts)
 
+    # Multi-night calibration fallback (T80S): when this run's night is
+    # missing bias, dark, or flat (per filter) frames entirely, search
+    # strictly earlier sibling YYYYMMDD night directories for matching raw
+    # frames and merge them into `metas` so overscan detection, gain
+    # measurement, and master-building all see them exactly as if they had
+    # been part of this night's own inventory (see robo43.calib.fallback).
+    bias_fallback_nights: tuple[str, ...] = ()
+    dark_fallback_nights: tuple[str, ...] = ()
+    #: group_key -> (contributing nights incl. current night, any borrowed?)
+    flat_fallback_source_nights: dict[str, tuple[tuple[str, ...], bool]] = {}
+    calib_fallback_enabled = (
+        settings.calib.calib_fallback
+        and not args.no_calib_fallback
+        and night_dir is not None
+    )
+    if not settings.calib.calib_fallback or args.no_calib_fallback:
+        logger.info("multi-night calibration fallback disabled")
+    elif night_dir is None:
+        logger.info(
+            "multi-night calibration fallback inactive: input is not a single "
+            "YYYYMMDD night directory"
+        )
+
+    if calib_fallback_enabled:
+        if not select_frames(metas, "bias"):
+            non_bias_metas = [m for m in metas if m.frame_type != "bias"]
+            target_config = dominant_camera_config(non_bias_metas)
+            if target_config is None:
+                logger.warning(
+                    "no bias frames for night %s; cannot determine a camera "
+                    "configuration to search previous nights for a fallback",
+                    night_dir.name,
+                )
+            else:
+                result = collect_fallback_frames(
+                    night_dir,
+                    current_night,
+                    frame_type="bias",
+                    target_config=target_config,
+                    min_count=settings.calib.min_bias_frames,
+                    max_nights=settings.calib.fallback_max_nights_bias,
+                    profile=profile,
+                    settings=settings,
+                )
+                if result.satisfied:
+                    logger.warning(
+                        "no bias frames for night %s; borrowing %d bias frame(s) "
+                        "from night(s) %s",
+                        night_dir.name, len(result.metas), ",".join(result.source_nights),
+                    )
+                    metas.extend(result.metas)
+                    bias_fallback_nights = result.source_nights
+                else:
+                    logger.warning(
+                        "no bias frames for night %s and fewer than %d found in "
+                        "the previous %d night(s); continuing without master bias",
+                        night_dir.name,
+                        settings.calib.min_bias_frames,
+                        settings.calib.fallback_max_nights_bias,
+                    )
+
+        if not select_frames(metas, "dark"):
+            non_dark_metas = [m for m in metas if m.frame_type != "dark"]
+            target_config = dominant_camera_config(non_dark_metas)
+            if target_config is not None:
+                result = collect_fallback_frames(
+                    night_dir,
+                    current_night,
+                    frame_type="dark",
+                    target_config=target_config,
+                    min_count=settings.calib.min_dark_frames,
+                    max_nights=settings.calib.fallback_max_nights_bias,
+                    profile=profile,
+                    settings=settings,
+                )
+                if result.satisfied:
+                    logger.warning(
+                        "no dark frames for night %s; borrowing %d dark frame(s) "
+                        "from night(s) %s",
+                        night_dir.name, len(result.metas), ",".join(result.source_nights),
+                    )
+                    metas.extend(result.metas)
+                    dark_fallback_nights = result.source_nights
+
+        science_metas_for_fallback = select_frames(metas, "science")
+        expected_filters = {
+            m.filter for m in science_metas_for_fallback if m.filter is not None
+        }
+        separate_dome_and_sky = settings.calib.separate_dome_and_sky_flats
+        local_flat_metas_all = select_frames(metas, "flat")
+        local_flat_groups = group_flats_by_filter(
+            local_flat_metas_all, separate_dome_and_sky=separate_dome_and_sky
+        )
+        covered_filters = {key.split(":", 1)[0] for key in local_flat_groups}
+
+        if profile.calib.flat_pool:
+            # New pooling policy (per instrument profile): always pool, per
+            # filter, whether or not the night has any local flats of its
+            # own for that filter -- see robo43.calib.fallback.pool_flat_frames.
+            local_filters_present = {
+                m.filter for m in local_flat_metas_all if m.filter is not None
+            }
+            for pool_filter in sorted(local_filters_present | expected_filters):
+                filter_local_metas = [
+                    m for m in local_flat_metas_all if m.filter == pool_filter
+                ]
+                if filter_local_metas:
+                    target_config = dominant_camera_config(filter_local_metas)
+                else:
+                    filter_science_metas = [
+                        m for m in science_metas_for_fallback if m.filter == pool_filter
+                    ]
+                    target_config = dominant_camera_config(filter_science_metas)
+                if target_config is None:
+                    logger.warning(
+                        "no flat or science frames for filter %s on night %s; "
+                        "cannot determine a camera configuration for flat "
+                        "pooling",
+                        pool_filter, night_dir.name,
+                    )
+                    continue
+
+                pool_result = pool_flat_frames(
+                    night_dir,
+                    current_night,
+                    local_metas=filter_local_metas,
+                    target_config=target_config,
+                    filter_name=pool_filter,
+                    min_nights=profile.calib.flat_pool_min_nights,
+                    max_nights=profile.calib.flat_pool_max_nights,
+                    target_frames=profile.calib.flat_pool_target_frames,
+                    fallback_max_nights=settings.calib.fallback_max_nights_flat,
+                    profile=profile,
+                    settings=settings,
+                )
+
+                local_paths = {m.path for m in filter_local_metas}
+                borrowed_metas = [
+                    m for m in pool_result.metas if m.path not in local_paths
+                ]
+                if borrowed_metas:
+                    metas.extend(borrowed_metas)
+
+                n_pool = len(pool_result.metas)
+                if n_pool == 0:
+                    logger.warning(
+                        "no flat frames for filter %s on night %s within the "
+                        "previous %d night(s); continuing without a master "
+                        "flat for that filter",
+                        pool_filter,
+                        night_dir.name,
+                        settings.calib.fallback_max_nights_flat,
+                    )
+                    continue
+
+                if n_pool < profile.calib.flat_pool_target_frames:
+                    logger.info(
+                        "flat pool for filter %s on night %s has only %d "
+                        "frame(s) (target %d); using what is available from "
+                        "night(s) %s",
+                        pool_filter,
+                        night_dir.name,
+                        n_pool,
+                        profile.calib.flat_pool_target_frames,
+                        ",".join(pool_result.contributing_nights),
+                    )
+                else:
+                    logger.info(
+                        "flat pool for filter %s on night %s has %d frame(s) "
+                        "from night(s) %s",
+                        pool_filter,
+                        night_dir.name,
+                        n_pool,
+                        ",".join(pool_result.contributing_nights),
+                    )
+
+                for group_key in group_flats_by_filter(
+                    list(pool_result.metas), separate_dome_and_sky=separate_dome_and_sky
+                ):
+                    flat_fallback_source_nights[group_key] = (
+                        pool_result.contributing_nights,
+                        pool_result.borrowed,
+                    )
+        else:
+            # Existing zero-trigger behaviour (unchanged): only search
+            # previous nights when a filter has no local flats at all.
+            for missing_filter in sorted(expected_filters - covered_filters):
+                filter_science_metas = [
+                    m for m in science_metas_for_fallback if m.filter == missing_filter
+                ]
+                target_config = dominant_camera_config(filter_science_metas)
+                if target_config is None:
+                    logger.warning(
+                        "no flat frames for filter %s on night %s; cannot determine "
+                        "a camera configuration to search previous nights for a "
+                        "fallback",
+                        missing_filter, night_dir.name,
+                    )
+                    continue
+                result = collect_fallback_frames(
+                    night_dir,
+                    current_night,
+                    frame_type="flat",
+                    target_config=target_config,
+                    min_count=settings.calib.min_flat_frames,
+                    max_nights=settings.calib.fallback_max_nights_flat,
+                    profile=profile,
+                    settings=settings,
+                    filter_name=missing_filter,
+                )
+                if result.satisfied:
+                    logger.warning(
+                        "no flat frames for filter %s on night %s; borrowing %d "
+                        "flat frame(s) from night(s) %s",
+                        missing_filter,
+                        night_dir.name,
+                        len(result.metas),
+                        ",".join(result.source_nights),
+                    )
+                    metas.extend(result.metas)
+                    for group_key in group_flats_by_filter(
+                        list(result.metas), separate_dome_and_sky=separate_dome_and_sky
+                    ):
+                        flat_fallback_source_nights[group_key] = (
+                            result.source_nights,
+                            True,
+                        )
+                else:
+                    logger.warning(
+                        "no flat frames for filter %s on night %s and fewer than "
+                        "%d found in the previous %d night(s); continuing without "
+                        "a master flat for that filter",
+                        missing_filter,
+                        night_dir.name,
+                        settings.calib.min_flat_frames,
+                        settings.calib.fallback_max_nights_flat,
+                    )
+
     # Overscan detection
     overscan_geometry = None
     if not args.no_overscan:
@@ -152,6 +572,9 @@ def _run(args: argparse.Namespace) -> int:
             return 2
     else:
         logger.info("overscan detection disabled via --no-overscan")
+
+    if settings.runtime.release_memory:
+        release_memory("reduce.overscan_detection", level=logging.INFO)
 
     # Dry-run mode: report plan and exit
     if args.dry_run:
@@ -242,6 +665,9 @@ def _run(args: argparse.Namespace) -> int:
             logger.error("failed to measure gain: %s", exc)
             gain_measurements = GainMeasurementSet({})
 
+    if settings.runtime.release_memory:
+        release_memory("reduce.gain_measurement", level=logging.INFO)
+
     # Build master bias
     bias_master = None
     bias_metas = select_frames(metas, "bias")
@@ -263,6 +689,7 @@ def _run(args: argparse.Namespace) -> int:
                         outdir=calibdir_path,
                         overscan=overscan_geometry,
                         gain_measurements=gain_measurements,
+                        fallback_source_nights=bias_fallback_nights,
                     )
                 except Exception as exc:
                     logger.error("failed to build master_bias: %s", exc)
@@ -277,12 +704,16 @@ def _run(args: argparse.Namespace) -> int:
                     outdir=calibdir_path,
                     overscan=overscan_geometry,
                     gain_measurements=gain_measurements,
+                    fallback_source_nights=bias_fallback_nights,
                 )
             except Exception as exc:
                 logger.error("failed to build master_bias: %s", exc)
                 return 2
     else:
         logger.warning("no bias frames found; continuing without master bias")
+
+    if settings.runtime.release_memory:
+        release_memory("reduce.master_bias", level=logging.INFO)
 
     # Build master darks
     dark_metas = select_frames(metas, "dark")
@@ -306,12 +737,16 @@ def _run(args: argparse.Namespace) -> int:
                     outdir=calibdir_path,
                     bias=bias_master,
                     gain_measurements=gain_measurements,
+                    fallback_source_nights=dark_fallback_nights,
                 )
             except Exception as exc:
                 logger.error("failed to build master_darks: %s", exc)
                 return 2
     else:
         logger.info("no dark frames found; continuing without master darks")
+
+    if settings.runtime.release_memory:
+        release_memory("reduce.master_dark", level=logging.INFO)
 
     # Build master flats
     flat_metas = select_frames(metas, "flat")
@@ -375,6 +810,7 @@ def _run(args: argparse.Namespace) -> int:
                         mask=mask_obj,
                         overscan=overscan_geometry,
                         gain_measurements=gain_measurements,
+                        fallback_source_nights=flat_fallback_source_nights,
                     )
                 except Exception as exc:
                     logger.error("failed to build master_flats: %s", exc)
@@ -385,6 +821,9 @@ def _run(args: argparse.Namespace) -> int:
             logger.info("no flat frames found; continuing without master flats")
     else:
         logger.info("no flat frames found; continuing without master flats")
+
+    if settings.runtime.release_memory:
+        release_memory("reduce.master_flat", level=logging.INFO)
 
     # Load calibration set
     try:
@@ -413,83 +852,113 @@ def _run(args: argparse.Namespace) -> int:
 
     logger.info("reducing %d science frames", len(science_metas_valid))
 
+    if settings.runtime.release_memory:
+        release_memory("reduce.before_science_loop", level=logging.INFO)
+
     statuses: list = []
     n_success = 0
     n_degraded = 0
     n_failed = 0
 
-    for sci_meta in science_metas_valid:
-        try:
-            product, status = reduce_frame(
-                sci_meta,
-                calib_set,
-                settings=settings,
-                profile=profile,
-                overscan=overscan_geometry,
+    global _worker_calib, _worker_settings, _worker_profile
+    global _worker_overscan, _worker_outdir, _worker_changelog_lock
+
+    if science_metas_valid:
+        nprocs_requested = max(1, settings.runtime.nprocs)
+        nprocs = nprocs_requested
+        if nprocs_requested > 1:
+            sample_header = read_header(science_metas_valid[0].path, profile)
+            naxis1 = int(sample_header.get("NAXIS1", 0) or 0)
+            naxis2 = int(sample_header.get("NAXIS2", 0) or 0)
+            per_worker_mb = (
+                naxis1 * naxis2 * STAGE_BYTES_PER_PIXEL["reduce.science"] / (1024.0 * 1024.0)
+                if naxis1 and naxis2
+                else 0.0
             )
+            nprocs = safe_worker_count(
+                nprocs_requested,
+                per_worker_mb,
+                settings.runtime.memory_reserve_mb,
+                stage="reduce.science",
+            )
+        logger.info(
+            "reducing %d science frame(s) using %d worker process(es)",
+            len(science_metas_valid),
+            nprocs,
+        )
 
-            # Determine output filename
-            raw_stem = sci_meta.path.stem.rsplit(".", 1)[0]  # Remove .fits if present
-            if raw_stem.endswith(".fit"):
-                raw_stem = raw_stem[:-4]
-            proc_filename = f"{raw_stem}_proc.fits"
-            proc_path = outdir_path / proc_filename
-
-            # Write product
+        if nprocs > 1:
+            # "spawn", not "fork": ProcessPoolExecutor's own manager and
+            # queue-feeder threads are already running in this process by
+            # the time any worker is spawned (see _init_science_worker's
+            # docstring), so "fork" here would carry the same
+            # fork-after-thread hazard CPython itself has an open issue
+            # about. calib_set is therefore rebuilt once per worker (inside
+            # the initializer) rather than pickled from the parent, and
+            # nothing this loop passes to reduce_frame_worker per task
+            # carries calib_set, settings, profile, or overscan_geometry --
+            # only the (small) FrameMeta.
+            mp_ctx = multiprocessing.get_context("spawn")
+            mp_queue: multiprocessing.Queue = mp_ctx.Queue()
+            changelog_lock = mp_ctx.Lock()
+            listener = log_listener(mp_queue)
             try:
-                product.write(proc_path, overwrite=settings.runtime.clobber)
-                status.product_path = proc_path
-            except Exception as exc:
-                logger.error("failed to write %s: %s", proc_path, exc)
-                status.proc_code = 4
-                status.proc_status = "FAILED"
-                status.error = str(exc)
+                # max_tasks_per_child is deliberately left at its default (a
+                # worker handles every task assigned to it for its whole
+                # lifetime): setting it to 1 would rerun
+                # _init_science_worker's CalibrationSet.load() once per
+                # frame instead of once per worker, which is exactly the
+                # per-task cost this design avoids.
+                with ProcessPoolExecutor(
+                    max_workers=nprocs,
+                    mp_context=mp_ctx,
+                    initializer=_init_science_worker,
+                    initargs=(
+                        calibdir_path,
+                        settings,
+                        profile,
+                        overscan_geometry,
+                        outdir_path,
+                        filters_to_load,
+                        changelog_lock,
+                        mp_queue,
+                        settings.runtime.loglevel,
+                    ),
+                ) as pool:
+                    results_iter = pool.map(reduce_frame_worker, science_metas_valid)
+                    for frame_index, (row, proc_code) in enumerate(results_iter):
+                        statuses.append(row)
+                        if proc_code == 0:
+                            n_success += 1
+                        elif proc_code == 3:
+                            n_degraded += 1
+                        elif proc_code == 4:
+                            n_failed += 1
+                        if settings.runtime.release_memory and (frame_index + 1) % 10 == 0:
+                            release_memory(f"reduce.science_loop:frame_{frame_index + 1}")
+            finally:
+                listener.stop()
+        else:
+            _worker_calib = calib_set
+            _worker_settings = settings
+            _worker_profile = profile
+            _worker_overscan = overscan_geometry
+            _worker_outdir = outdir_path
+            _worker_changelog_lock = contextlib.nullcontext()
+            for frame_index, sci_meta in enumerate(science_metas_valid):
+                row, proc_code = reduce_frame_worker(sci_meta)
+                statuses.append(row)
+                if proc_code == 0:
+                    n_success += 1
+                elif proc_code == 3:
+                    n_degraded += 1
+                elif proc_code == 4:
+                    n_failed += 1
+                if settings.runtime.release_memory and (frame_index + 1) % 10 == 0:
+                    release_memory(f"reduce.science_loop:frame_{frame_index + 1}")
 
-            # Append this frame's entry to the per-frame change log. Never
-            # allowed to fail the reduction: append_change_log catches its
-            # own errors, but re-reading the raw header here can also raise
-            # (e.g. the raw file vanished between reduction and now), so
-            # that is guarded too.
-            try:
-                raw_header_for_log = read_header(sci_meta.path, profile)
-                append_change_log(
-                    outdir_path, sci_meta, raw_header_for_log, product.header, status
-                )
-            except Exception as exc:
-                logger.warning(
-                    "failed to write change-log entry for %s: %s", sci_meta.path, exc
-                )
-
-            # Tally status
-            if status.proc_code == 0:
-                n_success += 1
-            elif status.proc_code == 3:
-                n_degraded += 1
-            elif status.proc_code == 4:
-                n_failed += 1
-
-            statuses.append(status.as_row())
-
-        except Exception as exc:
-            logger.error("failed to reduce %s: %s", sci_meta.path, exc)
-            n_failed += 1
-            # Create a minimal status record
-            statuses.append({
-                "path": str(sci_meta.path),
-                "raw_name": sci_meta.path.name,
-                "proc_code": 4,
-                "proc_status": "FAILED",
-                "steps_applied": "",
-                "steps_skipped": "",
-                "error": str(exc),
-                "product_path": None,
-                "wcs_solved": False,
-                "astrom_rms_arcsec": None,
-                "fwhm_arcsec": None,
-                "zeropoint": None,
-                "is_photometric": None,
-                "duration_s": None,
-            })
+    if settings.runtime.release_memory:
+        release_memory("reduce.after_science_loop", level=logging.INFO)
 
     # Write status CSV
     if statuses:
@@ -514,6 +983,7 @@ def _run(args: argparse.Namespace) -> int:
         len(science_metas_valid),
     )
 
+    log_peak_rss_summary("reduce")
     return 0
 
 

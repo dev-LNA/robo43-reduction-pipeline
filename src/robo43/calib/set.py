@@ -29,16 +29,16 @@ measured.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from astropy.io import fits
 
 from robo43.calib.dark import DarkEntry, DarkSelection, select_dark
 from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurement, GainMeasurementSet
 from robo43.calib.masks import MaskSet
-from robo43.io.fits_io import read_header, read_image
 from robo43.provenance import sha256_file
 
 if TYPE_CHECKING:
@@ -48,6 +48,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["CalibrationSet"]
+
+
+def _read_master(path: Path) -> tuple[np.ndarray, fits.Header]:
+    """Read a pipeline-written master frame: the image is always HDU 0.
+
+    Masters are this pipeline's own products, so they must never be read
+    through the instrument profile's raw ``science_hdu`` (which is 1 for
+    fpacked T80S frames, where HDU 1 of a master is its VAR plane).
+    """
+    with fits.open(path) as hdul:
+        return np.array(hdul[0].data, dtype=np.float32), hdul[0].header.copy()
 
 
 @dataclass(slots=True)
@@ -85,6 +96,10 @@ class CalibrationSet:
     dark_current_path: Path | None
     mask: MaskSet | None
     gain_measurements: GainMeasurementSet
+    bias_fallback: bool = False
+    bias_source_nights: tuple[str, ...] = ()
+    flat_fallback: dict[str, bool] = field(default_factory=dict)
+    flat_source_nights: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
     def load(
@@ -124,6 +139,10 @@ class CalibrationSet:
         dark_current_path = None
         mask = None
         gain_measurements = GainMeasurementSet({})
+        bias_fallback = False
+        bias_source_nights: tuple[str, ...] = ()
+        flat_fallback: dict[str, bool] = {}
+        flat_source_nights: dict[str, tuple[str, ...]] = {}
 
         if calibdir is None:
             calibdir_path = None
@@ -137,13 +156,14 @@ class CalibrationSet:
             bias_file = calibdir_path / "master_bias.fits"
             if bias_file.exists():
                 try:
-                    bias, header = read_image(bias_file, profile)
+                    bias, header = _read_master(bias_file)
                     bias_path = bias_file
+                    bias_fallback = bool(header.get("CALFBACK", False))
+                    if bias_fallback:
+                        bias_source_nights = tuple(str(header["BIASNGT"]).split(","))
                     # Try to load variance from VAR extension
                     try:
-                        with __import__("astropy.io.fits", fromlist=["open"]).open(
-                            bias_file
-                        ) as hdul:
+                        with fits.open(bias_file) as hdul:
                             if "VAR" in hdul:
                                 bias_var = np.array(
                                     hdul["VAR"].data, dtype=np.float32
@@ -178,15 +198,35 @@ class CalibrationSet:
                                 )
                             continue
 
-                    flat_data, _header = read_image(flat_file, profile)
+                    flat_data, flat_header = _read_master(flat_file)
                     flats[filter_name] = flat_data
                     flat_paths[filter_name] = flat_file
+                    if bool(flat_header.get("CALFBACK", False)):
+                        flat_fallback[filter_name] = True
+                        # A pooled master flat that combined nights from more
+                        # than a handful of nights records FLATN1/FLATN2/
+                        # FLATNNGT instead of FLATNGT, to stay within the
+                        # FITS string-card length limit (see
+                        # robo43.calib.flat._flat_fallback_cards); fall back
+                        # to that compact form when the full list is absent,
+                        # rather than raising and dropping this flat file.
+                        if "FLATNGT" in flat_header:
+                            flat_source_nights[filter_name] = tuple(
+                                str(flat_header["FLATNGT"]).split(",")
+                            )
+                        elif "FLATN1" in flat_header and "FLATN2" in flat_header:
+                            flat_source_nights[filter_name] = (
+                                str(flat_header["FLATN1"]),
+                                str(flat_header["FLATN2"]),
+                            )
+                        else:
+                            flat_source_nights[filter_name] = ()
+                    else:
+                        flat_fallback[filter_name] = False
 
                     # Try to load variance
                     try:
-                        from astropy.io import fits as fits_module
-
-                        with fits_module.open(flat_file) as hdul:
+                        with fits.open(flat_file) as hdul:
                             if "VAR" in hdul:
                                 flat_var[filter_name] = np.array(
                                     hdul["VAR"].data, dtype=np.float32
@@ -205,7 +245,7 @@ class CalibrationSet:
                 if dark_file.name.startswith("master_dark_current"):
                     continue
                 try:
-                    header = read_header(dark_file, profile=profile)
+                    header = fits.getheader(dark_file, 0)
                     exptime = None
                     ccd_temp = None
 
@@ -234,14 +274,12 @@ class CalibrationSet:
                     n_combine = int(header.get("NCOMBINE", 1))
 
                     # Load the data
-                    dark_data, _header = read_image(dark_file, profile)
+                    dark_data, _header = _read_master(dark_file)
 
                     # Try to load variance
                     dark_var = None
                     try:
-                        from astropy.io import fits as fits_module
-
-                        with fits_module.open(dark_file) as hdul:
+                        with fits.open(dark_file) as hdul:
                             if "VAR" in hdul:
                                 dark_var = np.array(
                                     hdul["VAR"].data, dtype=np.float32
@@ -272,7 +310,7 @@ class CalibrationSet:
 
             if dc_file.exists():
                 try:
-                    dark_current_map, _header = read_image(dc_file, profile)
+                    dark_current_map, _header = _read_master(dc_file)
                     dark_current_path = dc_file
                 except Exception as e:
                     logger.warning(
@@ -305,6 +343,10 @@ class CalibrationSet:
             dark_current_path=dark_current_path,
             mask=mask,
             gain_measurements=gain_measurements,
+            bias_fallback=bias_fallback,
+            bias_source_nights=bias_source_nights,
+            flat_fallback=flat_fallback,
+            flat_source_nights=flat_source_nights,
         )
 
     def flat_for(self, filter_name: str) -> tuple[np.ndarray | None, Path | None]:
@@ -334,6 +376,21 @@ class CalibrationSet:
         rather than invent a conversion factor.
         """
         return self.gain_measurements.get(readout_mode, gain_setting, binning)
+
+    def tiles_for(
+        self,
+        readout_mode: str | None,
+        gain_setting: float | None,
+        binning: int | None,
+    ) -> tuple[GainMeasurement, ...] | None:
+        """Per-amplifier-tile measurements for a frame's own group, in
+        tile-index order, or ``None`` when this group has no per-tile
+        records (never measured, or measured before per-tile storage
+        existed). ``None`` means "apply gain_for()'s frame-level summary
+        uniformly across the whole frame", never "no gain" -- see
+        GainMeasurementSet.tiles_for.
+        """
+        return self.gain_measurements.tiles_for(readout_mode, gain_setting, binning)
 
     def dark_for(
         self,
@@ -370,7 +427,7 @@ class CalibrationSet:
         dark_current_ref_temp = None
         if self.dark_current_map is not None and self.dark_current_path is not None:
             try:
-                header = read_header(self.dark_current_path, profile=profile)
+                header = fits.getheader(self.dark_current_path, 0)
                 temp_aliases = profile.aliases_for("ccd_temp")
                 # Try to get DCTREF or fallback to ccd_temp aliases
                 if "DCTREF" in header:

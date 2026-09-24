@@ -1,9 +1,26 @@
 """Reduce one science frame to a MEF product, recording which corrections were applied.
 
-This module implements the reduction pipeline for a single frame, following the
-exact order of operations specified in the interface contract (section 4.4):
-overscan → trim → bias → dark (scaled) → flat → bad-pixel mask → cosmic-ray
-rejection → gain to electrons → variance and DQ planes.
+This module implements the reduction pipeline for a single frame. The
+original order specified in the interface contract (section 4.4) was
+overscan -> trim -> bias -> dark (scaled) -> flat -> bad-pixel mask ->
+cosmic-ray rejection -> gain to electrons -> variance and DQ planes; gain to
+electrons has since moved to immediately after dark subtraction, before
+flat fielding, because per-amplifier-tile gain (robo43.calib.gain) must be
+applied before a per-tile-built master flat divides it out -- applying a
+single global gain after an ADU-domain flat division would reintroduce
+amplifier seams whenever tiles' gains differ. The order used here is:
+overscan -> trim -> bias -> dark (scaled) -> gain to electrons (per
+amplifier tile) -> flat -> bad-pixel mask -> cosmic-ray rejection ->
+variance and DQ planes. Saturation and non-linearity are evaluated on the
+RAW ADC read returned by ``read_image``, before overscan subtraction, trim,
+bias, or dark -- see ``raw_saturated``/``raw_nonlinear`` below -- because
+both ``profile.saturation_adu`` and ``profile.nonlinearity_adu`` are raw-ADC
+quantities: once the bias pedestal is removed, no pixel can reach
+``profile.saturation_adu``. Both masks are trimmed by
+``robo43.calib.overscan.trim_to_science`` to the exact geometry Step 1
+applies to the science data, then folded into the DQ plane unconditionally,
+in every branch of Step 6, whether or not a master bad-pixel mask is
+present.
 
 Each step is optional and independently recorded. Missing calibrations are handled
 gracefully per the graceful-degradation table in the interface contract (§1B.5):
@@ -25,10 +42,11 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from robo43.calib.masks import minimal_mask
-from robo43.calib.overscan import apply_overscan
+from robo43.calib.masks import minimal_mask, nonlinearity_mask, saturation_mask
+from robo43.calib.overscan import apply_overscan, trim_to_science
 from robo43.products.dq import DQ, DQ_DTYPE
 from robo43.products.mef import ReducedProduct, calibration_cards
+from robo43.products.nominal_wcs import override_nominal_wcs
 from robo43.products.weight import build_weight
 from robo43.reduce.cosmics import apply_to_dq, detect_cosmics
 
@@ -142,6 +160,27 @@ def reduce_frame(
         )
         raise  # Propagate the error; the caller's exception handler will record it
 
+    # Saturation/non-linearity are evaluated here, on the RAW ADC read,
+    # straight out of read_image -- before overscan subtraction, trim,
+    # bias, or dark -- because both profile.saturation_adu and
+    # profile.nonlinearity_adu are raw-ADC quantities: once the bias
+    # pedestal is removed, no pixel can reach profile.saturation_adu, so
+    # evaluating this any later means SATURATED/NONLINEAR could never fire
+    # (see the module docstring). Trimmed further down, once Step 1
+    # determines whether overscan/trim actually changed the data's shape,
+    # so both masks stay pixel-aligned with the (possibly trimmed/stitched)
+    # science data. ``None`` when the profile has no threshold configured.
+    raw_saturated = (
+        saturation_mask(data, profile.saturation_adu)
+        if profile.saturation_adu is not None
+        else None
+    )
+    raw_nonlinear = (
+        nonlinearity_mask(data, profile.nonlinearity_adu)
+        if profile.nonlinearity_adu is not None
+        else None
+    )
+
     # Gain: looked up once, from the night's runtime PTC measurement (see
     # robo43.calib.gain) for this frame's own (readout_mode, gain_setting,
     # binning) -- never from the frame's header or the instrument profile,
@@ -153,12 +192,22 @@ def reduce_frame(
     # group was never measured (e.g. no flats/biases at that setting); the
     # frame is then reduced in ADU rather than guessed at.
     gain_measurement = calib.gain_for(meta.readout_mode, meta.gain_setting, meta.binning)
+    # Per-amplifier-tile measurements for this same group, in tile-index
+    # order, or None when this group has no per-tile records (never
+    # measured, or measured before per-tile storage existed) -- Step 4
+    # below then falls back to a single whole-frame multiply by
+    # `gain_measurement`'s frame-level summary, numerically identical to
+    # today's single-amplifier behaviour.
+    tile_measurements = calib.tiles_for(meta.readout_mode, meta.gain_setting, meta.binning)
     gain = gain_measurement.gain_e_per_adu if gain_measurement is not None else None
     read_noise_e = (
         gain_measurement.read_noise_e if gain_measurement is not None else profile.read_noise_e
     )
     if gain_measurement is not None:
         header_cards.extend(gain_measurement.header_cards())
+        from robo43.calib.gain import per_tile_header_cards
+
+        header_cards.extend(per_tile_header_cards(tile_measurements))
     else:
         from robo43.calib.gain import no_measurement_cards
 
@@ -167,11 +216,23 @@ def reduce_frame(
 
     # --- Step 1: Overscan and Trim ---
     oscan_cards: list[tuple[str, Any, str]] = []
+    pre_overscan_shape = data.shape
     if overscan is not None:
         try:
             data, oscan_cards = apply_overscan(data, overscan, settings=settings)
             steps_applied.append("overscan")
             steps_applied.append("trim")
+            if data.shape != pre_overscan_shape:
+                # apply_overscan actually trimmed (and, for a multi-block
+                # geometry, stitched) the science data -- as opposed to one
+                # of its own no-op fallbacks (overscan_correct=False, or a
+                # non-finite overscan level) -- so the raw-domain
+                # saturation/non-linearity masks must be trimmed by the
+                # exact same block geometry to stay pixel-aligned with it.
+                if raw_saturated is not None:
+                    raw_saturated = trim_to_science(raw_saturated, overscan)
+                if raw_nonlinear is not None:
+                    raw_nonlinear = trim_to_science(raw_nonlinear, overscan)
         except Exception as e:
             logger.error("overscan correction failed: %s", e)
             steps_skipped.append("overscan")
@@ -183,6 +244,8 @@ def reduce_frame(
         oscan_cards.append(("TRIMMED", False, "Frame trimmed to science region"))
 
     header_cards.extend(oscan_cards)
+    if overscan is not None:
+        header_cards.extend(overscan.tile_header_cards())
     header_cards.append(
         ("MEDOSC", float(np.nanmedian(data)), "median after overscan/trim (ADU)")
     )
@@ -191,6 +254,19 @@ def reduce_frame(
     # so its shape matches the (possibly trimmed) science data
     dq = np.zeros(data.shape, dtype=DQ_DTYPE)
     assert dq.dtype == DQ_DTYPE, f"DQ dtype is {dq.dtype}, expected {DQ_DTYPE}"
+
+    # Saturation/non-linearity, computed on the raw ADC frame above and
+    # trimmed to match this shape, are folded in here -- unconditionally,
+    # in every branch of Step 6 below, whether or not a master bad-pixel
+    # mask is present. (Previously this only ran inside Step 6's
+    # minimal-mask fallback, so a frame with a master mask never got
+    # SATURATED/NONLINEAR at all, and it ran on an already bias/dark
+    # subtracted snapshot, so no pixel could ever reach
+    # profile.saturation_adu -- see the module docstring.)
+    if raw_saturated is not None:
+        dq[raw_saturated] |= int(DQ.SATURATED)
+    if raw_nonlinear is not None:
+        dq[raw_nonlinear] |= int(DQ.NONLINEAR)
 
     # --- Step 2: Bias Subtraction ---
     if calib.bias is not None:
@@ -208,6 +284,10 @@ def reduce_frame(
                 header_cards.append(
                     ("BIASFIL", calib.bias_path.name, "master bias used")
                 )
+                if calib.bias_fallback:
+                    header_cards.append(
+                        ("BIASNGT", ",".join(calib.bias_source_nights), "Bias borrowed from night(s)")
+                    )
                 if calib.bias_path is not None:
                     from robo43.provenance import sha256_file
                     header_cards.append(
@@ -268,7 +348,79 @@ def reduce_frame(
         ("MEDDARK", float(np.nanmedian(data)), "median after dark subtraction (ADU)")
     )
 
-    # --- Step 4: Flat Fielding ---
+    # --- Step 4: Gain to Electrons (per amplifier tile) ---
+    # Applied here -- immediately after bias/dark subtraction and BEFORE
+    # flat fielding -- because the master flat is itself built in electrons
+    # using each tile's own gain (robo43.calib.flat.build_master_flats).
+    # Converting later, after an ADU-domain flat division, would reintroduce
+    # amplifier seams wherever per-tile gains differ. `tile_measurements`
+    # is None either when this group has no measurement at all (`gain` is
+    # then also None; nothing to apply) or when it predates per-tile
+    # storage -- both fall back to a single whole-frame multiply by `gain`,
+    # numerically identical to today's behaviour (and exactly what a
+    # single-amplifier instrument's own one tile spanning the whole frame
+    # already reduces to).
+    bunit = "adu"
+    tile_slices = (
+        overscan.science_tile_slices
+        if overscan is not None and overscan.science_tile_slices
+        else [(slice(None), slice(None))]
+    )
+    read_noise_map = np.full(
+        data.shape, read_noise_e if read_noise_e is not None else 0.0, dtype=np.float64
+    )
+    gain_map = np.ones(data.shape, dtype=np.float64)
+    if tile_measurements is not None:
+        for tile_idx, (row_sl, col_sl) in enumerate(tile_slices):
+            tm = tile_measurements[tile_idx] if tile_idx < len(tile_measurements) else None
+            if tm is not None:
+                gain_map[row_sl, col_sl] = tm.gain_e_per_adu
+                read_noise_map[row_sl, col_sl] = tm.read_noise_e
+    elif gain is not None:
+        gain_map[:] = gain
+
+    if settings.calib.apply_gain:
+        if gain is None:
+            logger.warning(
+                "gain requested but no measured gain for readout=%s setting=%s "
+                "binning=%s; reducing this frame in ADU.",
+                meta.readout_mode, meta.gain_setting, meta.binning,
+            )
+            steps_skipped.append("gain")
+        else:
+            try:
+                if tile_measurements is not None:
+                    for tile_idx, (row_sl, col_sl) in enumerate(tile_slices):
+                        tm = (
+                            tile_measurements[tile_idx]
+                            if tile_idx < len(tile_measurements)
+                            else None
+                        )
+                        if tm is not None:
+                            data[row_sl, col_sl] = data[row_sl, col_sl] * tm.gain_e_per_adu
+                else:
+                    data = data * gain
+                bunit = "electron"
+                steps_applied.append("gain")
+            except Exception as e:
+                logger.error("gain conversion failed: %s", e)
+                steps_skipped.append("gain")
+    else:
+        # apply_gain=False: gain_map/read_noise_map above still carry the
+        # per-tile values (used by Step 7's cosmics and Step 8's variance),
+        # but `data` itself is deliberately left in ADU.
+        steps_skipped.append("gain")
+
+    header_cards.append(("BUNIT", bunit, "Unit of the SCI plane"))
+    header_cards.append(
+        (
+            "MEDGAIN",
+            float(np.nanmedian(data)),
+            "median right after gain conversion (before flat/mask/cosmics)",
+        )
+    )
+
+    # --- Step 5: Flat Fielding ---
     flat_array, flat_path = calib.flat_for(meta.filter)
     is_photometric: bool | None = None
     if flat_array is None:
@@ -292,9 +444,18 @@ def reduce_frame(
 
             # Mark pixels where flat was zero/non-finite
             data[bad_flat] = np.nan
+            del safe_flat
 
             steps_applied.append("flat")
             header_cards.append(("FLATFIL", flat_path.name, "master flat used"))
+            if calib.flat_fallback.get(meta.filter, False):
+                header_cards.append(
+                    (
+                        "FLATNGT",
+                        ",".join(calib.flat_source_nights.get(meta.filter, ())),
+                        "Flat borrowed from night(s)",
+                    )
+                )
             if flat_path is not None:
                 from robo43.provenance import sha256_file
                 header_cards.append(
@@ -311,7 +472,22 @@ def reduce_frame(
         ("MEDFLAT", float(np.nanmedian(data)), "median after flat fielding")
     )
 
-    # --- Step 5: Bad-Pixel Mask ---
+    header_cards.append(
+        (
+            "CALFBACK",
+            bool(calib.bias_fallback or calib.flat_fallback.get(meta.filter, False)),
+            "Any calibration borrowed from a previous night",
+        )
+    )
+
+    # --- Step 6: Bad-Pixel Mask ---
+    # SATURATED/NONLINEAR were already folded into `dq` right after it was
+    # initialized, from the raw-ADC masks computed before Step 1 -- in
+    # every branch below, not only the no-mask fallback (see the module
+    # docstring). The minimal-mask fallback here now only ever contributes
+    # NO_DATA, evaluated on the live `data` (whatever unit Step 4 left it
+    # in, so a NaN introduced later -- e.g. by Step 5's flat division --
+    # is still caught).
     if calib.mask is not None:
         try:
             if calib.mask.dq.shape == dq.shape:
@@ -323,31 +499,32 @@ def reduce_frame(
                            calib.mask.dq.shape, dq.shape)
                 steps_skipped.append("mask")
                 # Fall back to minimal mask
-                minimal = minimal_mask(data, saturation=profile.saturation_adu)
-                dq = dq | minimal.dq.astype(DQ_DTYPE)
+                dq = dq | minimal_mask(data, saturation=None).dq
         except Exception as e:
             logger.error("mask application failed: %s", e)
             steps_skipped.append("mask")
             # Fall back to minimal mask
             try:
-                minimal = minimal_mask(data, saturation=profile.saturation_adu)
-                dq = dq | minimal.dq.astype(DQ_DTYPE)
+                dq = dq | minimal_mask(data, saturation=None).dq
             except Exception as e2:
                 logger.error("minimal mask fallback failed: %s", e2)
     else:
         # Use minimal mask as fallback
         try:
-            minimal = minimal_mask(data, saturation=profile.saturation_adu)
-            dq = dq | minimal.dq.astype(DQ_DTYPE)
+            dq = dq | minimal_mask(data, saturation=None).dq
             steps_skipped.append("mask")
             header_cards.append(
-                ("MASKFIL", "NONE", "no master mask; using minimal saturation+NaN mask")
+                ("MASKFIL", "NONE", "no master mask; using minimal NaN mask")
             )
         except Exception as e:
             logger.error("minimal mask fallback failed: %s", e)
             steps_skipped.append("mask")
 
-    # --- Step 6: Cosmic-Ray Rejection ---
+    # --- Step 7: Cosmic-Ray Rejection ---
+    # `data` is already in whatever unit Step 4 left it in (electron if gain
+    # was applied there, ADU otherwise); `in_electrons` and `saturation`
+    # must both match that unit or astroscrappy's internal noise/saturation
+    # model is built in the wrong units (see detect_cosmics's docstring).
     cr_cards: list[tuple[str, Any, str]] = []
     if settings.calib.cosmic_ray_rejection:
         if gain is None:
@@ -355,7 +532,7 @@ def reduce_frame(
             # flats/biases at this readout/gain-setting/binning combination):
             # an expected, known condition -- not an astroscrappy failure --
             # so it is handled explicitly here rather than via the ValueError
-            # path below, mirroring Step 7's identical gain-is-None handling.
+            # path below, mirroring Step 4's identical gain-is-None handling.
             logger.warning(
                 "cosmic-ray rejection requires a measured gain; no measured "
                 "gain for readout=%s setting=%s binning=%s; skipping "
@@ -367,15 +544,23 @@ def reduce_frame(
                 ("CRREJ", False, "cosmic-ray rejection applied"),
             ]
         else:
+            in_electrons = bunit == "electron"
+            saturation_for_cosmics = profile.saturation_adu
+            if saturation_for_cosmics is not None and in_electrons:
+                # detect_cosmics only auto-scales `saturation` by gain when
+                # in_electrons=False (its own gain_e_per_adu path); with
+                # in_electrons=True it uses gain=1.0 internally, so an ADU
+                # saturation level must be pre-converted here instead.
+                saturation_for_cosmics = saturation_for_cosmics * gain
             try:
                 cr_result = detect_cosmics(
                     data,
                     settings=settings.calib,
                     gain_e_per_adu=gain,
                     read_noise_e=read_noise_e,
-                    saturation=profile.saturation_adu,
+                    saturation=saturation_for_cosmics,
                     dq=dq,
-                    in_electrons=False,
+                    in_electrons=in_electrons,
                 )
                 data = cr_result.cleaned
                 dq = apply_to_dq(dq, cr_result.mask)
@@ -395,52 +580,27 @@ def reduce_frame(
 
     header_cards.extend(cr_cards)
     header_cards.append(
-        ("MEDCOSM", float(np.nanmedian(data)), "median after cosmic-ray rejection (ADU)")
-    )
-
-    # --- Step 7: Gain to Electrons ---
-    bunit = "adu"
-    if settings.calib.apply_gain:
-        if gain is not None:
-            try:
-                data = data * gain
-                bunit = "electron"
-                steps_applied.append("gain")
-            except Exception as e:
-                logger.error("gain conversion failed: %s", e)
-                steps_skipped.append("gain")
-        else:
-            logger.warning(
-                "gain requested but no measured gain for readout=%s setting=%s "
-                "binning=%s; reducing this frame in ADU.",
-                meta.readout_mode, meta.gain_setting, meta.binning,
-            )
-            steps_skipped.append("gain")
-    else:
-        steps_skipped.append("gain")
-
-    header_cards.append(("BUNIT", bunit, "Unit of the SCI plane"))
-    header_cards.append(
-        ("MEDGAIN", float(np.nanmedian(data)), "median after gain conversion (final SCI median)")
+        ("MEDCOSM", float(np.nanmedian(data)), f"median after cosmic-ray rejection ({bunit})")
     )
 
     # --- Step 8: Variance and Error Plane ---
     # Build a variance estimate from read noise and photon noise.
-    # When gain is applied, variance is in electrons^2; otherwise in ADU^2.
-    # ERR plane is 1-sigma (sqrt of variance).
+    # When gain was applied (Step 4), variance is in electrons^2; otherwise
+    # in ADU^2. ERR plane is 1-sigma (sqrt of variance). Both terms use each
+    # tile's own gain and read noise, via the per-pixel gain_map/
+    # read_noise_map built in Step 4 (uniform across the whole frame --
+    # filled with the single frame-level `gain`/`read_noise_e` -- whenever
+    # tile_measurements was unavailable, so a single-amplifier instrument or
+    # an ungained group sees exactly the old scalar formula).
 
-    variance = np.zeros_like(data, dtype=np.float32)
+    variance = np.zeros_like(data, dtype=np.float64)
 
-    # Read noise contribution (always in electrons, convert to data units if
-    # needed). ``read_noise_e`` prefers the runtime PTC measurement over the
-    # profile's static value; see the gain resolution above.
-    read_noise_var = 0.0
-    if read_noise_e is not None:
-        if bunit == "electron":
-            read_noise_var = read_noise_e ** 2
-        else:
-            # In ADU: read_noise_e / gain
-            read_noise_var = (read_noise_e / (gain or 1.0)) ** 2
+    if bunit == "electron":
+        read_noise_var = read_noise_map ** 2
+    else:
+        # In ADU: read_noise_e / gain, per tile.
+        safe_gain_map = np.where(gain_map > 0, gain_map, 1.0)
+        read_noise_var = (read_noise_map / safe_gain_map) ** 2
 
     variance += read_noise_var
 
@@ -471,6 +631,7 @@ def reduce_frame(
 
     # --- Build Product Header ---
     product_header = raw_header.copy()
+    override_nominal_wcs(product_header, profile, ny=data.shape[0], nx=data.shape[1])
     product_header["EXTNAME"] = "SCI"
     product_header["BUNIT"] = bunit
 

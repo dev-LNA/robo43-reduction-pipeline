@@ -137,6 +137,14 @@ class PhotometrySettings:
     zp_sigma_clip: float = 3.0
     zp_min_stars: int = 10
     zp_rms_max: float = 0.05
+    # Optional Gaia DR3 absolute (external) zero-point calibration -- see
+    # robo43.photometry.gaia_zp. Off by default: it never alters
+    # instrumental_zp or any instrumental column the relative-photometry
+    # (exoplanet-detection) path reads, only adds calibrated columns/cards
+    # alongside. Enabled by --gaia-zp on `robo43 photometry`.
+    abs_calibration: bool = False
+    gaia_match_radius_arcsec: float = 2.0
+    gaia_ruwe_max: float = 1.4
     catalog_format: str = "mef"
     write_catalog: bool = True
 
@@ -205,6 +213,45 @@ class CalibSettings:
     # cosmic-ray storm or light leak (the measurement is still used, and
     # the ratio is always recorded on GainMeasurement.bias_var_ratio).
     gain_var_disagreement_factor: float = 2.0
+    # Two flats pair for photon-transfer measurement when their median
+    # levels (post overscan/trim, pre-bias-subtraction) differ by no more
+    # than this fraction of the brighter one -- see
+    # robo43.calib.gain._level_matched_pairs. Needed because pooled T80S
+    # flats span several nights at different lamp/sky levels, so a naive
+    # "next frame in the list" pairing yields almost no usable pairs.
+    gain_flat_pair_level_tol_frac: float = 0.05
+    # Multi-night calibration fallback (T80S support): when a night
+    # directory has zero raw frames of a calibration type -- bias, dark,
+    # or a flat filter group -- search sibling YYYYMMDD directories
+    # under the same parent for strictly earlier nights' raw frames of
+    # that type (and, for flats, that filter) and build the master from
+    # those instead. Only takes effect when the reduction input resolves
+    # to a single directory whose name parses as YYYYMMDD; disabled
+    # entirely otherwise. See the --no-calib-fallback CLI flag.
+    calib_fallback: bool = True
+    # Minimum bias frames required from a single (or, failing that,
+    # accumulated nearest) earlier night before it is used to build a
+    # fallback master bias.
+    min_bias_frames: int = 3
+    # Minimum dark frames required from a single (or accumulated) earlier
+    # night before it is used to build a fallback master dark.
+    min_dark_frames: int = 3
+    # Minimum flat frames, per filter, required from a single (or
+    # accumulated) earlier night before it is used to build a fallback
+    # master flat for that filter.
+    min_flat_frames: int = 5
+    # How many calendar days back from the target night the bias and dark
+    # fallback search is allowed to look before giving up.
+    fallback_max_nights_bias: int = 30
+    # How many calendar days back from the target night the flat fallback
+    # search is allowed to look before giving up. Flats drift with dust
+    # and mirror coatings more slowly than the bias level does, so this
+    # window is wider than the bias/dark one. Also the outer bound for the
+    # per-instrument flat-pooling policy's search of older nights once
+    # nothing is found within its own (typically much shorter) pooling
+    # window -- see InstrumentProfile.calib.flat_pool and
+    # robo43.calib.fallback.pool_flat_frames -- hence the wide default.
+    fallback_max_nights_flat: int = 365
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +344,8 @@ class RuntimeSettings:
     dry_run: bool = False
     clobber: bool = False
     pdb: bool = False
+    memory_reserve_mb: float = 8192.0
+    release_memory: bool = True
 
 
 @dataclass(frozen=True, slots=True)

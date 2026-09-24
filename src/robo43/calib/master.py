@@ -83,7 +83,7 @@ class MasterFrame:
             with fits.open(path) as hdul:
                 # Read primary HDU data
                 primary = hdul[0]
-                data = np.asarray(primary.data, dtype=np.float32)
+                data = np.array(primary.data, dtype=np.float32)
 
                 # Read BUNIT from header
                 bunit = primary.header.get("BUNIT", "adu")
@@ -94,13 +94,13 @@ class MasterFrame:
                 mask = None
 
                 if "VAR" in hdul:
-                    variance = np.asarray(hdul["VAR"].data, dtype=np.float32)
+                    variance = np.array(hdul["VAR"].data, dtype=np.float32)
 
                 if "WEIGHT" in hdul:
-                    weight = np.asarray(hdul["WEIGHT"].data, dtype=np.float32)
+                    weight = np.array(hdul["WEIGHT"].data, dtype=np.float32)
 
                 if "DQ" in hdul:
-                    mask = np.asarray(hdul["DQ"].data, dtype=DQ_DTYPE)
+                    mask = np.array(hdul["DQ"].data, dtype=DQ_DTYPE)
 
                 # Construct and return the instance
                 return cls(
