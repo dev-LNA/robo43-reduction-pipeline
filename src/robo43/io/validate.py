@@ -34,7 +34,7 @@ STAGE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "flat": ("filter",),
     "reduce": ("filter",),
     "astrometry": ("ra_deg", "dec_deg", "pixel_scale"),
-    "photometry": ("filter", "gain", "saturation"),
+    "photometry": ("filter", "gain_setting", "saturation"),
     "zeropoint": ("airmass",),
 }
 
@@ -67,7 +67,7 @@ _FIELD_TYPES: dict[str, type] = {
     "ra_deg": float, "dec_deg": float,
     "pixel_scale": float,
     "ccd_temp": float,
-    "gain": float,
+    "gain_setting": float,
     "read_noise": float,
     "saturation": float,
     "airmass": float,
@@ -221,7 +221,7 @@ class ValidationIssue:
 _TABLE_FIELDS: tuple[str, ...] = (
     "naxis1", "naxis2", "frame_type", "exptime", "date_obs",
     "filter", "ra_deg", "dec_deg", "pixel_scale", "ccd_temp",
-    "gain", "read_noise", "saturation", "airmass",
+    "gain_setting", "read_noise", "saturation", "airmass",
     "object", "telescope", "instrument", "observer", "binning",
     "focal_length_mm", "site_lat_deg", "site_lon_deg", "site_elevation_m", "mjd",
 )

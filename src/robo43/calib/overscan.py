@@ -218,7 +218,7 @@ def _apply_overscan_tiled(
         (
             "TRIMREG",
             iraf_region,
-            "Bounding box of stitched tiles (IRAF); raw region, stitched from multiple blocks",
+            "Bbox of stitched tiles (IRAF, raw)",
         )
     )
 

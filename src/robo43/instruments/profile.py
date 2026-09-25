@@ -356,7 +356,7 @@ def available_profiles() -> dict[str, Path]:
 
 def resolve_profile(
     *,
-    name: str | None = None,
+    name: str | os.PathLike[str] | None = None,
     header: fits.Header | Mapping[str, Any] | None = None,
     profile_toml: str | None = None,
 ) -> InstrumentProfile:
@@ -364,9 +364,17 @@ def resolve_profile(
     profiles = available_profiles()
 
     if name is not None:
+        candidate_path = Path(name)
+        if candidate_path.suffix == ".toml" and candidate_path.is_file():
+            logger.info("instrument profile loaded from filesystem path '%s'", candidate_path)
+            return load_profile_file(candidate_path, source="path")
+        name = str(name)
         if name not in profiles:
             known = ", ".join(sorted(profiles))
-            msg = f"instrument profile {name!r} not found (available: {known})"
+            msg = (
+                f"instrument profile {name!r} not found as a registered name "
+                f"(available: {known}) or as an existing .toml file path"
+            )
             raise ConfigError(msg)
         logger.info("instrument profile '%s' selected explicitly by name", name)
         return load_profile_file(profiles[name])

@@ -4,6 +4,151 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-25 (evening) — test warnings removed; phase 1B (inventory/inspect/fixheader) landed
+
+**Branch:** `fix-imagetyp-headers` (uncommitted, on top of the Gaia ZP changes below). **Suite:** 487
+passed, 0 warnings, 0 skips (`python3 -m pytest -o addopts="" -q -rs`). `ruff check` is clean on all
+new files.
+
+### Warnings (100 → 0)
+
+- Header comments that were too long were shortened: `MEDGAIN` (`reduce/frame.py`), `FLATNGT`
+  (`calib/flat.py`), `GAINRN` (`calib/gain.py`), `TRIMREG` (`calib/overscan.py`).
+- Test fixtures wrote the non-standard `READNOISE`; they now write `RDNOISE` (the profile alias).
+- photutils `NoDetectionsWarning` (an expected, already-handled empty-frame case) is suppressed locally
+  in `astrometry/centroids.py` and `photometry/catalog.py`.
+- astropy `FITSFixedWarning` ('datfix' filling MJD-OBS) is suppressed around each `WCS(...)`
+  construction: `io/headers.py`, `astrometry/solve.py`, `products/nominal_wcs.py`, `cli/photometry.py`
+  and `tests/test_cli_astrometry.py`.
+
+### Phase 1B
+
+The resume note `docs/refactor-resume/phase1b-inventory-cli.md` was stale. Where it disagreed with the
+current code or with `docs/INTERFACE_CONTRACT.md`, the contract won:
+
+- **No packaged `synth2.toml`** (ADDENDUM 9). Instead, `resolve_profile` / `--instrument` accept a
+  path to a TOML file (`instruments/profile.py`).
+- **Pre-existing bug fixed:** `io/validate.py` referenced a nonexistent `FrameMeta.gain`, so
+  `inspect --stages photometry` raised `AttributeError`. It is now `gain_setting`. The override key is
+  `gain_setting`; there is deliberately **no `gain=` alias**, since GAIN is a QHY setting index, not
+  e-/ADU.
+- **FOCUS added** to classification (`instruments/keywords.py`, `io/headers.py`). Focus frames
+  previously fell through to science.
+
+New code:
+
+- `io/inventory.py`: `build_inventory`, `metas_from_inventory`, `write_inventory` and
+  `filter_inventory`. There is an `imagetyp` column in the canonical vocabulary and a `read_error`
+  column. In auto mode each file is read exactly once. The worker pool uses `spawn`. `filter=` never
+  matches ZERO/DARK rows. `valid_only` drops only frames whose header says `VALID = False` and always
+  keeps `read_error` rows.
+- `cli/inventory.py`: the `--frame-type`, `--filter`, `--object` and `--include-invalid` options.
+  It logs how many `VALID = False` frames were excluded.
+- `cli/inspect.py`: each stage is checked only against the frame types it applies to
+  (`_STAGE_APPLIES_TO`, keyed on ZERO/DARK/FLAT/OBJECT). FOCUS is never checked by science stages.
+  `--emit-overrides` writes a template.
+- `cli/fixheader.py`: derives IMAGETYP from OBJECT only (a wrong but mappable existing value such as
+  "Light Frame" is still repaired). It never touches FILTER on ZERO/DARK. It writes a `.bak` backup
+  before writing, plus a HISTORY card. `--dry-run` is a true no-op and reports "would change (dry-run)".
+- Tests: `tests/conftest.py`, `test_inventory.py`, `test_cli_inventory.py`, `test_cli_inspect.py`,
+  `test_cli_fixheader.py`, `test_headers_classify_focus.py`, `test_validate_gain_field.py` and
+  `test_profile_resolve_path.py`. Real `mini_sample` frames are used where they exist (the tests skip
+  when absent); synthetic data is used only for the MEF layout and the stripped-keyword night.
+
+Checked by hand on copies of the real `mini_sample`: the inventory gives ZERO/FLAT/OBJECT;
+`--filter U-Bessell` returns 0 rows (only biases carry it); the `BAD_…` frame (`VALID = False`) is
+excluded with a log line; a truncated file lands as a `read_error` row. `fixheader` repaired
+"Light Frame" to FLAT, with backup and HISTORY, and the dry run left the sha256 unchanged.
+
+### Open items
+
+1. **Commit** everything once reviewed: the Gaia ZP files from the entry below, the warning fixes and
+   phase 1B.
+2. ~~Delete the legacy `src/fix_header.py`~~ — done (deleted, superseded by `robo43 fixheader`).
+3. `generic.toml` cannot derive `science_hdu` for a foreign MEF instrument (ADDENDUM 9's second
+   finding). It needs a fix and a test.
+4. Full unit suites for the already-landed `io/headers.py`, `io/meta.py`, `io/validate.py`,
+   `io/fits_io.py` and `instruments/profile.py` (next step 8 of the old resume note) were not written.
+   Only targeted regression tests exist.
+5. Next in dependency order (`docs/refactor-resume/README.md`): phase 4.3 remainder, then the rest.
+   Check the README against the current code first, because it is as stale as the phase 1B note was.
+6. The open items from the entries below still stand.
+
+---
+
+## 2026-09-25 (later) — Gaia ZP spatial gradient diagnosed and fixed
+
+**Branch:** `fix-imagetyp-headers` (4 files modified, **uncommitted**). **Suite:** 434 passed
+(`python3 -m pytest -o addopts="" -q`); `ruff check` clean on the changed files.
+
+### Diagnosis (3 T80S R frames of 20251104, ~4600 stars with REFMAG < 16)
+
+The 0.13–0.15 mag `SPZPRNG` had three causes:
+
+- **Kron-aperture/PSF bias (main cause).** FWHM varies smoothly across the field (focus/coma).
+  The `MAG_AUTO` residual tracks FWHM (r = 0.45); with a fixed aperture the correlation is
+  about 0.
+- **A planar tilt fixed on the detector** (bottom-left +0.10 to +0.15, top-right about −0.10;
+  identical in the dithered frames). **T80S has only twilight sky flats — dome flats will never
+  exist.** The tilt is therefore most likely a twilight-sky gradient imprinted in the sky flat.
+- **Colour term:** about +0.056 mag per mag of BP−RP.
+- Ruled out: crowding (r = 0.07) and mismatches (median separation 0.15").
+
+Analysis scripts and plots are in the session scratchpad (`zpgrad/`); that directory does not
+persist.
+
+### What changed
+
+`photometry/gaia_zp.py`, `config.py`, `data/config.default.toml`, `tests/test_gaia_zp.py`.
+
+- The ZP is fitted as REFMAG − MAG = a + b·(BP−RP − c0) + S(x,y). This is `fit_zero_point_model`:
+  iterative OLS with sigma clipping, and S is a polynomial in detector coordinates normalised
+  to the centre.
+- New settings `gaia_zp_aperture_arcsec = 4.0` (0.0 = old `MAG_AUTO`),
+  `gaia_zp_color_term = true` and `gaia_zp_surface_order = 1` (0 reproduces the old scalar fit
+  exactly).
+- `ZPABS` is the value at the detector centre and colour c0. The RMS gate uses the residuals
+  after the full model.
+- `MAG_CALIB` = the fitted magnitude + a + S(x,y) + b·(BP−RP − c0), with the colour term set
+  to 0 for stars without Gaia BP−RP.
+- New header cards `ZPAPER`, `ZPSURFO`, `ZPCOLB`, `ZPCOLC0`, `ZPSFnn` and `SPZPRES`
+  (the range after the full model). `SPZPRNG` and `ZPTnn` still describe the raw diffs
+  (the gradient diagnostic).
+
+Aperture choice (pooled residual MAD after the full model): 2" 0.070, 3" 0.037,
+**4" 0.033**, MAG_AUTO 0.044.
+
+| Frame | ZPABS old→new | RMS old→new | SPZPRES | ZPABSCAL |
+|---|---|---|---|---|
+| 030335 | 28.120→28.108 | 0.079→0.045 | 0.044 | False→True |
+| 034524 | 28.139→28.093 | 0.082→0.042 | 0.048 | False→True |
+| 043150 | 28.143→28.142 | 0.077→0.042 | 0.046 | False→True |
+
+The colour slope and surface coefficients agree frame to frame
+(b ≈ 0.056, (sx, sy) ≈ (−0.024, −0.042)).
+
+### Open items
+
+1. **Commit** the four modified files once reviewed.
+2. **`MAG_APER_CAL` applies the single 4"-anchored correction to every aperture column**, so the
+   2/3/6/8" calibrated columns are off by their aperture correction relative to 4". This
+   predates the change (the old code anchored to `MAG_AUTO`). Fix it with a per-aperture
+   correction, or write `MAG_APER_CAL` only for the fitted aperture.
+3. **Sky flats labelled `_dome`.** `calib/flat.py:62` classifies a flat as sky only when `OBJECT`
+   contains "sky" or "twilight"; T80S marks twilight flats via `IMAGETYP = 'sky-flat'`, so its
+   master is written as `master_flat_R_dome.fits`. This is a naming issue only (same pixels).
+   Fix the classifier, for example by checking IMAGETYP or adding a per-instrument default
+   flat kind of "sky".
+4. The planar tilt is absorbed per frame by the surface. A permanent illumination/star-flat
+   correction built from these residuals would remove it at the reduction stage instead.
+5. `gaia_zp_surface_order = 2` is covered only by the unit tests and has not been run on real
+   data. The XP path is still untested live, and the full 45-frame `--gaia-zp` run is still
+   pending.
+6. The items from the entry below still stand (`select_reference_stars` guard, T80S linearity,
+   doubled log timestamps, ruff findings elsewhere).
+
+---
+
 ## 2026-09-25 — Gaia zero point (`--gaia-zp`) fixed and tested on T80S
 
 **Branch:** `fix-imagetyp-headers`. **Suite:** 428 passed (`python3 -m pytest -o addopts="" -q`

@@ -26,6 +26,7 @@ import dataclasses
 import logging
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,7 +35,7 @@ import astropy.units as u
 import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 
 from robo43.astrometry.centroids import (
     FALLBACK_LADDER,
@@ -286,7 +287,9 @@ def _build_solution(
         # value is already the (value, comment) tuple astropy.io.fits.Header
         # wants; fits.Header(dict_of_tuples) itself raises, hence the loop.
         header[key] = value
-    wcs = WCS(header)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        wcs = WCS(header)
 
     xs = np.array([s.x - 1.0 for s in stars])
     ys = np.array([s.y - 1.0 for s in stars])

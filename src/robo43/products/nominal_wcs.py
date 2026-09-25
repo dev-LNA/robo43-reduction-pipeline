@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 if TYPE_CHECKING:
@@ -61,7 +62,9 @@ def override_nominal_wcs(
         return
 
     try:
-        wcs = WCS(header)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            wcs = WCS(header)
     except Exception as exc:
         logger.debug("could not parse header WCS to override: %s", exc)
         return

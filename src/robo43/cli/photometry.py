@@ -12,6 +12,7 @@ import functools
 import logging
 import multiprocessing
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,14 +20,19 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 
 from robo43.cli.common import configure_from_args
 from robo43.cli.registry import Subcommand, register
 from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header, write_fits
 from robo43.logging_setup import log_listener, worker_log_config
-from robo43.memory import STAGE_BYTES_PER_PIXEL, log_peak_rss_summary, release_memory, safe_worker_count
+from robo43.memory import (
+    STAGE_BYTES_PER_PIXEL,
+    log_peak_rss_summary,
+    release_memory,
+    safe_worker_count,
+)
 from robo43.photometry import gaia_zp
 from robo43.photometry.catalog import measure_sources, pixel_scale_arcsec
 from robo43.products.catalog import build_catalog_hdu
@@ -249,7 +255,9 @@ def _process_one(
             dq = np.array(hdul["DQ"].data, dtype=DQ_DTYPE)
             header = hdul["SCI"].header
 
-            wcs = WCS(header, hdul)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                wcs = WCS(header, hdul)
             gain = _resolved_gain(header)
 
             result = measure_sources(

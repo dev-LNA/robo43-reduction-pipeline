@@ -84,6 +84,19 @@ gaia_xp_timeout_s = 300.0
 # the cross-match drives the fit itself; REFMAG/REFMAGERR are still
 # written for every cross-matched source regardless of this cut.
 gaia_zp_refmag_max = 16.0
+# Aperture magnitude (matched by radius against aperture_radii_arcsec) the
+# zero-point fit, MAG_CALIB, and MAG_APER_CAL are derived from; 0 fits on
+# MAG_AUTO instead. Chosen empirically on T80S R-band data: a fixed aperture
+# avoids MAG_AUTO's Kron-aperture correlation with per-frame FWHM/PSF shape.
+gaia_zp_aperture_arcsec = 4.0
+# Fit a linear term in Gaia BP-RP colour alongside the zero point, referenced
+# to the fit sample's own median BP-RP. Stars with no BP-RP cross-match are
+# excluded from the fit (not from REFMAG/REFMAGERR).
+gaia_zp_color_term = true
+# Spatial zero-point surface fit order alongside the colour term: 0 = a
+# single scalar (pre-surface-fit behaviour), 1 = a plane in normalised
+# detector (x, y), 2 = a full quadratic surface.
+gaia_zp_surface_order = 1
 
 [calib]
 combine_method = "mean"

@@ -51,6 +51,17 @@ Reference-magnitude order (design requirement 1):
 
 A filter with neither mapping degrades to "calibration unavailable"
 (``GaiaZeroPoint.source == "unavailable"``), logged, never an error.
+
+The fit itself (:func:`fit_zero_point_model`) is a scalar sigma-clipped
+median by default, refinable three ways via ``settings.photometry``:
+``gaia_zp_aperture_arcsec`` fits on a fixed-radius ``MAG_APER`` column
+instead of the Kron ``MAG_AUTO`` (0 keeps ``MAG_AUTO``), ``gaia_zp_color_term``
+adds a linear Gaia BP-RP colour term, and ``gaia_zp_surface_order`` adds a
+planar (1) or quadratic (2) zero-point surface across the detector. All
+three only change ``header_cards``' additive ``ZPABS*``/``ZPTnn``/
+``SPZPRNG``/``SPZPRES`` cards and ``MAG_CALIB``/``MAGERR_CALIB``/
+``MAG_APER_CAL``/``MAGERR_APER_CAL`` -- never ``MAG_AUTO``, any ``*_APER``
+column, or ``instrumental_zp`` itself.
 """
 
 from __future__ import annotations
@@ -79,7 +90,7 @@ if TYPE_CHECKING:
     from astropy.io import fits
     from astropy.wcs import WCS
 
-    from robo43.config import Settings
+    from robo43.config import PhotometrySettings, Settings
     from robo43.instruments.profile import InstrumentProfile
 
 logger = logging.getLogger(__name__)
@@ -89,8 +100,10 @@ __all__ = [
     "GaiaTransform",
     "GaiaZeroPoint",
     "ZeroPointFit",
+    "ZeroPointModelFit",
     "calibrate_frame",
     "fit_zero_point",
+    "fit_zero_point_model",
     "gaia_quality_mask",
     "header_cards",
     "match_to_gaia",
@@ -893,6 +906,185 @@ def fit_zero_point(diffs: np.ndarray, *, sigma: float) -> ZeroPointFit:
     return ZeroPointFit(zp=zp, err=float(err), rms=float(rms), n=int(good.size))
 
 
+@dataclass(frozen=True, slots=True)
+class ZeroPointModelFit:
+    """Robust fit of ``REFMAG - mag_ref = a + b*(BP-RP - c0) + S(x,y)``.
+
+    ``zp`` is ``a``: the model's value at the detector centre and colour
+    ``c0`` -- not yet offset by ``instrumental_zp``, exactly like
+    :attr:`ZeroPointFit.zp` (see :func:`calibrate_frame`). ``rms``/``err``
+    are computed from residuals after the *full* model (colour term and
+    spatial surface both removed), per :func:`fit_zero_point_model`.
+    ``color_coef``/``c0`` are ``None`` whenever the colour term was not fit;
+    ``surface_coef`` is ``()`` whenever ``surface_order == 0``.
+    """
+
+    zp: float | None
+    err: float | None
+    rms: float | None
+    n: int
+    color_coef: float | None
+    c0: float | None
+    surface_coef: tuple[float, ...]
+    surface_order: int
+
+
+def _normalized_xy(
+    x: np.ndarray, y: np.ndarray, naxis1: int, naxis2: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Detector ``(x, y)`` (0-based) recentred on the geometric frame centre
+    and scaled by the half-size, so :func:`fit_zero_point_model`'s surface
+    coefficients stay order-unity regardless of ``NAXIS1``/``NAXIS2``."""
+    cx, cy = naxis1 / 2.0, naxis2 / 2.0
+    hx = naxis1 / 2.0 if naxis1 > 0 else 1.0
+    hy = naxis2 / 2.0 if naxis2 > 0 else 1.0
+    return (x - cx) / hx, (y - cy) / hy
+
+
+def _surface_design(xs: np.ndarray, ys: np.ndarray, order: int) -> np.ndarray:
+    """Spatial-surface design columns, no constant term: empty (N, 0) for
+    ``order == 0``, ``[xs, ys]`` for ``order == 1``, plus ``[xs**2, xs*ys,
+    ys**2]`` for ``order == 2``. ``xs``/``ys`` are already normalised (see
+    :func:`_normalized_xy`)."""
+    if order <= 0:
+        return np.zeros((xs.shape[0], 0))
+    cols = [xs, ys]
+    if order >= 2:
+        cols += [xs**2, xs * ys, ys**2]
+    return np.column_stack(cols)
+
+
+def _surface_value(
+    xs: np.ndarray, ys: np.ndarray, coef: tuple[float, ...], order: int
+) -> np.ndarray:
+    """``S(x,y)`` for normalised ``(xs, ys)``, given the ``coef``
+    :func:`fit_zero_point_model` fit against :func:`_surface_design`'s
+    columns."""
+    if order <= 0 or not coef:
+        return np.zeros_like(xs)
+    return _surface_design(xs, ys, order) @ np.asarray(coef, dtype=float)
+
+
+def fit_zero_point_model(
+    x: np.ndarray,
+    y: np.ndarray,
+    diffs: np.ndarray,
+    bp_rp: np.ndarray | None,
+    *,
+    sigma: float,
+    color_term: bool,
+    surface_order: int,
+    naxis1: int,
+    naxis2: int,
+    maxiters: int = 5,
+) -> ZeroPointModelFit:
+    """Iteratively sigma-clipped fit of ``diffs (= REFMAG - mag_ref) = a +
+    b*(BP-RP - c0) + S(x,y)`` over one frame's reference-star sample.
+
+    ``color_term=False`` drops the ``b*(BP-RP - c0)`` term. ``surface_order``
+    drops ``S(x,y)`` entirely at 0 (in which case, with ``color_term`` also
+    False, ``a`` is delegated straight to :func:`fit_zero_point` -- the two
+    are then identical), fits a plane in normalised detector ``(x, y)`` at 1,
+    or a full quadratic surface at 2; any other value raises ``ValueError``.
+    Stars with a non-finite ``BP-RP`` are excluded from the fit whenever
+    ``color_term`` is True (:func:`calibrate_frame` still writes their
+    ``REFMAG``/``REFMAGERR`` regardless -- this is a fit-sample cut, not a
+    cross-match cut).
+
+    Each outer pass refits by ordinary least squares on the currently-kept
+    points, then re-clips the new residuals with :func:`~astropy.stats.
+    sigma_clip` (``sigma``, ``maxiters=5`` -- the same call
+    :func:`fit_zero_point` makes) computed only over those same kept points;
+    it stops early once a pass keeps exactly the same points as the last, or
+    after ``maxiters`` outer passes. ``rms`` is ``1.4826 * MAD`` of the final
+    kept residuals about their own median, matching :func:`fit_zero_point`'s
+    idiom; ``err = rms / sqrt(n)``.
+    """
+    if surface_order not in (0, 1, 2):
+        msg = f"surface_order must be 0, 1, or 2 (got {surface_order!r})"
+        raise ValueError(msg)
+
+    diffs = np.asarray(diffs, dtype=float)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if not color_term and surface_order == 0:
+        fit = fit_zero_point(diffs, sigma=sigma)
+        return ZeroPointModelFit(
+            zp=fit.zp,
+            err=fit.err,
+            rms=fit.rms,
+            n=fit.n,
+            color_coef=None,
+            c0=None,
+            surface_coef=(),
+            surface_order=0,
+        )
+
+    good = np.isfinite(diffs) & np.isfinite(x) & np.isfinite(y)
+    if color_term:
+        if bp_rp is None:
+            msg = "bp_rp is required when color_term is True"
+            raise ValueError(msg)
+        bp_rp = np.asarray(bp_rp, dtype=float)
+        good = good & np.isfinite(bp_rp)
+
+    if np.count_nonzero(good) == 0:
+        return ZeroPointModelFit(None, None, None, 0, None, None, (), surface_order)
+
+    d = diffs[good]
+    xs, ys = _normalized_xy(x[good], y[good], naxis1, naxis2)
+    c0 = float(np.median(bp_rp[good])) if color_term else None
+
+    design_cols: list[np.ndarray] = [np.ones_like(d)]
+    if color_term:
+        design_cols.append(bp_rp[good] - c0)
+    n_scalar_cols = len(design_cols)
+    if surface_order >= 1:
+        surface_cols = _surface_design(xs, ys, surface_order)
+        design_cols.extend(surface_cols[:, k] for k in range(surface_cols.shape[1]))
+    design = np.column_stack(design_cols)
+
+    keep = np.ones(d.shape, dtype=bool)
+    coef: np.ndarray | None = None
+    for _ in range(maxiters):
+        if np.count_nonzero(keep) < design.shape[1] + 1:
+            break
+        coef, *_ = np.linalg.lstsq(design[keep], d[keep], rcond=None)
+        resid = d - design @ coef
+        clipped = sigma_clip(resid[keep], sigma=sigma, maxiters=5, masked=True)
+        kept_now = ~np.asarray(clipped.mask)
+        new_keep = np.zeros_like(keep)
+        new_keep[np.flatnonzero(keep)[kept_now]] = True
+        if np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+
+    if coef is None or np.count_nonzero(keep) == 0:
+        return ZeroPointModelFit(None, None, None, 0, None, c0, (), surface_order)
+
+    resid_final = d[keep] - design[keep] @ coef
+    mad = float(np.median(np.abs(resid_final - np.median(resid_final))))
+    rms = 1.4826 * mad
+    n = int(np.count_nonzero(keep))
+    err = rms / np.sqrt(n)
+
+    a = float(coef[0])
+    b = float(coef[1]) if color_term else None
+    surface_coef = tuple(float(c) for c in coef[n_scalar_cols:]) if surface_order >= 1 else ()
+
+    return ZeroPointModelFit(
+        zp=a,
+        err=float(err),
+        rms=float(rms),
+        n=n,
+        color_coef=b,
+        c0=c0,
+        surface_coef=surface_coef,
+        surface_order=surface_order,
+    )
+
+
 _TILE_RE = re.compile(r"\[(\d+):(\d+),(\d+):(\d+)\]")
 
 
@@ -1012,6 +1204,18 @@ class GaiaZeroPoint:
     tile_offsets: dict[int, float] = field(default_factory=dict)
     spatial_range: float | None = None
     filter: str | None = None
+    #: 4x4 spatial ZP grid range (see spatial_zp_range), computed on
+    #: residuals AFTER the colour term and spatial surface are both removed
+    #: -- the SPZPRES header card. `spatial_range` (SPZPRNG) keeps its
+    #: original, pre-model-removal meaning unchanged.
+    spatial_range_resid: float | None = None
+    #: settings.photometry.gaia_zp_aperture_arcsec as configured (0.0 means
+    #: the fit used MAG_AUTO instead of a fixed aperture).
+    aperture_arcsec: float | None = None
+    color_coef: float | None = None
+    color_c0: float | None = None
+    surface_coef: tuple[float, ...] = ()
+    surface_order: int = 0
 
 
 def header_cards(gzp: GaiaZeroPoint) -> list[tuple[str, Any, str]]:
@@ -1026,16 +1230,46 @@ def header_cards(gzp: GaiaZeroPoint) -> list[tuple[str, Any, str]]:
         (
             "ZPABSRMS",
             gzp.zp_rms if gzp.zp_rms is not None else "NONE",
-            "ZPABS fit RMS (1.4826*MAD), mag",
+            "ZPABS fit RMS (1.4826*MAD) after the full colour+surface model, mag",
         ),
         ("ZPABSN", gzp.n, "reference stars used for ZPABS"),
         ("ZPABSSRC", gzp.source, "reference-magnitude source"),
         ("ZPABSCAL", gzp.calibrated, "ZPABS meets zp_min_stars/zp_rms_max"),
     ]
+    if gzp.aperture_arcsec is not None:
+        cards.append(
+            ("ZPAPER", gzp.aperture_arcsec, "ZPABS fit aperture radius, arcsec (0=MAG_AUTO)")
+        )
+    cards.append(("ZPSURFO", gzp.surface_order, "ZPABS spatial surface fit order (0=scalar)"))
+    if gzp.color_coef is not None:
+        cards.append(
+            (
+                "ZPCOLB",
+                gzp.color_coef,
+                "ZPABS Gaia BP-RP colour-term slope, mag/mag (0 applied where unmatched)",
+            )
+        )
+        cards.append(("ZPCOLC0", gzp.color_c0, "reference Gaia BP-RP for ZPCOLB/ZPABS, mag"))
+    for idx, coef in enumerate(gzp.surface_coef):
+        cards.append((f"ZPSF{idx:02d}", coef, f"ZPABS spatial surface coefficient {idx}"))
     for idx, offset in sorted(gzp.tile_offsets.items()):
         cards.append((f"ZPT{idx:02d}", offset, f"tile {idx} ZP offset from ZPABS, mag"))
     if gzp.spatial_range is not None:
-        cards.append(("SPZPRNG", gzp.spatial_range, "4x4 spatial ZP grid range (max-min), mag"))
+        cards.append(
+            (
+                "SPZPRNG",
+                gzp.spatial_range,
+                "4x4 spatial ZP grid range before surface fit (max-min), mag",
+            )
+        )
+    if gzp.spatial_range_resid is not None:
+        cards.append(
+            (
+                "SPZPRES",
+                gzp.spatial_range_resid,
+                "4x4 spatial ZP grid range after full model (max-min), mag",
+            )
+        )
     return cards
 
 
@@ -1095,6 +1329,73 @@ def _frame_epoch_jyear(header: fits.Header) -> float:
     return 2016.0  # Gaia DR3 reference epoch; last-resort fallback
 
 
+def _resolve_aperture_index(ps: PhotometrySettings) -> int | None:
+    """The ``MAG_APER``/``MAGERR_APER`` column index
+    ``ps.gaia_zp_aperture_arcsec`` selects, or ``None`` when it is 0.0 (fit
+    on ``MAG_AUTO`` instead -- back-compat with the pre-aperture-fit
+    behaviour). Raises ``ValueError`` -- not degraded to "unavailable" --
+    when it is set to a radius absent from ``ps.aperture_radii_arcsec``:
+    that is a configuration mistake, not a data-availability failure.
+    """
+    aperture = ps.gaia_zp_aperture_arcsec
+    if aperture == 0.0:
+        return None
+    try:
+        return list(ps.aperture_radii_arcsec).index(aperture)
+    except ValueError:
+        msg = (
+            f"photometry.gaia_zp_aperture_arcsec={aperture!r} is not one of "
+            f"aperture_radii_arcsec={ps.aperture_radii_arcsec!r} "
+            "(use 0 to fit on MAG_AUTO instead)"
+        )
+        raise ValueError(msg) from None
+
+
+def _reference_magnitude(table: Table, aper_idx: int | None) -> tuple[np.ndarray, np.ndarray]:
+    """``(mag, magerr)`` the Gaia ZP fit and ``MAG_CALIB``/``MAGERR_CALIB``
+    are built from: ``MAG_AUTO``/``MAGERR_AUTO`` when ``aper_idx`` is
+    ``None``, otherwise column ``aper_idx`` of ``MAG_APER``/``MAGERR_APER``
+    (:func:`_resolve_aperture_index`)."""
+    if aper_idx is None:
+        return (
+            np.asarray(table["MAG_AUTO"], dtype=float),
+            np.asarray(table["MAGERR_AUTO"], dtype=float),
+        )
+    mag_aper = np.asarray(table["MAG_APER"], dtype=float)
+    magerr_aper = np.asarray(table["MAGERR_APER"], dtype=float)
+    if mag_aper.ndim == 2:
+        return mag_aper[:, aper_idx], magerr_aper[:, aper_idx]
+    return mag_aper, magerr_aper
+
+
+def _model_prediction(
+    x: np.ndarray,
+    y: np.ndarray,
+    bp_rp: np.ndarray | None,
+    model: ZeroPointModelFit,
+    *,
+    naxis1: int,
+    naxis2: int,
+    color_term: bool,
+) -> np.ndarray:
+    """``a + S(x,y) + b*(BP-RP - c0)`` for every star in ``(x, y[, bp_rp])``
+    -- the per-star correction :func:`calibrate_frame` adds to ``mag_ref``
+    for ``MAG_CALIB``/``MAG_APER_CAL``. A star with a non-finite ``bp_rp``
+    (no Gaia colour) contributes 0 for the colour term rather than being
+    dropped, unlike the fit itself (:func:`fit_zero_point_model`)."""
+    pred = np.full(x.shape, model.zp if model.zp is not None else 0.0, dtype=float)
+    if model.surface_order >= 1 and model.surface_coef:
+        xs, ys = _normalized_xy(x, y, naxis1, naxis2)
+        pred = pred + _surface_value(xs, ys, model.surface_coef, model.surface_order)
+    if color_term and model.color_coef is not None and bp_rp is not None:
+        bp_rp = np.asarray(bp_rp, dtype=float)
+        valid = np.isfinite(bp_rp)
+        contrib = np.zeros(x.shape, dtype=float)
+        contrib[valid] = model.color_coef * (bp_rp[valid] - (model.c0 or 0.0))
+        pred = pred + contrib
+    return pred
+
+
 def calibrate_frame(
     table: Table,
     *,
@@ -1122,6 +1423,7 @@ def calibrate_frame(
     modifies any input column in place.
     """
     ps = settings.photometry
+    aper_idx = _resolve_aperture_index(ps)
     out = table.copy()
     unavailable = GaiaZeroPoint(
         zp=None,
@@ -1131,6 +1433,8 @@ def calibrate_frame(
         source="unavailable",
         calibrated=False,
         filter=filter_name,
+        aperture_arcsec=ps.gaia_zp_aperture_arcsec,
+        surface_order=ps.gaia_zp_surface_order,
     )
 
     if filter_name is None or len(table) == 0:
@@ -1215,6 +1519,8 @@ def calibrate_frame(
             source=source_label,
             calibrated=False,
             filter=filter_name,
+            aperture_arcsec=ps.gaia_zp_aperture_arcsec,
+            surface_order=ps.gaia_zp_surface_order,
         ), out
 
     # REFMAG/REFMAGERR/GAIA_SOURCE_ID/GAIA_SEP_ARCSEC: every cross-matched
@@ -1268,70 +1574,139 @@ def calibrate_frame(
             source=source_label,
             calibrated=False,
             filter=filter_name,
+            aperture_arcsec=ps.gaia_zp_aperture_arcsec,
+            surface_order=ps.gaia_zp_surface_order,
         ), out
 
-    # diffs = REFMAG - MAG_AUTO is an OFFSET, not a zero point: MAG_AUTO
+    # Gaia BP-RP per source_id, looked up by GAIA_SOURCE_ID for both the fit
+    # sample (clean, below) and the full catalogue (MAG_CALIB, below).
+    bp_rp_by_id: dict[int, float] = {
+        int(sid): float(bp) - float(rp)
+        for sid, bp, rp in zip(
+            gaia_epoch["source_id"],
+            gaia_epoch["phot_bp_mean_mag"],
+            gaia_epoch["phot_rp_mean_mag"],
+            strict=True,
+        )
+    }
+
+    naxis1 = int(header.get("NAXIS1", 0))
+    naxis2 = int(header.get("NAXIS2", 0))
+    x = np.asarray(clean["X_IMAGE"], dtype=float) - 1.0  # 1-based -> 0-based
+    y = np.asarray(clean["Y_IMAGE"], dtype=float) - 1.0
+    clean_gaia_id = np.asarray(clean["GAIA_SOURCE_ID"], dtype=np.int64)
+    clean_bp_rp = np.array(
+        [bp_rp_by_id.get(int(sid), np.nan) for sid in clean_gaia_id], dtype=float
+    )
+    mag_ref, _magerr_ref = _reference_magnitude(clean, aper_idx)
+
+    # diffs = REFMAG - mag_ref is an OFFSET, not a zero point: mag_ref
     # already has settings.photometry.instrumental_zp baked in
-    # (robo43.photometry.catalog._magnitudes computes MAG_AUTO as
-    # instrumental_zp - 2.5*log10(flux)), so offset = median(REFMAG -
-    # MAG_AUTO) is exactly what MAG_AUTO must be shifted by to read as the
-    # Gaia-referenced magnitude. The true zero point -- the magnitude
-    # corresponding to unit flux in the catalogue's own flux units, reported
-    # as GaiaZeroPoint.zp / the ZPABS header card / CatalogMetrics.zp / the
-    # status CSV's zp_abs -- is offset + instrumental_zp.
-    diffs = np.asarray(clean["REFMAG"], dtype=float) - np.asarray(clean["MAG_AUTO"], dtype=float)
-    fit = fit_zero_point(diffs, sigma=ps.zp_sigma_clip)
+    # (robo43.photometry.catalog._magnitudes computes both MAG_AUTO and
+    # MAG_APER as instrumental_zp - 2.5*log10(flux)), so the fitted model's
+    # constant term "a" is exactly what mag_ref must be shifted by to read
+    # as the Gaia-referenced magnitude at the detector centre and colour c0.
+    # The true zero point -- the magnitude corresponding to unit flux in the
+    # catalogue's own flux units, reported as GaiaZeroPoint.zp / the ZPABS
+    # header card / CatalogMetrics.zp / the status CSV's zp_abs -- is
+    # a + instrumental_zp.
+    diffs = np.asarray(clean["REFMAG"], dtype=float) - mag_ref
+    model = fit_zero_point_model(
+        x,
+        y,
+        diffs,
+        clean_bp_rp if ps.gaia_zp_color_term else None,
+        sigma=ps.zp_sigma_clip,
+        color_term=ps.gaia_zp_color_term,
+        surface_order=ps.gaia_zp_surface_order,
+        naxis1=naxis1,
+        naxis2=naxis2,
+    )
     calibrated = (
-        fit.zp is not None
-        and fit.n >= ps.zp_min_stars
-        and fit.rms is not None
-        and fit.rms <= ps.zp_rms_max
+        model.zp is not None
+        and model.n >= ps.zp_min_stars
+        and model.rms is not None
+        and model.rms <= ps.zp_rms_max
     )
 
-    offset = fit.zp
+    offset = model.zp
     tile_offsets: dict[int, float] = {}
     spatial_range: float | None = None
+    spatial_range_resid: float | None = None
     if offset is not None:
-        naxis1 = int(header.get("NAXIS1", 0))
-        naxis2 = int(header.get("NAXIS2", 0))
         tiles = parse_tile_slices(header, shape=(naxis2, naxis1))
-        x = (
-            np.asarray(clean["X_IMAGE"], dtype=float) - 1.0
-        )  # 1-based -> 0-based, matches tile slices
-        y = np.asarray(clean["Y_IMAGE"], dtype=float) - 1.0
         # zp_global=offset, not the true zero point: diffs (and therefore
         # the per-tile/spatial fits below) live in offset space, and
         # instrumental_zp cancels out of every "offset - zp_global"
         # subtraction per_tile_offsets does internally either way.
+        # Per-tile offsets and SPZPRNG are deliberately computed on the raw
+        # diffs, not on colour/surface-corrected residuals, so they keep
+        # diagnosing exactly the pre-model gradient/amplifier structure they
+        # always have; SPZPRES below is the analogous diagnostic AFTER the
+        # full model.
         tile_offsets = per_tile_offsets(
             x, y, diffs, tiles, zp_global=offset, sigma=ps.zp_sigma_clip
         )
         spatial_range = spatial_zp_range(x, y, diffs, naxis1=naxis1, naxis2=naxis2)
+        model_pred = _model_prediction(
+            x,
+            y,
+            clean_bp_rp,
+            model,
+            naxis1=naxis1,
+            naxis2=naxis2,
+            color_term=ps.gaia_zp_color_term,
+        )
+        spatial_range_resid = spatial_zp_range(
+            x, y, diffs - model_pred, naxis1=naxis1, naxis2=naxis2
+        )
 
     gzp = GaiaZeroPoint(
         zp=(offset + ps.instrumental_zp) if offset is not None else None,
-        zp_err=fit.err,
-        zp_rms=fit.rms,
-        n=fit.n,
+        zp_err=model.err,
+        zp_rms=model.rms,
+        n=model.n,
         source=source_label,
         calibrated=bool(calibrated),
         tile_offsets=tile_offsets,
         spatial_range=spatial_range,
         filter=filter_name,
+        spatial_range_resid=spatial_range_resid,
+        aperture_arcsec=ps.gaia_zp_aperture_arcsec,
+        color_coef=model.color_coef,
+        color_c0=model.c0,
+        surface_coef=model.surface_coef,
+        surface_order=ps.gaia_zp_surface_order,
     )
 
     if gzp.calibrated:
         zp_err = gzp.zp_err or 0.0
-        out["MAG_CALIB"] = (np.asarray(out["MAG_AUTO"], dtype=float) + offset).astype(np.float32)
-        out["MAGERR_CALIB"] = np.sqrt(
-            np.asarray(out["MAGERR_AUTO"], dtype=float) ** 2 + zp_err**2
-        ).astype(np.float32)
+        out_x = np.asarray(out["X_IMAGE"], dtype=float) - 1.0
+        out_y = np.asarray(out["Y_IMAGE"], dtype=float) - 1.0
+        out_gaia_id = np.asarray(out["GAIA_SOURCE_ID"], dtype=np.int64)
+        out_bp_rp = np.array(
+            [bp_rp_by_id.get(int(sid), np.nan) for sid in out_gaia_id], dtype=float
+        )
+        # Every star gets the fitted constant + spatial surface; the colour
+        # term only applies where the star has its own Gaia BP-RP match (0
+        # otherwise -- see the ZPCOLB header card comment).
+        corr = _model_prediction(
+            out_x,
+            out_y,
+            out_bp_rp,
+            model,
+            naxis1=naxis1,
+            naxis2=naxis2,
+            color_term=ps.gaia_zp_color_term,
+        )
+        base_mag, base_magerr = _reference_magnitude(out, aper_idx)
+        out["MAG_CALIB"] = (base_mag + corr).astype(np.float32)
+        out["MAGERR_CALIB"] = np.sqrt(base_magerr**2 + zp_err**2).astype(np.float32)
         if "MAG_APER" in out.colnames:
-            out["MAG_APER_CAL"] = (np.asarray(out["MAG_APER"], dtype=float) + offset).astype(
-                np.float32
-            )
-            out["MAGERR_APER_CAL"] = np.sqrt(
-                np.asarray(out["MAGERR_APER"], dtype=float) ** 2 + zp_err**2
-            ).astype(np.float32)
+            mag_aper = np.asarray(out["MAG_APER"], dtype=float)
+            magerr_aper = np.asarray(out["MAGERR_APER"], dtype=float)
+            corr_b = corr[:, None] if mag_aper.ndim == 2 else corr
+            out["MAG_APER_CAL"] = (mag_aper + corr_b).astype(np.float32)
+            out["MAGERR_APER_CAL"] = np.sqrt(magerr_aper**2 + zp_err**2).astype(np.float32)
 
     return gzp, out

@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import csv
 import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 
 from robo43.cli.main import main
 from robo43.logging_setup import ROOT_LOGGER_NAME
@@ -164,4 +165,6 @@ def test_astrometry_solves_real_mini_sample_frames(tmp_path):
         assert out_path.exists()
         with fits.open(out_path) as hdul:
             for name in ("SCI", "ERR", "DQ", "WEIGHT"):
-                assert WCS(hdul[name].header).has_celestial, name
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FITSFixedWarning)
+                    assert WCS(hdul[name].header).has_celestial, name

@@ -164,6 +164,22 @@ class PhotometrySettings:
     # fit, per-tile offsets, and spatial ZP range; REFMAG/REFMAGERR are
     # still written for every cross-matched source regardless of this cut.
     gaia_zp_refmag_max: float = 16.0
+    # Aperture magnitude the Gaia ZP fit (and MAG_CALIB/MAG_APER_CAL) uses,
+    # matched by radius against aperture_radii_arcsec -- 0 fits on MAG_AUTO
+    # instead (pre-aperture-fit back-compat). Chosen empirically on T80S
+    # R-band data: MAG_AUTO's Kron aperture correlates with per-frame
+    # FWHM/PSF-shape variation, which a fixed aperture avoids -- see
+    # robo43.photometry.gaia_zp.fit_zero_point_model.
+    gaia_zp_aperture_arcsec: float = 4.0
+    # Fit a linear term in Gaia BP-RP colour alongside the zero point,
+    # referenced to the fit sample's own median BP-RP. Stars with no BP-RP
+    # cross-match are excluded from the fit (not from REFMAG/REFMAGERR).
+    gaia_zp_color_term: bool = True
+    # Spatial zero-point surface fit order alongside the colour term: 0 is a
+    # single scalar (pre-surface-fit behaviour), 1 a plane in normalised
+    # detector (x, y), 2 a full quadratic surface. See
+    # robo43.photometry.gaia_zp.fit_zero_point_model.
+    gaia_zp_surface_order: int = 1
     catalog_format: str = "mef"
     write_catalog: bool = True
 
@@ -614,6 +630,22 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(msg)
     if settings.calib.flat_min_level_frac >= settings.calib.flat_max_level_frac:
         msg = "calib.flat_min_level_frac must be below calib.flat_max_level_frac"
+        raise ConfigError(msg)
+    gaia_zp_aperture = settings.photometry.gaia_zp_aperture_arcsec
+    gaia_zp_radii = settings.photometry.aperture_radii_arcsec
+    if gaia_zp_aperture != 0.0 and gaia_zp_aperture not in gaia_zp_radii:
+        msg = (
+            "photometry.gaia_zp_aperture_arcsec: "
+            f"{gaia_zp_aperture!r} is not one of "
+            f"{gaia_zp_radii} "
+            "(use 0 to fit on MAG_AUTO instead)"
+        )
+        raise ConfigError(msg)
+    if settings.photometry.gaia_zp_surface_order not in (0, 1, 2):
+        msg = (
+            "photometry.gaia_zp_surface_order must be 0, 1, or 2 "
+            f"(got {settings.photometry.gaia_zp_surface_order!r})"
+        )
         raise ConfigError(msg)
     if settings.runtime.strict and settings.runtime.assume_profile_defaults:
         msg = "--strict and --assume-profile-defaults are mutually exclusive"

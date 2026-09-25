@@ -104,7 +104,7 @@ def _write_frame(
     hdu.header["GAIN"] = gain
     hdu.header["XBINNING"] = binning
     hdu.header["READOUTM"] = "High Gain Mode 16BIT"
-    hdu.header["READNOISE"] = 5.0
+    hdu.header["RDNOISE"] = 5.0
     hdu.header["SATURATE"] = 60000.0
     path.parent.mkdir(parents=True, exist_ok=True)
     hdu.writeto(path, overwrite=True)

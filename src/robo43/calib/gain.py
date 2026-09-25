@@ -159,7 +159,7 @@ class GainMeasurement:
             ("GAINSRC", self.source, "origin of GAINVAL: measured/none"),
             ("GAINSET", self.gain_setting, "camera GAIN header setting index"),
             ("READOUTM", self.readout_mode, "camera readout mode"),
-            ("GAINRN", self.read_noise_e, "measured read noise, e- (from the same bias pairs)"),
+            ("GAINRN", self.read_noise_e, "measured read noise, e- (bias pairs)"),
             ("GAINNPR", self.n_pairs, "flat pairs used for gain measurement"),
             ("GAINSCT", self.scatter_frac, "relative scatter across gain pairs"),
             ("GAINNTL", self.n_tiles, "number of amplifier tiles measured"),

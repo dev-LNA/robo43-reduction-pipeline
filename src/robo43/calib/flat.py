@@ -254,7 +254,7 @@ def _flat_fallback_cards(
         joined = ",".join(contributing_nights)
         if len(joined) <= 68:
             cards.append(
-                ("FLATNGT", joined, "Source night(s) contributing to this master flat")
+                ("FLATNGT", joined, "Source night(s) of this master flat")
             )
         else:
             ordered = sorted(contributing_nights)

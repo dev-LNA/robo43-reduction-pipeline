@@ -30,12 +30,14 @@ intact and masking on that bit would only discard good detections.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder, find_peaks
+from photutils.utils.exceptions import NoDetectionsWarning
 
 from robo43.products.dq import DQ
 
@@ -133,13 +135,15 @@ def measure_fwhm(sci: np.ndarray, med: float, sd: float, *, fallback_px: float) 
     ``(0.5, 10.0)`` pixels. Returns ``2.3548 * median(sigma)`` when at least 5
     stamps yield a usable sigma, otherwise ``fallback_px`` unchanged.
     """
-    table = find_peaks(
-        sci,
-        threshold=med + _FWHM_PEAK_SIGMA * sd,
-        box_size=15,
-        border_width=_FWHM_STAMP_HALF_WIDTH + 2,
-        npeaks=4000,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NoDetectionsWarning)
+        table = find_peaks(
+            sci,
+            threshold=med + _FWHM_PEAK_SIGMA * sd,
+            box_size=15,
+            border_width=_FWHM_STAMP_HALF_WIDTH + 2,
+            npeaks=4000,
+        )
     if table is None or len(table) < _FWHM_MIN_VALID_STAMPS:
         return fallback_px
 
@@ -206,7 +210,9 @@ def detect_stars_for_rung(
         brightest=rung.max_stars * 2,
         exclude_border=True,
     )
-    sources = finder(sci - background_med)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NoDetectionsWarning)
+        sources = finder(sci - background_med)
     if sources is None or len(sources) < _MIN_RAW_DETECTIONS:
         return ()
 

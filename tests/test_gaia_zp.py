@@ -86,8 +86,8 @@ def _synthetic_catalog(
             "FLUXERR_AUTO": (flux * 0.01).astype(np.float32),
             "MAG_AUTO": mag_auto.astype(np.float32),
             "MAGERR_AUTO": np.full(n, 0.01, dtype=np.float32),
-            "MAG_APER": np.tile(mag_auto[:, None], (1, 2)).astype(np.float32),
-            "MAGERR_APER": np.full((n, 2), 0.01, dtype=np.float32),
+            "MAG_APER": np.tile(mag_auto[:, None], (1, 5)).astype(np.float32),
+            "MAGERR_APER": np.full((n, 5), 0.01, dtype=np.float32),
             "FLUX_MAX": (flux * 3).astype(np.float32),
             "FLAGS": np.zeros(n, dtype=np.int32),
             "IMAFLAGS_ISO": np.zeros(n, dtype=np.int32),
@@ -436,6 +436,12 @@ def test_calibrate_frame_zp_is_true_zero_point_not_offset(tmp_path):
         instrumental_zp=20.0,
         gaia_zp_refmag_max=100.0,
         gaia_gmax=100.0,  # this test's synthetic G mags run ~21-25, unrelated to a real sky scale
+        # This test pins the MAG_AUTO/instrumental_zp scalar-ZP semantics
+        # specifically (it mutates MAG_AUTO post-construction without a
+        # matching MAG_APER), not the aperture/colour/surface model.
+        gaia_zp_aperture_arcsec=0.0,
+        gaia_zp_color_term=False,
+        gaia_zp_surface_order=0,
     )
     catalog = _synthetic_catalog(60, seed=7)
     flux = np.asarray(catalog["FLUX_AUTO"], dtype=float)
@@ -501,6 +507,12 @@ def test_calibrate_frame_bright_cut_excludes_faint_reference_stars(tmp_path):
         # query-time gmax pre-filter so only gaia_zp_refmag_max (applied
         # later, on REFMAG) is under test here.
         gaia_gmax=100.0,
+        # This test pins the MAG_AUTO/instrumental_zp scalar-ZP semantics
+        # specifically (it mutates MAG_AUTO post-construction without a
+        # matching MAG_APER), not the aperture/colour/surface model.
+        gaia_zp_aperture_arcsec=0.0,
+        gaia_zp_color_term=False,
+        gaia_zp_surface_order=0,
     )
     catalog = _synthetic_catalog(60, seed=9)
     flux = np.asarray(catalog["FLUX_AUTO"], dtype=float)
@@ -589,3 +601,150 @@ def test_header_cards_uses_none_sentinel_when_uncalibrated():
     cards = {k: v for k, v, _c in gaia_zp.header_cards(gzp)}
     assert cards["ZPABS"] == "NONE"
     assert cards["ZPABSCAL"] is False
+
+
+# ---------------------------------------------------------------------------
+# fit_zero_point_model: colour term / planar surface / surface_order==0
+# ---------------------------------------------------------------------------
+
+
+def test_fit_zero_point_model_recovers_color_term():
+    rng = np.random.default_rng(11)
+    n = 400
+    bp_rp = rng.uniform(0.3, 2.0, n)
+    c0_true = float(np.median(bp_rp))
+    a_true, b_true = 25.0, -0.15
+    diffs = a_true + b_true * (bp_rp - c0_true) + rng.normal(0, 0.01, n)
+    x = rng.uniform(0, 800, n)
+    y = rng.uniform(0, 800, n)
+    model = gaia_zp.fit_zero_point_model(
+        x, y, diffs, bp_rp, sigma=3.0, color_term=True, surface_order=0,
+        naxis1=800, naxis2=800,
+    )
+    assert model.zp == pytest.approx(a_true, abs=0.02)
+    assert model.color_coef == pytest.approx(b_true, abs=0.02)
+    assert model.c0 == pytest.approx(c0_true, abs=1e-9)
+    assert model.surface_coef == ()
+    assert model.surface_order == 0
+    assert model.n >= int(0.9 * n)
+
+
+def test_fit_zero_point_model_recovers_planar_surface():
+    rng = np.random.default_rng(12)
+    n = 500
+    naxis1 = naxis2 = 1000
+    x = rng.uniform(0, naxis1, n)
+    y = rng.uniform(0, naxis2, n)
+    xs = (x - naxis1 / 2.0) / (naxis1 / 2.0)
+    ys = (y - naxis2 / 2.0) / (naxis2 / 2.0)
+    a_true, sx_true, sy_true = 25.0, 0.05, -0.03
+    diffs = a_true + sx_true * xs + sy_true * ys + rng.normal(0, 0.01, n)
+    model = gaia_zp.fit_zero_point_model(
+        x, y, diffs, None, sigma=3.0, color_term=False, surface_order=1,
+        naxis1=naxis1, naxis2=naxis2,
+    )
+    assert model.zp == pytest.approx(a_true, abs=0.02)
+    assert model.surface_coef[0] == pytest.approx(sx_true, abs=0.02)
+    assert model.surface_coef[1] == pytest.approx(sy_true, abs=0.02)
+    assert model.surface_order == 1
+    assert model.color_coef is None
+    assert model.c0 is None
+
+
+def test_fit_zero_point_model_surface_order_zero_matches_fit_zero_point():
+    rng = np.random.default_rng(13)
+    diffs = 24.5 + rng.normal(0, 0.02, 150)
+    x = rng.uniform(0, 500, 150)
+    y = rng.uniform(0, 500, 150)
+    direct = gaia_zp.fit_zero_point(diffs, sigma=3.0)
+    model = gaia_zp.fit_zero_point_model(
+        x, y, diffs, None, sigma=3.0, color_term=False, surface_order=0,
+        naxis1=500, naxis2=500,
+    )
+    assert model.zp == direct.zp
+    assert model.err == direct.err
+    assert model.rms == direct.rms
+    assert model.n == direct.n
+    assert model.color_coef is None
+    assert model.c0 is None
+    assert model.surface_coef == ()
+    assert model.surface_order == 0
+
+
+def test_fit_zero_point_model_rejects_bad_surface_order():
+    with pytest.raises(ValueError, match="surface_order"):
+        gaia_zp.fit_zero_point_model(
+            np.array([1.0]), np.array([1.0]), np.array([25.0]), None,
+            sigma=3.0, color_term=False, surface_order=3, naxis1=100, naxis2=100,
+        )
+
+
+# ---------------------------------------------------------------------------
+# calibrate_frame: invalid aperture, and MAG_CALIB for unmatched stars
+# ---------------------------------------------------------------------------
+
+
+def test_calibrate_frame_invalid_aperture_raises(tmp_path):
+    profile = _profile(gaia_transform={"R": "sdss_r"})
+    settings = _settings(gaia_zp_aperture_arcsec=3.5)  # not in aperture_radii_arcsec
+    catalog = _synthetic_catalog(10)
+    header = _sci_header()
+
+    with pytest.raises(ValueError, match="gaia_zp_aperture_arcsec"):
+        gaia_zp.calibrate_frame(
+            catalog,
+            header=header,
+            wcs=None,
+            settings=settings,
+            profile=profile,
+            gain_e_per_adu=None,
+            scale=0.55,
+            filter_name="R",
+            cache_dir=tmp_path,
+            query_fn=lambda *_args: _fake_gaia_table(catalog, true_zp=24.0),
+        )
+
+
+def test_calibrate_frame_mag_calib_zero_colour_for_unmatched_stars(tmp_path):
+    """A catalogue star with no Gaia cross-match still gets MAG_CALIB, with
+    the colour term contributing exactly 0 (surface_order=0 isolates this:
+    MAG_CALIB - MAG_AUTO must equal the fitted scalar "a" alone)."""
+    profile = _profile(gaia_transform={"R": "sdss_r"})
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=0.5,
+        zp_sigma_clip=3.0,
+        gaia_zp_refmag_max=100.0,
+        gaia_gmax=100.0,
+        gaia_zp_aperture_arcsec=0.0,
+        gaia_zp_surface_order=0,
+    )
+    catalog = _synthetic_catalog(60, seed=21)
+    gaia_full = _fake_gaia_table(catalog, true_zp=24.0, noise=0.01, seed=210)
+    # Drop the last 10 sources: those 10 catalogue stars cross-match nothing
+    # (GAIA_SOURCE_ID stays 0, colour is unavailable for them).
+    gaia = gaia_full[:-10]
+    header = _sci_header()
+
+    gzp, out = gaia_zp.calibrate_frame(
+        catalog,
+        header=header,
+        wcs=None,
+        settings=settings,
+        profile=profile,
+        gain_e_per_adu=None,
+        scale=0.55,
+        filter_name="R",
+        cache_dir=tmp_path,
+        query_fn=lambda *_args: gaia,
+    )
+    assert gzp.calibrated
+    assert gzp.color_coef is not None
+
+    unmatched = np.asarray(out["GAIA_SOURCE_ID"]) == 0
+    assert unmatched.sum() >= 5
+
+    raw_offset = gzp.zp - settings.photometry.instrumental_zp  # "a"; no surface at order 0
+    mag_auto = np.asarray(out["MAG_AUTO"], dtype=float)
+    mag_calib = np.asarray(out["MAG_CALIB"], dtype=float)
+    assert np.allclose(mag_calib[unmatched], mag_auto[unmatched] + raw_offset, atol=1e-4)

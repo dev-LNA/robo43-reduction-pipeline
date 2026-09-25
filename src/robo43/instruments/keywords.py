@@ -54,6 +54,8 @@ DEFAULT_IMAGETYP_MAP: dict[str, str] = {
     "dome flat": "flat",
     "sky flat": "flat",
     "twilight flat": "flat",
+    "focus frame": "focus",
+    "focus": "focus",
 }
 
 #: Fallback substring classifier used when IMAGETYP is absent or unmapped:
@@ -64,5 +66,13 @@ OBJECT_TYPE_PATTERNS: dict[str, tuple[str, ...]] = {
     "bias": ("bias", "zero"),
     "dark": ("dark",),
     "flat": ("flat", "sky flat", "twilight", "dome flat"),
+    "focus": ("focus",),
     "science": (),
+}
+
+#: Internal frame_type (bias/dark/flat/focus/science) -> the pipeline's
+#: canonical, user-facing IMAGETYP vocabulary. Never "BIAS" -- bias frames
+#: are always "ZERO".
+CANONICAL_IMAGETYP: dict[str, str] = {
+    "bias": "ZERO", "dark": "DARK", "flat": "FLAT", "focus": "FOCUS", "science": "OBJECT",
 }

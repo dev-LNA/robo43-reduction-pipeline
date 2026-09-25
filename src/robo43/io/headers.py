@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,7 +18,7 @@ import astropy.units as u
 import numpy as np
 from astropy.coordinates import AltAz, Angle, EarthLocation, SkyCoord
 from astropy.time import Time
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from robo43.exceptions import MetadataError
@@ -125,14 +126,31 @@ def _axis_to_degrees(value: Any, *, unit: u.UnitBase) -> float | None:
     raise TypeError(msg)
 
 
+def classify_from_object(object_text: str | None) -> str | None:
+    """Classify a frame from its OBJECT value alone, ignoring IMAGETYP.
+
+    Returns "bias"/"dark"/"flat"/"focus"/"science", or None when object_text
+    is empty or None. Case-insensitive substring match against
+    OBJECT_TYPE_PATTERNS; "science" is the default when nothing matches.
+    """
+    if not object_text:
+        return None
+    lowered = object_text.lower()
+    for category in ("bias", "dark", "flat", "focus"):
+        substrings = OBJECT_TYPE_PATTERNS.get(category, ())
+        if any(sub in lowered for sub in substrings):
+            return category
+    return "science"
+
+
 def classify_frame_type(
     header: fits.Header, profile: InstrumentProfile, *, object_value: str | None = None
 ) -> tuple[str | None, Source]:
-    """Classify a frame as bias/dark/flat/science.
+    """Classify a frame as bias/dark/flat/focus/science.
 
     IMAGETYP (via the profile's alias-then-map lookup) wins whenever present
-    and mappable. Only falls back to OBJECT substring matching when IMAGETYP
-    is absent or unmappable.
+    and mappable. Only falls back to OBJECT substring matching (via
+    classify_from_object) when IMAGETYP is absent or unmappable.
     """
     raw_imagetyp, imagetyp_origin = _find_alias_value(header, profile, "imagetyp")
     if raw_imagetyp is not None:
@@ -147,16 +165,10 @@ def classify_frame_type(
         raw_object, _origin = _find_alias_value(header, profile, "object")
         object_text = str(raw_object) if raw_object is not None else None
 
-    if not object_text:
+    category = classify_from_object(object_text)
+    if category is None:
         return None, Source.DEFAULT
-
-    lowered = object_text.lower()
-    for category in ("bias", "dark", "flat"):
-        substrings = OBJECT_TYPE_PATTERNS.get(category, ())
-        if any(sub in lowered for sub in substrings):
-            return category, Source.DERIVED
-
-    return "science", Source.DERIVED
+    return category, Source.DERIVED
 
 
 def derive_pixel_scale(
@@ -186,7 +198,9 @@ def derive_pixel_scale(
 
     if profile.trust_header_wcs:
         try:
-            wcs = WCS(header)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                wcs = WCS(header)
             if wcs.has_celestial:
                 scales_deg = proj_plane_pixel_scales(wcs)
                 scale_arcsec = float(np.mean(scales_deg) * 3600.0)

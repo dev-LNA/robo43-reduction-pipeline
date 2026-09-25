@@ -416,7 +416,7 @@ def reduce_frame(
         (
             "MEDGAIN",
             float(np.nanmedian(data)),
-            "median right after gain conversion (before flat/mask/cosmics)",
+            "median after gain step (pre-flat)",
         )
     )
 

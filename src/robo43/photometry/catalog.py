@@ -56,6 +56,7 @@ downstream.
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -67,13 +68,14 @@ from astropy.stats import SigmaClip
 from astropy.table import Table
 from astropy.wcs.utils import proj_plane_pixel_scales
 from photutils.background import Background2D, MedianBackground
-from scipy.ndimage import binary_dilation
 from photutils.segmentation import (
     SourceCatalog,
     deblend_sources,
     detect_sources,
     make_2dgaussian_kernel,
 )
+from photutils.utils.exceptions import NoDetectionsWarning
+from scipy.ndimage import binary_dilation
 
 import robo43
 from robo43.astrometry.centroids import estimate_background, measure_fwhm
@@ -376,12 +378,14 @@ def measure_sources(
     subtracted = sci.astype(np.float64) - bkg.background
     convolved = convolve(subtracted, kernel)
 
-    segm = detect_sources(
-        convolved,
-        threshold=ps.detect_thresh * bkg.background_rms,
-        npixels=ps.detect_minarea,
-        mask=bad_mask,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NoDetectionsWarning)
+        segm = detect_sources(
+            convolved,
+            threshold=ps.detect_thresh * bkg.background_rms,
+            npixels=ps.detect_minarea,
+            mask=bad_mask,
+        )
 
     n_aper = len(ps.aperture_radii_arcsec)
 

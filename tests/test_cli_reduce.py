@@ -100,7 +100,7 @@ def _write_synthetic_frame(
     hdu.header["NAXIS1"] = shape[1]
     hdu.header["NAXIS2"] = shape[0]
     hdu.header["GAIN"] = 2.0
-    hdu.header["READNOISE"] = 5.0
+    hdu.header["RDNOISE"] = 5.0
     hdu.header["SATURATE"] = 60000.0
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -736,7 +736,7 @@ def _write_frame_with_level(
     hdu.header["NAXIS1"] = shape[1]
     hdu.header["NAXIS2"] = shape[0]
     hdu.header["GAIN"] = 2.0
-    hdu.header["READNOISE"] = 5.0
+    hdu.header["RDNOISE"] = 5.0
     hdu.header["SATURATE"] = 60000.0
     path.parent.mkdir(parents=True, exist_ok=True)
     hdu.writeto(path, overwrite=True)
