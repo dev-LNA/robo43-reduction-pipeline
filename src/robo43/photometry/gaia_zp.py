@@ -13,6 +13,27 @@ here is additive: new ``REFMAG``/``REFMAGERR``/``GAIA_SOURCE_ID``/
 *only* when a zero point was actually fit, and a handful of SCI-header cards
 (``ZPABS*``, ``ZPTnn``).
 
+The Gaia cone query is bounded two ways an unfiltered query is not: a
+magnitude limit (``settings.photometry.gaia_gmax``, applied server-side and
+re-applied locally on whatever comes back) and a per-service timeout
+(``gaia_query_timeout_s``). ``settings.photometry.gaia_catalog`` selects
+which service is tried first -- ``"vizier"`` (VizieR's I/355/gaiadr3, fast
+because the magnitude cut is a server-side column filter) or ``"esa"`` (the
+ESA Gaia archive over ADQL, launched in the background and polled so it can
+be aborted on timeout) -- and the other service is tried as a fallback on
+any failure. An unfiltered cone against the live ESA archive holds on the
+order of 1.6e6 sources per square degree and was still EXECUTING after 8
+minutes in testing; both services failing degrades to "calibration
+unavailable" rather than raising or hanging. Gaia DR3 XP synthetic
+photometry (path (a) below) is likewise bounded: at most
+``gaia_xp_max_stars`` cross-matched, ``FLAGS == 0`` sources are ever sent to
+gaiaxpy, brightest ``G`` first, and the request is subject to its own
+timeout (``gaia_xp_timeout_s``) -- an unbounded request queries gaiaxpy for
+every Gaia source in the cone. Only the zero-point fit itself (and its
+per-tile/spatial diagnostics) is further restricted to reference stars
+brighter than ``gaia_zp_refmag_max``; ``REFMAG``/``REFMAGERR`` are still
+populated for every cross-matched source regardless of that cut.
+
 Reference-magnitude order (design requirement 1):
 
     (a) Gaia DR3 XP low-resolution-spectra synthetic photometry, in the
@@ -34,9 +55,13 @@ A filter with neither mapping degrades to "calibration unavailable"
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import re
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -193,26 +218,179 @@ def transform_mag(
 # ---------------------------------------------------------------------------
 
 
-def _cache_key(ra_deg: float, dec_deg: float, radius_deg: float) -> str:
-    """One cache key per rounded (ra, dec, radius) triple -- see the module
-    docstring: 45 frames of the same field share one cache file."""
-    return f"gaia_{ra_deg:.3f}_{dec_deg:.3f}_{radius_deg:.3f}"
+def _cache_key(ra_deg: float, dec_deg: float, radius_deg: float, gmax: float) -> str:
+    """One cache key per rounded (ra, dec, radius, gmax) quadruple -- see the
+    module docstring: 45 frames of the same field share one cache file, and
+    a changed magnitude limit never reuses a cache built under a different
+    one."""
+    return f"gaia_{ra_deg:.3f}_{dec_deg:.3f}_{radius_deg:.3f}_g{gmax:.2f}"
 
 
-def _default_gaia_cone_query(ra_deg: float, dec_deg: float, radius_deg: float) -> Table:
-    """Live ADQL cone search against the Gaia archive. Imported lazily so
-    tests never need astroquery or network access -- they inject their own
-    ``query_fn`` instead."""
+#: VizieR I/355/gaiadr3 column -> canonical :data:`_GAIA_QUERY_COLUMNS` name
+#: (tested mapping; ``ref_epoch`` has no VizieR source column and is added
+#: as the constant :data:`_VIZIER_REF_EPOCH_JYEAR` instead).
+_VIZIER_COLUMN_MAP: dict[str, str] = {
+    "Source": "source_id",
+    "RA_ICRS": "ra",
+    "DE_ICRS": "dec",
+    "pmRA": "pmra",
+    "pmDE": "pmdec",
+    "Gmag": "phot_g_mean_mag",
+    "BPmag": "phot_bp_mean_mag",
+    "RPmag": "phot_rp_mean_mag",
+    "RUWE": "ruwe",
+    "E(BP/RP)": "phot_bp_rp_excess_factor",
+    "Dup": "duplicated_source",
+}
+
+_VIZIER_GAIADR3_CATALOG = "I/355/gaiadr3"
+
+#: Gaia DR3 reference epoch; VizieR's I/355/gaiadr3 carries no per-row epoch
+#: column, so every row is given this same constant (matching the ESA
+#: archive's ``ref_epoch`` for DR3).
+_VIZIER_REF_EPOCH_JYEAR = 2016.0
+
+
+def _column_to_float_array(column: Any) -> np.ndarray:
+    """A VizieR result column as a plain float ``ndarray``; a masked
+    (missing-value) column's masked entries become NaN."""
+    if hasattr(column, "filled"):
+        return np.asarray(column.filled(np.nan), dtype=float)
+    return np.asarray(column, dtype=float)
+
+
+def _vizier_table_to_gaia_columns(vizier_table: Table) -> Table:
+    """Rename/cast one VizieR I/355/gaiadr3 result to :data:`_GAIA_QUERY_COLUMNS`
+    (:data:`_VIZIER_COLUMN_MAP`): masked (missing) float values become NaN,
+    ``source_id`` becomes int64, ``duplicated_source`` becomes bool, and a
+    constant ``ref_epoch`` (:data:`_VIZIER_REF_EPOCH_JYEAR`) is added.
+    """
+    n = len(vizier_table)
+    out = Table()
+    for src_col, dst_col in _VIZIER_COLUMN_MAP.items():
+        column = vizier_table[src_col]
+        if dst_col == "source_id":
+            out[dst_col] = np.asarray(column, dtype=np.int64)
+        elif dst_col == "duplicated_source":
+            out[dst_col] = np.asarray(column).astype(bool)
+        else:
+            out[dst_col] = _column_to_float_array(column)
+    out["ref_epoch"] = np.full(n, _VIZIER_REF_EPOCH_JYEAR)
+    return out[list(_GAIA_QUERY_COLUMNS)]
+
+
+def _default_gaia_vizier_query(
+    ra_deg: float, dec_deg: float, radius_deg: float, *, gmax: float, timeout_s: float
+) -> Table:
+    """VizieR cone search against I/355/gaiadr3, magnitude-limited
+    server-side at ``Gmag < gmax`` -- tested at ~45s for G<17 over a 1.06 deg
+    cone (38,778 rows), versus an unbounded ESA archive cone that was still
+    EXECUTING after 8 minutes. Imported lazily -- see module docstring."""
+    from astroquery.vizier import Vizier
+
+    vizier = Vizier(
+        columns=list(_VIZIER_COLUMN_MAP),
+        column_filters={"Gmag": f"<{gmax}"},
+        row_limit=-1,
+        timeout=timeout_s,
+    )
+    result = vizier.query_region(
+        SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg),
+        radius=radius_deg * u.deg,
+        catalog=_VIZIER_GAIADR3_CATALOG,
+    )
+    if len(result) == 0:
+        return Table({name: [] for name in _GAIA_QUERY_COLUMNS})
+    return _vizier_table_to_gaia_columns(result[0])
+
+
+def _default_gaia_esa_query(
+    ra_deg: float, dec_deg: float, radius_deg: float, *, gmax: float, timeout_s: float
+) -> Table:
+    """Live ADQL cone search against the ESA Gaia archive, magnitude-limited
+    (``phot_g_mean_mag < gmax``) and time-bounded: the job runs in the
+    background and is polled, and is aborted and reported as a failure if it
+    has not completed within ``timeout_s`` -- an unbounded query against
+    this cone was still EXECUTING after 8 minutes in testing. Imported
+    lazily so tests never need astroquery or network access -- they inject
+    their own ``query_fn`` instead."""
     from astroquery.gaia import Gaia
 
     cols = ", ".join(_GAIA_QUERY_COLUMNS)
     adql = (
         f"SELECT {cols} FROM gaiadr3.gaia_source WHERE "
         f"1=CONTAINS(POINT('ICRS', ra, dec), "
-        f"CIRCLE('ICRS', {ra_deg}, {dec_deg}, {radius_deg}))"
+        f"CIRCLE('ICRS', {ra_deg}, {dec_deg}, {radius_deg})) "
+        f"AND phot_g_mean_mag < {gmax}"
     )
-    job = Gaia.launch_job_async(adql)
-    return job.get_results()
+    job = Gaia.launch_job_async(adql, background=True)
+    start = time.monotonic()
+    while True:
+        phase = job.get_phase(update=True)
+        if phase == "COMPLETED":
+            return job.get_results()
+        if phase in ("ERROR", "ABORTED"):
+            msg = f"ESA Gaia archive job finished in phase {phase!r}"
+            raise RuntimeError(msg)
+        if time.monotonic() - start > timeout_s:
+            with contextlib.suppress(Exception):
+                job.abort()
+            msg = f"ESA Gaia archive query exceeded the {timeout_s}s timeout"
+            raise TimeoutError(msg)
+        time.sleep(2.0)
+
+
+#: service name -> query function, both ``(ra_deg, dec_deg, radius_deg, *,
+#: gmax, timeout_s) -> Table``.
+_GAIA_SERVICES: dict[str, Callable[..., Table]] = {
+    "vizier": _default_gaia_vizier_query,
+    "esa": _default_gaia_esa_query,
+}
+
+
+def _default_gaia_cone_query(
+    ra_deg: float,
+    dec_deg: float,
+    radius_deg: float,
+    *,
+    catalog: str,
+    gmax: float,
+    timeout_s: float,
+) -> Table:
+    """Live cone search against the configured Gaia service
+    (:data:`_GAIA_SERVICES`), falling back to the other service on any
+    failure (a query error, a timed-out job). Re-raises the second
+    service's exception if both fail; :func:`calibrate_frame` turns that
+    into a logged "calibration unavailable" rather than letting it escape.
+    Tests inject their own ``query_fn`` and never reach this function.
+    """
+    order = [catalog, *[name for name in _GAIA_SERVICES if name != catalog]]
+    last_exc: Exception | None = None
+    for name in order:
+        try:
+            return _GAIA_SERVICES[name](
+                ra_deg, dec_deg, radius_deg, gmax=gmax, timeout_s=timeout_s
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gaia cone query via %r failed (%s); trying the other service", name, exc
+            )
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
+def _apply_gmax_cut(table: Table, gmax: float) -> Table:
+    """Drop rows with a NaN or >= ``gmax`` ``phot_g_mean_mag``, so an
+    injected test fake -- or any query result -- honours the configured
+    magnitude limit even if it did not filter server-side. A table with no
+    ``phot_g_mean_mag`` column (an injected fake carrying only the columns
+    its test needs) passes through unchanged.
+    """
+    if "phot_g_mean_mag" not in table.colnames:
+        return table
+    g = np.asarray(table["phot_g_mean_mag"], dtype=float)
+    return table[np.isfinite(g) & (g < gmax)]
 
 
 def query_gaia_cone(
@@ -222,28 +400,38 @@ def query_gaia_cone(
     *,
     cache_dir: Path,
     query_fn: QueryFn | None = None,
+    gmax: float = 17.0,
+    catalog: str = "vizier",
+    timeout_s: float = 300.0,
 ) -> Table:
     """Cone search around ``(ra_deg, dec_deg)``, cached on disk under ``cache_dir``.
 
-    One query per rounded ``(ra, dec, radius)`` triple, so 45 frames of one
-    field query the archive exactly once. ``query_fn`` defaults to a live
-    astroquery call; passing a fake makes this fully offline-testable.
+    One query per rounded ``(ra, dec, radius, gmax)`` quadruple, so 45 frames
+    of one field query the archive exactly once. ``query_fn`` defaults to a
+    live astroquery call against ``catalog`` (``"vizier"`` or ``"esa"``,
+    falling back to the other on failure -- see
+    :func:`_default_gaia_cone_query`); passing a fake makes this fully
+    offline-testable. The ``gmax`` magnitude cut is re-applied locally on
+    whatever ``query_fn`` returns (see :func:`_apply_gmax_cut`), whether
+    freshly fetched or read back from the cache.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{_cache_key(ra_deg, dec_deg, radius_deg)}.fits"
+    cache_path = cache_dir / f"{_cache_key(ra_deg, dec_deg, radius_deg, gmax)}.fits"
     if cache_path.exists():
         logger.info("Gaia cone cache hit: %s", cache_path)
-        return Table.read(cache_path)
-
-    fn = query_fn or _default_gaia_cone_query
-    table = fn(ra_deg, dec_deg, radius_deg)
-    try:
-        table.write(cache_path, format="fits", overwrite=True)
-    except Exception as exc:
-        # A cache-write failure must not fail the calibration.
-        logger.warning("failed to write Gaia cone cache %s: %s", cache_path, exc)
-    return table
+        table = Table.read(cache_path)
+    else:
+        fn = query_fn or functools.partial(
+            _default_gaia_cone_query, catalog=catalog, gmax=gmax, timeout_s=timeout_s
+        )
+        table = fn(ra_deg, dec_deg, radius_deg)
+        try:
+            table.write(cache_path, format="fits", overwrite=True)
+        except Exception as exc:
+            # A cache-write failure must not fail the calibration.
+            logger.warning("failed to write Gaia cone cache %s: %s", cache_path, exc)
+    return _apply_gmax_cut(table, gmax)
 
 
 def propagate_epoch(table: Table, target_epoch_jyear: float) -> Table:
@@ -353,15 +541,20 @@ def xp_synthetic_mags(
     cache_dir: Path,
     cache_key: str,
     generate_fn: Callable[[list[int]], Any] | None = None,
+    timeout_s: float = 300.0,
 ) -> Table | None:
     """Gaia DR3 XP synthetic photometry in the JPLUS band ``band`` (path a).
 
     Lazily imports ``gaiaxpy``; returns ``None`` -- never raises -- whenever
-    gaiaxpy is not installed, the archive query fails, or ``band`` cannot
-    be found in the returned columns, so the caller always has a
-    well-defined fallback to the colour-transform path (b). Cached on disk
-    next to the cone-search cache, keyed the same way (one XP query per
-    field).
+    gaiaxpy is not installed, the archive query fails, ``band`` cannot be
+    found in the returned columns, or the request does not complete within
+    ``timeout_s`` (enforced with a one-shot ``ThreadPoolExecutor``, since
+    gaiaxpy's own call offers no timeout of its own), so the caller always
+    has a well-defined fallback to the colour-transform path (b). Cached on
+    disk next to the cone-search cache, keyed the same way (one XP query per
+    field). ``source_ids`` is expected to already be capped by the caller
+    (:func:`resolve_reference_mags`'s ``xp_source_ids``) -- this function
+    requests exactly the ids it is given.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -389,14 +582,18 @@ def xp_synthetic_mags(
                 truncation=False,
             )
 
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        df = fn(source_ids)
+        df = executor.submit(fn, source_ids).result(timeout=timeout_s)
     except Exception as exc:
-        # Any archive/network/gaiaxpy failure degrades gracefully to path (b).
+        # Any archive/network/gaiaxpy failure, or an expired timeout,
+        # degrades gracefully to path (b).
         logger.warning(
             "Gaia XP synthetic photometry query failed (%s); falling back to colour transform", exc
         )
         return None
+    finally:
+        executor.shutdown(wait=False)
 
     located = _find_gaiaxpy_columns(df, band)
     if located is None:
@@ -430,9 +627,19 @@ def resolve_reference_mags(
     allow_xp: bool = True,
     allow_transform: bool = True,
     xp_generate_fn: Callable[[list[int]], Any] | None = None,
+    xp_source_ids: set[int] | None = None,
+    xp_timeout_s: float = 300.0,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, str]:
     """Reference magnitude per row of ``gaia``, in the fixed design order
     (a) XP synthetic photometry, (b) colour transform.
+
+    ``xp_source_ids``, when given, restricts the XP request (path a) to
+    only those ``gaia["source_id"]`` values -- see
+    :func:`_brightest_xp_candidates`, which caps and orders them
+    brightest-first before :func:`calibrate_frame` passes them here; rows
+    of ``gaia`` whose id is not in the set simply get a NaN XP magnitude
+    and fall through to path (b) if nothing else in the table is valid.
+    ``None`` (the default) requests XP for every row, as before.
 
     Returns ``(mag, mag_err, valid_mask, source_label)``; ``mag`` is
     ``None`` (``source_label == "unavailable"``) when neither path applies
@@ -440,12 +647,18 @@ def resolve_reference_mags(
     """
     xp_band = profile.filter_gaia_xp.get(filter_name)
     if allow_xp and xp_band:
+        ids = (
+            [int(v) for v in gaia["source_id"]]
+            if xp_source_ids is None
+            else [int(v) for v in gaia["source_id"] if int(v) in xp_source_ids]
+        )
         xp = xp_synthetic_mags(
-            [int(v) for v in gaia["source_id"]],
+            ids,
             xp_band,
             cache_dir=cache_dir,
             cache_key=cache_key,
             generate_fn=xp_generate_fn,
+            timeout_s=xp_timeout_s,
         )
         if xp is not None:
             lookup = {
@@ -605,6 +818,42 @@ def match_to_gaia(
     good = sep_arcsec <= radius_arcsec
     cat_idx = np.flatnonzero(good)
     return cat_idx, idx[good], sep_arcsec[good]
+
+
+def _brightest_xp_candidates(
+    table: Table,
+    gaia_epoch: Table,
+    cat_idx: np.ndarray,
+    gaia_idx: np.ndarray,
+    *,
+    max_stars: int,
+) -> set[int]:
+    """Gaia ``source_id`` values worth an XP synthetic-photometry request: the
+    brightest (lowest ``phot_g_mean_mag``) ``max_stars`` cross-matched
+    sources with catalogue ``FLAGS == 0``, deduplicated. An unbounded
+    request queries gaiaxpy for every Gaia source in the cone. ``table`` is
+    indexed by ``cat_idx``, ``gaia_epoch`` by ``gaia_idx`` (the
+    :func:`match_to_gaia` outputs); a ``table`` with no ``FLAGS`` column
+    treats every cross-matched source as clean.
+    """
+    if max_stars <= 0 or len(cat_idx) == 0:
+        return set()
+    if "FLAGS" in table.colnames:
+        clean = np.asarray(table["FLAGS"])[cat_idx] == 0
+    else:
+        clean = np.ones(len(cat_idx), dtype=bool)
+    gi = gaia_idx[clean]
+    if gi.size == 0:
+        return set()
+    g_mag = np.asarray(gaia_epoch["phot_g_mean_mag"], dtype=float)[gi]
+    order = np.argsort(g_mag)
+    ids: dict[int, None] = {}
+    for i in order:
+        sid = int(gaia_epoch["source_id"][gi[i]])
+        ids.setdefault(sid, None)
+        if len(ids) >= max_stars:
+            break
+    return set(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -902,9 +1151,23 @@ def calibrate_frame(
         return unavailable, out
     epoch = _frame_epoch_jyear(header)
 
-    gaia = query_gaia_cone(
-        ra_center, dec_center, radius_deg, cache_dir=cache_dir, query_fn=query_fn
-    )
+    try:
+        gaia = query_gaia_cone(
+            ra_center,
+            dec_center,
+            radius_deg,
+            cache_dir=cache_dir,
+            query_fn=query_fn,
+            gmax=ps.gaia_gmax,
+            catalog=ps.gaia_catalog,
+            timeout_s=ps.gaia_query_timeout_s,
+        )
+    except Exception as exc:
+        # Both configured Gaia services failed (or the injected query_fn
+        # raised): absolute calibration is unavailable for this frame, never
+        # a hang or a propagated exception.
+        logger.warning("Gaia cone query failed (%s); absolute calibration unavailable", exc)
+        return unavailable, out
     if len(gaia) == 0:
         return unavailable, out
 
@@ -913,7 +1176,21 @@ def calibrate_frame(
         return unavailable, out
 
     gaia_epoch = propagate_epoch(gaia, epoch)
-    cache_key = _cache_key(ra_center, dec_center, radius_deg)
+    cache_key = _cache_key(ra_center, dec_center, radius_deg, ps.gaia_gmax)
+
+    # Match before resolving reference magnitudes (rather than after, as
+    # earlier): the brightest-first XP source_id cap below needs to know
+    # which Gaia sources are actually cross-matched to a clean catalogue
+    # detection.
+    cat_idx, gaia_idx, sep_arcsec = match_to_gaia(
+        out, gaia_epoch, radius_arcsec=ps.gaia_match_radius_arcsec
+    )
+    if len(cat_idx) == 0:
+        return unavailable, out
+
+    xp_source_ids = _brightest_xp_candidates(
+        out, gaia_epoch, cat_idx, gaia_idx, max_stars=ps.gaia_xp_max_stars
+    )
     ref_mag, ref_mag_err, ref_valid, source_label = resolve_reference_mags(
         gaia_epoch,
         filter_name=filter_name,
@@ -921,23 +1198,11 @@ def calibrate_frame(
         cache_dir=cache_dir,
         cache_key=cache_key,
         xp_generate_fn=xp_generate_fn,
+        xp_source_ids=xp_source_ids,
+        xp_timeout_s=ps.gaia_xp_timeout_s,
     )
     if ref_mag is None:
         return unavailable, out
-
-    cat_idx, gaia_idx, sep_arcsec = match_to_gaia(
-        out, gaia_epoch, radius_arcsec=ps.gaia_match_radius_arcsec
-    )
-    if len(cat_idx) == 0:
-        return GaiaZeroPoint(
-            zp=None,
-            zp_err=None,
-            zp_rms=None,
-            n=0,
-            source=source_label,
-            calibrated=False,
-            filter=filter_name,
-        ), out
 
     keep = ref_valid[gaia_idx]
     cat_idx, gaia_idx, sep_arcsec = cat_idx[keep], gaia_idx[keep], sep_arcsec[keep]
@@ -973,7 +1238,11 @@ def calibrate_frame(
 
     # The zero point itself uses only the stricter reference-star subset
     # (unsaturated/isolated/FLAGS==0 -- quality.reference_sample) that also
-    # has a valid cross-match, per the design ("reuse it for ZP stars").
+    # has a valid cross-match, per the design ("reuse it for ZP stars"),
+    # further restricted to REFMAG < gaia_zp_refmag_max -- only the bright,
+    # high-S/N end of the cross-match drives the fit itself. REFMAG/
+    # REFMAGERR above are written for every cross-matched source regardless
+    # of this cut.
     clean = select_reference_stars(
         out,
         settings=settings,
@@ -983,11 +1252,11 @@ def calibrate_frame(
         scale=scale,
         gain_e_per_adu=gain_e_per_adu,
     )
-    has_ref = (
-        np.isfinite(np.asarray(clean["REFMAG"], dtype=float))
-        if len(clean)
-        else np.array([], dtype=bool)
-    )
+    if len(clean):
+        clean_refmag = np.asarray(clean["REFMAG"], dtype=float)
+        has_ref = np.isfinite(clean_refmag) & (clean_refmag < ps.gaia_zp_refmag_max)
+    else:
+        has_ref = np.array([], dtype=bool)
     clean = clean[has_ref]
 
     if len(clean) == 0:
@@ -1001,6 +1270,15 @@ def calibrate_frame(
             filter=filter_name,
         ), out
 
+    # diffs = REFMAG - MAG_AUTO is an OFFSET, not a zero point: MAG_AUTO
+    # already has settings.photometry.instrumental_zp baked in
+    # (robo43.photometry.catalog._magnitudes computes MAG_AUTO as
+    # instrumental_zp - 2.5*log10(flux)), so offset = median(REFMAG -
+    # MAG_AUTO) is exactly what MAG_AUTO must be shifted by to read as the
+    # Gaia-referenced magnitude. The true zero point -- the magnitude
+    # corresponding to unit flux in the catalogue's own flux units, reported
+    # as GaiaZeroPoint.zp / the ZPABS header card / CatalogMetrics.zp / the
+    # status CSV's zp_abs -- is offset + instrumental_zp.
     diffs = np.asarray(clean["REFMAG"], dtype=float) - np.asarray(clean["MAG_AUTO"], dtype=float)
     fit = fit_zero_point(diffs, sigma=ps.zp_sigma_clip)
     calibrated = (
@@ -1010,9 +1288,10 @@ def calibrate_frame(
         and fit.rms <= ps.zp_rms_max
     )
 
+    offset = fit.zp
     tile_offsets: dict[int, float] = {}
     spatial_range: float | None = None
-    if fit.zp is not None:
+    if offset is not None:
         naxis1 = int(header.get("NAXIS1", 0))
         naxis2 = int(header.get("NAXIS2", 0))
         tiles = parse_tile_slices(header, shape=(naxis2, naxis1))
@@ -1020,13 +1299,17 @@ def calibrate_frame(
             np.asarray(clean["X_IMAGE"], dtype=float) - 1.0
         )  # 1-based -> 0-based, matches tile slices
         y = np.asarray(clean["Y_IMAGE"], dtype=float) - 1.0
+        # zp_global=offset, not the true zero point: diffs (and therefore
+        # the per-tile/spatial fits below) live in offset space, and
+        # instrumental_zp cancels out of every "offset - zp_global"
+        # subtraction per_tile_offsets does internally either way.
         tile_offsets = per_tile_offsets(
-            x, y, diffs, tiles, zp_global=fit.zp, sigma=ps.zp_sigma_clip
+            x, y, diffs, tiles, zp_global=offset, sigma=ps.zp_sigma_clip
         )
         spatial_range = spatial_zp_range(x, y, diffs, naxis1=naxis1, naxis2=naxis2)
 
     gzp = GaiaZeroPoint(
-        zp=fit.zp,
+        zp=(offset + ps.instrumental_zp) if offset is not None else None,
         zp_err=fit.err,
         zp_rms=fit.rms,
         n=fit.n,
@@ -1038,7 +1321,6 @@ def calibrate_frame(
     )
 
     if gzp.calibrated:
-        offset = gzp.zp - ps.instrumental_zp
         zp_err = gzp.zp_err or 0.0
         out["MAG_CALIB"] = (np.asarray(out["MAG_AUTO"], dtype=float) + offset).astype(np.float32)
         out["MAGERR_CALIB"] = np.sqrt(

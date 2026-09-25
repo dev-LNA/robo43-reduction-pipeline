@@ -57,6 +57,33 @@ zp_min_stars = 10
 zp_rms_max = 0.05
 catalog_format = "mef"
 write_catalog = true
+# Gaia DR3 cone-query source for the optional absolutely-calibrated zero
+# point (robo43.photometry.gaia_zp, enabled via --gaia-zp / abs_calibration):
+# "vizier" queries VizieR's I/355/gaiadr3 (fast, magnitude-limited
+# server-side); "esa" queries the ESA Gaia archive directly over ADQL. The
+# configured service is tried first and the other is used as a fallback on
+# any failure or timeout.
+gaia_catalog = "vizier"
+# Only stars brighter than this G magnitude are ever retrieved -- an
+# unbounded cone query holds on the order of 1.6e6 sources per square
+# degree and can run unbounded.
+gaia_gmax = 17.0
+# Per-query network timeout, seconds, for both the vizier and esa services.
+gaia_query_timeout_s = 300.0
+# Cap on how many cross-matched, FLAGS==0 sources are sent to gaiaxpy for
+# XP synthetic photometry (reference-magnitude path (a)), brightest G
+# first -- an unbounded request queries gaiaxpy for every Gaia source in
+# the cone.
+gaia_xp_max_stars = 2000
+# Timeout, seconds, for the batched gaiaxpy XP synthetic-photometry
+# request; on expiry the frame falls back to the Gaia G/BP/RP colour
+# transform exactly like any other XP failure.
+gaia_xp_timeout_s = 300.0
+# Reference stars fainter than this REFMAG never enter the zero-point fit,
+# per-tile offsets, or spatial ZP range -- only the bright, high-S/N end of
+# the cross-match drives the fit itself; REFMAG/REFMAGERR are still
+# written for every cross-matched source regardless of this cut.
+gaia_zp_refmag_max = 16.0
 
 [calib]
 combine_method = "mean"

@@ -4,6 +4,65 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-25 — Gaia zero point (`--gaia-zp`) fixed and tested on T80S
+
+**Branch:** `fix-imagetyp-headers`. **Suite:** 428 passed (`python3 -m pytest -o addopts="" -q`
+prints the summary line; the repo's `-q` addopts hides it otherwise).
+
+### Why `--gaia-zp` hung
+
+- The Gaia cone query had no magnitude limit. The T80S LMC cone (radius 1.06°) holds about 1.6M
+  Gaia sources. The ESA archive never finishes that query, even with a G < 16 limit
+  (still EXECUTING after 8 min).
+- The XP step then asked `gaiaxpy` for spectra on every source in the cone.
+
+### What changed
+
+All in `photometry/gaia_zp.py`; the new settings are in `config.py` and `config.default.toml`.
+
+- The cone query uses **VizieR `I/355/gaiadr3`** by default (`gaia_catalog = "vizier"`), with
+  the ESA archive as fallback. It is limited to `gaia_gmax = 17.0` and has a `gaia_query_timeout_s`
+  timeout. The cache key includes gmax. If both services fail, the frame is marked
+  "unavailable" and nothing raises.
+- XP synthetic photometry is requested only for the `gaia_xp_max_stars = 2000` brightest
+  cross-matched `FLAGS==0` stars, with `gaia_xp_timeout_s`. Matching now runs before
+  reference-magnitude resolution. On failure it falls back to the G/BP/RP colour transform.
+- **ZP semantics bug fixed.** `MAG_AUTO` already includes `instrumental_zp` (20), so
+  median(REFMAG − MAG_AUTO) is an *offset*. `ZPABS`/`zp_abs` now report offset + instrumental_zp,
+  and `MAG_CALIB = MAG_AUTO + offset`. Previously ZPABS read about 8.1, and `MAG_CALIB` would have
+  been 20 mag off whenever a frame passed the RMS gate.
+- Bright-star cut: the ZP fit, the per-tile offsets and the spatial range use only stars with
+  REFMAG < `gaia_zp_refmag_max = 16.0`. Fainter stars in this field scatter 0.13–0.18 mag and
+  carry a blending bias of about +0.06 mag. REFMAG is still written for every match.
+
+### Test on 3 frames of T80S 20251104 (copies; production outputs untouched)
+
+| Frame | ZPABS | N | RMS | SPZPRNG |
+|---|---|---|---|---|
+| 030335 | 28.120 | 1444 | 0.079 | 0.134 |
+| 034524 | 28.139 | 1551 | 0.082 | 0.126 |
+| 043150 | 28.143 | 1284 | 0.077 | 0.145 |
+
+About 3–4 min per frame, of which the VizieR query takes about 50 s. `ZPABSSRC = gaia_gbrp_sdss_r`,
+because the ESA archive returned 503 during testing, so the XP path fell back.
+`ZPABSCAL = False` on all three: RMS 0.08 > `zp_rms_max = 0.05`, so no `MAG_CALIB` is written.
+
+### Open items
+
+1. **ZP spatial gradient of 0.13–0.15 mag** across the T80S field. It dominates the RMS.
+   Check whether it is a flat-field or illumination residual or a colour term. The options are
+   to fix it, to raise `zp_rms_max` to about 0.10 for T80S, or to accept `ZPABSCAL = False`
+   (Gaia is only a consistency check).
+2. **XP path untested live.** The ESA archive returned 503 throughout. Retry once it is up
+   and compare against the colour-transform ZP.
+3. `--gaia-zp` has not yet been run on the full 45-frame night.
+4. `calibrate_frame` does not guard `select_reference_stars` with a try/except (this
+   predates the change).
+5. The earlier open items below still stand: T80S linearity, the doubled log timestamps and the
+   ruff findings.
+
+---
+
 ## 2026-09-24 — saturation flagging fixed, reduce parallelised, T80S night re-reduced
 
 **Branch:** `fix-imagetyp-headers`. **Suite:** 425 passed (`python3 -m pytest -q`).

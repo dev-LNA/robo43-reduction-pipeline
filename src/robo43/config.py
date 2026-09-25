@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 __all__ = [
+    "GAIA_CATALOGS",
     "SCIENCE_SECTIONS",
     "USER_CONFIG_PATH",
     "AstrometrySettings",
@@ -54,6 +55,7 @@ DIAGNOSTIC_LEVELS = ("none", "summary", "full")
 COMBINE_METHODS = ("mean", "median")
 CATALOG_FORMATS = ("mef", "ldac", "both")
 COADD_SCALINGS = ("exptime", "starflux", "none")
+GAIA_CATALOGS = ("vizier", "esa")
 
 #: The sections whose values can change the numbers in a product.  These, and
 #: only these, feed :meth:`Settings.config_hash`.
@@ -145,6 +147,23 @@ class PhotometrySettings:
     abs_calibration: bool = False
     gaia_match_radius_arcsec: float = 2.0
     gaia_ruwe_max: float = 1.4
+    # Cone-query source ("vizier" or "esa" -- see robo43.photometry.gaia_zp)
+    # and bounds: an unfiltered cone query holds ~1.6e6 sources per square
+    # degree and can run unbounded. The configured service is tried first
+    # and the other is used as a fallback on any failure or timeout.
+    gaia_catalog: str = "vizier"
+    gaia_gmax: float = 17.0
+    gaia_query_timeout_s: float = 300.0
+    # Gaia DR3 XP synthetic-photometry request bounds (robo43.photometry.
+    # gaia_zp.resolve_reference_mags path (a)): at most this many
+    # cross-matched, FLAGS==0 sources, brightest G first, are ever sent to
+    # gaiaxpy, subject to their own timeout.
+    gaia_xp_max_stars: int = 2000
+    gaia_xp_timeout_s: float = 300.0
+    # Only reference stars brighter than this REFMAG feed the zero-point
+    # fit, per-tile offsets, and spatial ZP range; REFMAG/REFMAGERR are
+    # still written for every cross-matched source regardless of this cut.
+    gaia_zp_refmag_max: float = 16.0
     catalog_format: str = "mef"
     write_catalog: bool = True
 
@@ -583,6 +602,7 @@ def _validate(settings: Settings) -> None:
         ("diagnostics.level", settings.diagnostics.level, DIAGNOSTIC_LEVELS),
         ("calib.combine_method", settings.calib.combine_method, COMBINE_METHODS),
         ("photometry.catalog_format", settings.photometry.catalog_format, CATALOG_FORMATS),
+        ("photometry.gaia_catalog", settings.photometry.gaia_catalog, GAIA_CATALOGS),
         ("coadd.scale_by", settings.coadd.scale_by, COADD_SCALINGS),
     )
     for where, value, allowed in checks:

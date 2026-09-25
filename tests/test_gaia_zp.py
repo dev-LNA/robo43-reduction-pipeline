@@ -296,7 +296,13 @@ def test_resolve_reference_mags_uses_xp_when_available(tmp_path):
 
 def test_calibrate_frame_recovers_zero_point(tmp_path):
     profile = _profile(gaia_transform={"R": "sdss_r"})
-    settings = _settings(zp_min_stars=5, zp_rms_max=0.1, zp_sigma_clip=3.0)
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=0.1,
+        zp_sigma_clip=3.0,
+        gaia_zp_refmag_max=100.0,
+        gaia_gmax=100.0,  # this test's synthetic G mags run ~37-41, unrelated to a real sky scale
+    )
     catalog = _synthetic_catalog(60, seed=3)
     gaia = _fake_gaia_table(catalog, true_zp=24.0, noise=0.02, seed=30)
     header = _sci_header()
@@ -317,7 +323,9 @@ def test_calibrate_frame_recovers_zero_point(tmp_path):
         query_fn=fake_query,
     )
     assert gzp.calibrated
-    assert gzp.zp == pytest.approx(24.0, abs=0.05)
+    # gzp.zp is the true zero point (offset + instrumental_zp), not the raw
+    # median(REFMAG - MAG_AUTO) offset -- see the ZP-semantics fix.
+    assert gzp.zp == pytest.approx(24.0 + settings.photometry.instrumental_zp, abs=0.05)
     assert gzp.source == "gaia_gbrp_sdss_r"
     assert "MAG_CALIB" in out.colnames
     assert "REFMAG" in out.colnames
@@ -349,7 +357,13 @@ def test_calibrate_frame_rejects_when_too_few_stars(tmp_path):
 
 def test_calibrate_frame_rejects_on_high_rms(tmp_path):
     profile = _profile(gaia_transform={"R": "sdss_r"})
-    settings = _settings(zp_min_stars=5, zp_rms_max=0.001, zp_sigma_clip=3.0)
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=0.001,
+        zp_sigma_clip=3.0,
+        gaia_zp_refmag_max=100.0,
+        gaia_gmax=100.0,  # this test's synthetic G mags run ~37-41, unrelated to a real sky scale
+    )
     catalog = _synthetic_catalog(60, seed=5)
     gaia = _fake_gaia_table(catalog, true_zp=24.0, noise=0.02, seed=50)
     header = _sci_header()
@@ -373,7 +387,13 @@ def test_calibrate_frame_rejects_on_high_rms(tmp_path):
 
 def test_calibrate_frame_per_tile_offsets(tmp_path):
     profile = _profile(gaia_transform={"R": "sdss_r"})
-    settings = _settings(zp_min_stars=5, zp_rms_max=1.0, zp_sigma_clip=5.0)
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=1.0,
+        zp_sigma_clip=5.0,
+        gaia_zp_refmag_max=100.0,
+        gaia_gmax=100.0,  # this test's synthetic G mags run ~37-41, unrelated to a real sky scale
+    )
     catalog = _synthetic_catalog(80, seed=6, naxis1=800, naxis2=100)
     gaia = _fake_gaia_table(catalog, true_zp=24.0)
     header = _sci_header(
@@ -399,6 +419,162 @@ def test_calibrate_frame_per_tile_offsets(tmp_path):
     # injected offset, so any recovered per-tile offset should be small.
     for offset in gzp.tile_offsets.values():
         assert abs(offset) < 0.1
+
+
+def test_calibrate_frame_zp_is_true_zero_point_not_offset(tmp_path):
+    """ZP-semantics pin: MAG_AUTO already has instrumental_zp baked in, so
+    median(REFMAG - MAG_AUTO) is an OFFSET, and GaiaZeroPoint.zp/MAG_CALIB
+    must use it correctly rather than being off by instrumental_zp. With
+    MAG_AUTO = 20 - 2.5*log10(F) and REFMAG = 28 - 2.5*log10(F) for every
+    star, the fit must recover zp == 28 exactly and MAG_CALIB == REFMAG.
+    """
+    profile = _profile(gaia_transform={"R": "sdss_r"})
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=0.5,
+        zp_sigma_clip=3.0,
+        instrumental_zp=20.0,
+        gaia_zp_refmag_max=100.0,
+        gaia_gmax=100.0,  # this test's synthetic G mags run ~21-25, unrelated to a real sky scale
+    )
+    catalog = _synthetic_catalog(60, seed=7)
+    flux = np.asarray(catalog["FLUX_AUTO"], dtype=float)
+    catalog["MAG_AUTO"] = (20.0 - 2.5 * np.log10(flux)).astype(np.float32)
+    true_refmag = 28.0 - 2.5 * np.log10(flux)
+
+    # bp_rp == 0 makes transform_mag's polynomial reduce to its constant
+    # term, so g_mag - poly(0) == g_mag - poly0 recovers true_refmag exactly
+    # when g_mag = true_refmag + poly0.
+    xf = gaia_zp.GAIA_TRANSFORMS["sdss_r"]
+    g_mag = true_refmag + xf.coeffs[0]
+    n = len(catalog)
+    gaia = Table(
+        {
+            "source_id": np.arange(1000, 1000 + n, dtype=np.int64),
+            "ra": np.asarray(catalog["ALPHA_J2000"], dtype=float),
+            "dec": np.asarray(catalog["DELTA_J2000"], dtype=float),
+            "ref_epoch": np.full(n, 2016.0),
+            "pmra": np.zeros(n),
+            "pmdec": np.zeros(n),
+            "phot_g_mean_mag": g_mag,
+            "phot_bp_mean_mag": g_mag,
+            "phot_rp_mean_mag": g_mag,
+            "ruwe": np.full(n, 1.0),
+            "phot_bp_rp_excess_factor": np.full(n, 1.1),
+            "duplicated_source": np.zeros(n, dtype=bool),
+        }
+    )
+    header = _sci_header()
+
+    gzp, out = gaia_zp.calibrate_frame(
+        catalog,
+        header=header,
+        wcs=None,
+        settings=settings,
+        profile=profile,
+        gain_e_per_adu=None,
+        scale=0.55,
+        filter_name="R",
+        cache_dir=tmp_path,
+        query_fn=lambda *_args: gaia,
+    )
+    assert gzp.calibrated
+    assert gzp.zp == pytest.approx(28.0, abs=1e-3)
+    refmag_col = np.asarray(out["REFMAG"])
+    mag_calib_col = np.asarray(out["MAG_CALIB"])
+    finite = np.isfinite(refmag_col)
+    assert finite.sum() > 0
+    assert np.allclose(mag_calib_col[finite], refmag_col[finite], atol=1e-3)
+
+
+def test_calibrate_frame_bright_cut_excludes_faint_reference_stars(tmp_path):
+    """gaia_zp_refmag_max restricts the ZP fit to REFMAG < the cut; REFMAG
+    is still written for every cross-matched source regardless."""
+    profile = _profile(gaia_transform={"R": "sdss_r"})
+    settings = _settings(
+        zp_min_stars=5,
+        zp_rms_max=0.5,
+        zp_sigma_clip=3.0,
+        instrumental_zp=20.0,
+        gaia_zp_refmag_max=16.0,
+        # this test's faint-group synthetic G mags run ~33-37: disable the
+        # query-time gmax pre-filter so only gaia_zp_refmag_max (applied
+        # later, on REFMAG) is under test here.
+        gaia_gmax=100.0,
+    )
+    catalog = _synthetic_catalog(60, seed=9)
+    flux = np.asarray(catalog["FLUX_AUTO"], dtype=float)
+    catalog["MAG_AUTO"] = (20.0 - 2.5 * np.log10(flux)).astype(np.float32)
+
+    n = len(catalog)
+    half = n // 2
+    refmag = np.empty(n)
+    refmag[:half] = 16.0 - 2.5 * np.log10(flux[:half])  # true zp 16, below the 16.0 cut
+    refmag[half:] = 40.0 - 2.5 * np.log10(flux[half:])  # true zp 40, well above the cut
+
+    xf = gaia_zp.GAIA_TRANSFORMS["sdss_r"]
+    g_mag = refmag + xf.coeffs[0]  # bp_rp == 0 -> transform_mag recovers refmag exactly
+    gaia = Table(
+        {
+            "source_id": np.arange(2000, 2000 + n, dtype=np.int64),
+            "ra": np.asarray(catalog["ALPHA_J2000"], dtype=float),
+            "dec": np.asarray(catalog["DELTA_J2000"], dtype=float),
+            "ref_epoch": np.full(n, 2016.0),
+            "pmra": np.zeros(n),
+            "pmdec": np.zeros(n),
+            "phot_g_mean_mag": g_mag,
+            "phot_bp_mean_mag": g_mag,
+            "phot_rp_mean_mag": g_mag,
+            "ruwe": np.full(n, 1.0),
+            "phot_bp_rp_excess_factor": np.full(n, 1.1),
+            "duplicated_source": np.zeros(n, dtype=bool),
+        }
+    )
+    header = _sci_header()
+
+    gzp, out = gaia_zp.calibrate_frame(
+        catalog,
+        header=header,
+        wcs=None,
+        settings=settings,
+        profile=profile,
+        gain_e_per_adu=None,
+        scale=0.55,
+        filter_name="R",
+        cache_dir=tmp_path,
+        query_fn=lambda *_args: gaia,
+    )
+    assert gzp.calibrated
+    assert gzp.zp == pytest.approx(16.0, abs=0.05)
+    assert gzp.n <= half
+    refmag_col = np.asarray(out["REFMAG"])
+    assert int(np.isfinite(refmag_col).sum()) > half
+
+
+def test_query_gaia_cone_applies_gmax_cut_locally(tmp_path):
+    """query_gaia_cone drops rows at or above gmax even when the injected
+    query_fn does not filter them itself, and a changed gmax does not reuse
+    a cache built under a different one."""
+
+    def fake_query(_ra, _dec, _radius):
+        return Table(
+            {
+                "source_id": [1, 2, 3],
+                "ra": [10.0, 10.0, 10.0],
+                "dec": [-20.0, -20.0, -20.0],
+                "phot_g_mean_mag": [15.0, 17.5, np.nan],
+            }
+        )
+
+    bright_only = gaia_zp.query_gaia_cone(
+        10.0, -20.0, 0.5, cache_dir=tmp_path, query_fn=fake_query, gmax=17.0
+    )
+    assert list(bright_only["source_id"]) == [1]
+
+    unfiltered = gaia_zp.query_gaia_cone(
+        10.0, -20.0, 0.5, cache_dir=tmp_path, query_fn=fake_query, gmax=100.0
+    )
+    assert sorted(unfiltered["source_id"]) == [1, 2]  # NaN row still dropped
 
 
 def test_header_cards_uses_none_sentinel_when_uncalibrated():
