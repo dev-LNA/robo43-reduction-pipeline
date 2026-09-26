@@ -485,3 +485,43 @@ def test_select_dark_current_map_gain_none_treated_as_adu_equivalent():
     assert selection_with_gain.entry.data == pytest.approx(
         selection_no_gain.entry.data / 4.0
     )
+
+
+def test_build_master_darks_calls_apply_overscan_when_overscan_is_given(tmp_path):
+    """When overscan geometry is provided, darks are trimmed with apply_overscan
+    (not apply_overscan_trim) to match the bias shape."""
+    from unittest.mock import MagicMock, patch
+
+    rng = np.random.default_rng(800)
+    h, w = 16, 16
+    metas = _make_group(
+        tmp_path,
+        "with_overscan",
+        n=2,
+        shape=(h, w),
+        exptime=10.0,
+        ccd_temp=-10.0,
+        level=100.0,
+        sigma=3.0,
+        rng=rng,
+    )
+    profile = _profile()
+    settings = _settings()
+
+    # Create a mock OverscanGeometry
+    mock_geometry = MagicMock()
+    mock_geometry.shape = (h, w)
+
+    # Mock apply_overscan to return trimmed data and cards
+    mock_apply_overscan = MagicMock(return_value=(np.ones((h, w), dtype=np.float32), []))
+
+    with patch("robo43.calib.overscan.apply_overscan", mock_apply_overscan):
+        _masters, _dc = build_master_darks(
+            metas, settings=settings, profile=profile, outdir=tmp_path / "overscan_test",
+            overscan=mock_geometry,
+        )
+
+    # Assert that apply_overscan was called at least once
+    assert mock_apply_overscan.called
+    # Verify that the number of calls matches the number of dark frames
+    assert mock_apply_overscan.call_count == len(metas)

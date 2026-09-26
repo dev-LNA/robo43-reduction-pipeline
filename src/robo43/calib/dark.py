@@ -34,6 +34,7 @@ from robo43.io.meta import FrameMeta
 
 if TYPE_CHECKING:
     from robo43.calib.gain import GainMeasurementSet
+    from robo43.calib.overscan import OverscanGeometry
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ def build_master_darks(
     profile: InstrumentProfile,
     outdir: str | Path,
     bias: MasterFrame | None = None,
+    overscan: OverscanGeometry | None = None,
     gain_measurements: GainMeasurementSet | None = None,
     fallback_source_nights: tuple[str, ...] = (),
 ) -> tuple[dict[tuple[float, float | None], MasterFrame], MasterFrame]:
@@ -117,6 +119,9 @@ def build_master_darks(
     group with no measurement falls back to 1.0 (i.e. contributes an
     ADU/s-equivalent, not a true e-/s current) and is logged as such, rather
     than raising or silently invoking the profile.
+
+    ``overscan`` is the runtime-detected geometry used for the master bias;
+    when given, darks are trimmed with it so they match the bias shape.
     """
     dark_metas_all = select_frames(metas, "dark")
     if not dark_metas_all:
@@ -165,7 +170,12 @@ def build_master_darks(
         frames: list[np.ndarray] = []
         for meta in group_metas:
             data, _header = read_image(meta.path, profile)
-            trimmed, _cards = apply_overscan_trim(data, profile=profile, settings=settings)
+            if overscan is not None:
+                from robo43.calib.overscan import apply_overscan
+
+                trimmed, _cards = apply_overscan(data, overscan, settings=settings)
+            else:
+                trimmed, _cards = apply_overscan_trim(data, profile=profile, settings=settings)
             if bias is not None:
                 if trimmed.shape != bias.data.shape:
                     msg = (

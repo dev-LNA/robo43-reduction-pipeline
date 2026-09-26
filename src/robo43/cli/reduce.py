@@ -736,6 +736,7 @@ def _run(args: argparse.Namespace) -> int:
                     profile=profile,
                     outdir=calibdir_path,
                     bias=bias_master,
+                    overscan=overscan_geometry,
                     gain_measurements=gain_measurements,
                     fallback_source_nights=dark_fallback_nights,
                 )

@@ -4,6 +4,40 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-25 (night) — ROBO43 night 20250911 reduced (WASP-145A); master-dark overscan bug fixed
+
+**Branch:** `main`, uncommitted: `src/robo43/calib/dark.py`, `src/robo43/cli/reduce.py`, `tests/test_dark.py`.
+
+- **Bug fixed:** `build_master_darks` ignored the runtime-detected overscan geometry and trimmed with the
+  profile layout, so darks stayed (3211, 4800) while the master bias was (3194, 4788) and `reduce` aborted.
+  It now takes `overscan=` (mirroring `build_master_bias`), and `cli/reduce.py` passes `overscan_geometry`.
+  This path had never run on real data (T80S has no darks). One mock-based regression test was added.
+- **Raw headers:** every frame of this night has `IMAGETYP='LIGHT'`. The bias/dark/flat frames were copied to
+  `$O/raw_calib/` and fixed there with `robo43 fixheader` (raw data untouched); the science frames are read
+  from the raw directory.
+- Output `O=/ssdsto1/data/ROBO43_reduced/20250911`: 351 WASP-145A R-Bessell 30 s frames, masters in `$O/calib`,
+  input list `$O/inputs_all.txt`. Measured gain 0.7056 e-/ADU, RN 6.95 e- (matches the profile note).
+  CRFRAC ~0.17% (the README's 31.5% TODO no longer applies).
+  Reduce 19 min (`--np 8`), astrometry 351/351 (RMS ~0.23"), photometry 351/351 in 13 min.
+
+```
+robo43 reduce --instrument robo43 --clobber --np 8 --outdir $O --calibdir $O/calib --logfile $O/reduce.log $(cat $O/inputs_all.txt)
+robo43 astrometry --instrument robo43 --index-dir ~/Documents/.astrometry --in-place --max-sources 400 --np 8 --logfile $O/astrometry.log $O/*_proc.fits
+robo43 photometry --instrument robo43 --in-place --catalog-csv --np 8 --logfile $O/photometry.log $O/*_proc.fits
+```
+
+### Open items
+
+1. **Excess frame-to-frame noise in the reduced photometry.** Clean (FLAGS==0) unsaturated bright-star pairs
+   scatter 7-12 ppt per 30 s frame against 2.3-2.8 ppt expected, in every aperture up to 8". Not cosmic rays
+   (<1% of CR pixels are near stars) and not linear in seeing or x/y. The field drifts ~200 x 150 px over 3 h
+   with 1.7 px frame-to-frame jitter (no autoguiding?) and stellar cores look boxy (image motion during the
+   exposure). Suspects: flat-field error x drift, tracking glitches, scintillation well above Young's ~1.2 ppt.
+2. Commit the dark fix after review.
+3. `fixheader` writes into the raw directory; there is no `--outdir` option, hence the copy step above.
+
+---
+
 ## 2026-09-25 (evening) — test warnings removed; phase 1B (inventory/inspect/fixheader) landed
 
 **Branch:** `fix-imagetyp-headers` (uncommitted, on top of the Gaia ZP changes below). **Suite:** 487
