@@ -4,6 +4,43 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-26 — T80S night 20251105 reduced (MC0087); 20251106 download in progress
+
+**Branch:** `main`, no code changes (operations only).
+
+- **Raw data** `/ssdsto1/data/T80S/20251105/` (downloaded while the run was being set up): 73 MC0087 R 90 s frames
+  and 12 biases. Each file was verified before use (size multiple of 2880, CHECKSUM/DATASUM with
+  `fits.open(checksum=True)`, full decompression); all 85 passed (`$O/integrity_check.txt`).
+  There is a real or not-yet-downloaded gap in the science frames at 05:02-05:27 UT.
+- **No flats this night** (none on 20251104 either). The reduction reuses the same 13 R sky flats as 20251104
+  (`/ssdsto1/data/T80S/{20251027,20251030,20251101,20251102}/skyflat*.fz`) with this night's biases, and the same
+  config override `[calib] flat_min_level_frac = 0.15` (`$O/t80s_20251105.toml`).
+- Output `O=/ssdsto1/data/T80S_reduced/20251105`, input list `$O/inputs_all.txt` (98 files).
+  Gain 0.9273 e-/ADU, RN 4.25 e- (matches 20251104). Reduce 19 min with `--np 6`, 73/73 "degraded" (no darks,
+  no bad-pixel mask, as expected for T80S); astrometry 73/73 in 13 min; photometry 73/73 in 62 min (`--np 4`).
+- **RAM:** reduce peak 39.7 GB total (about 5.8 GB per worker, 6 workers); the machine has 62 GB and about 12 GB is
+  used by other processes, so `--np 6` left 16-18 GB free. Astrometry and photometry peak about 0.2 GB in the parent.
+
+```
+robo43 reduce --instrument t80s --config $O/t80s_20251105.toml --clobber --np 6 --outdir $O --calibdir $O/calib --logfile $O/reduce.log $(cat $O/inputs_all.txt)
+robo43 astrometry --instrument t80s --index-dir ~/Documents/.astrometry --in-place --max-sources 400 --rms-max 0.5 --np 6 --logfile $O/astrometry.log $O/*_proc.fits
+robo43 photometry --instrument t80s --in-place --catalog-csv --np 4 --logfile $O/photometry.log $O/*_proc.fits
+```
+
+- relphot then ran on this night; results are in the relphot HANDOFF
+  (`~/Dropbox/relative-photometry/HANDOFF.md`). A reusable wrapper for the four relphot steps is
+  `/ssdsto1/data/T80S_reduced/relphot_night.sh NIGHT`.
+
+### Open items
+
+1. **Night 20251106**: the download was still running on 2026-09-28 (49 TOO frames, no biases or flats yet).
+   Wait until the biases have arrived and the directory has been idle for about 10 minutes, verify every file as
+   above, then reduce with the same flats and settings, run astrometry and photometry, then
+   `relphot_night.sh 20251106`.
+2. The open items from the entries below still stand.
+
+---
+
 ## 2026-09-25 (night) — ROBO43 night 20250911 reduced (WASP-145A); master-dark overscan bug fixed
 
 **Branch:** `main`, uncommitted: `src/robo43/calib/dark.py`, `src/robo43/cli/reduce.py`, `tests/test_dark.py`.
