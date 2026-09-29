@@ -4,6 +4,34 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-28 — T80S night 20251106 reduced (MC0087)
+
+**Branch:** `main`, no code changes (operations only).
+
+- **Raw data** `/ssdsto1/data/T80S/20251106/`: 69 MC0087 R 90 s frames (04:38-07:13 UT, no gaps, cadence 131 s)
+  and 11 biases; download idle since 08:11.
+- **Integrity check correction:** the stored CHECKSUM/DATASUM of the compressed HDU do *not* verify on any T80S
+  raw file, including the 20251105 files recorded as passing below (astropy 7.2 `fits.open(checksum=True)` warns
+  on every file; `fitscheck` reports them missing; an independent ones-complement sum over the raw bytes, validated
+  on a synthetic file, disagrees too). The earlier check must not have caught the warnings. **ZDATASUM (checksum of
+  the uncompressed image) does verify**, so the pixel data are intact. The check is now
+  `python /ssdsto1/data/T80S_reduced/20251106/zcheck.py FILES` (ZDATASUM, full decompression, finite pixels,
+  size multiple of 2880): 80/80 OK (`$O/integrity_check.txt`).
+- Same 13 R sky flats as 20251104/05 (`$O/inputs_flats.txt`), this night's biases, `$O/t80s_20251106.toml`
+  (`flat_min_level_frac = 0.15`). Output `O=/ssdsto1/data/T80S_reduced/20251106`, input list `$O/inputs_all.txt`
+  (93 files), commands in `$O/chain.sh` (same as 20251105 below). Gain warnings identical to 20251105.
+- Reduce 18 min (`--np 6`), 69/69 "degraded" (no darks/mask, expected). Astrometry 10 min, 68/69: frame
+  `TOO-20251107-053742` solved at 0.528" and was rejected by `--rms-max 0.5`; re-solved alone with `--rms-max 0.6`
+  (0.534") and its photometry redone; the status CSVs were merged (`*_main.csv` = originals,
+  `*_053742.csv` = single-frame runs). Photometry 54 min (`--np 4`), 69/69.
+- **Seeing was poor:** FWHM 3.9-4.5" all night (median ~4.15"; 20251105 median 3.94"), astrometric RMS
+  0.41-0.53" (20251105 0.33-0.49").
+- **RAM:** reduce peak RSS 36.7 GB; minimum MemAvailable 12.4 GB (logged every 20 s in `$O/mem.log`).
+  Astrometry 0.2 GB (2.8 GB for the single-frame rerun), photometry 0.2 GB.
+- relphot results: see the relphot HANDOFF, same date.
+
+---
+
 ## 2026-09-26 — T80S night 20251105 reduced (MC0087); 20251106 download in progress
 
 **Branch:** `main`, no code changes (operations only).
