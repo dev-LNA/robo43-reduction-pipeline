@@ -879,3 +879,68 @@ def test_fallback_cards_frm_counts_only_accepted_frames(tmp_path):
     assert cards["FLATNACC"] == 3
     assert cards["FLATNFRM"] == 3
     assert cards["FLATNREJ"] == 1
+
+
+def _make_cold_flats(tmp_path, *, n, cold_yx, shape=(64, 64), level=20000.0, sigma=200.0, seed=7):
+    """``n`` flats that all carry the same cold pixels (at 80% response)."""
+    rng = np.random.default_rng(seed)
+    metas = []
+    for i in range(n):
+        frame = level + rng.normal(0.0, sigma, size=shape)
+        for y, x in cold_yx:
+            frame[y, x] = 0.8 * level
+        path = tmp_path / f"flat_{i:02d}.fits"
+        _write_fits(path, frame)
+        metas.append(_meta(path, shape, filter="R-Bessell", object="DomeFlat"))
+    return metas
+
+
+def test_cold_pixel_mask_written_for_enough_flats(tmp_path):
+    """>= cold_pixel_min_flats accepted flats: coldpix file, DEAD in the master DQ, card."""
+    from robo43.calib.masks import build_mask, read_cold_pixel_masks
+
+    cold_yx = [(5, 7), (20, 40), (33, 12), (60, 60)]
+    shape = (64, 64)
+    metas = _make_cold_flats(tmp_path, n=20, cold_yx=cold_yx, shape=shape)
+    settings = _settings(separate_dome_and_sky_flats=False)
+    outdir = tmp_path / "masters"
+
+    masters = build_master_flats(
+        metas, settings=settings, profile=_profile(), outdir=outdir,
+        mask=build_mask(shape=shape, settings=settings.calib),
+        gain_measurements=GainMeasurementSet({}),
+    )
+
+    coldpix_path = outdir / "coldpix_R-Bessell.fits"
+    assert coldpix_path.exists()
+    with fits.open(coldpix_path) as hdul:
+        assert hdul["COLDPIX"].data.dtype == np.uint8
+        assert hdul["COLDPIX"].header["NFLATS"] == 20
+        assert hdul["COLDPIX"].header["NCOLD"] == len(cold_yx)
+    combined, names = read_cold_pixel_masks(outdir)
+    assert names == ["coldpix_R-Bessell.fits"]
+    for y, x in cold_yx:
+        assert combined[y, x]
+    assert int(np.count_nonzero(combined)) == len(cold_yx)
+
+    master = masters["R-Bessell"]
+    cards = {c[0]: c[1] for c in master.header_cards}
+    assert cards["COLDPIX"] == "coldpix_R-Bessell.fits"
+    for y, x in cold_yx:
+        assert int(master.mask[y, x]) & int(DQ.DEAD)
+    assert int(np.count_nonzero(master.mask & int(DQ.DEAD))) == len(cold_yx)
+
+
+def test_no_cold_pixel_file_below_min_flats(tmp_path):
+    """Fewer accepted flats than cold_pixel_min_flats: no coldpix file, COLDPIX=NONE."""
+    metas = _make_cold_flats(tmp_path, n=19, cold_yx=[(5, 7), (20, 40)])
+    outdir = tmp_path / "masters"
+
+    masters = build_master_flats(
+        metas, settings=_settings(separate_dome_and_sky_flats=False),
+        profile=_profile(), outdir=outdir, gain_measurements=GainMeasurementSet({}),
+    )
+
+    assert not list(outdir.glob("coldpix_*.fits"))
+    cards = {c[0]: c[1] for c in masters["R-Bessell"].header_cards}
+    assert cards["COLDPIX"] == "NONE"

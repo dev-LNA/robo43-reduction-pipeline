@@ -29,7 +29,8 @@ from robo43.calib.fallback import (
 )
 from robo43.calib.flat import build_master_flats, group_flats_by_filter
 from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurementSet, measure_gain
-from robo43.calib.masks import MaskSet
+from robo43.calib.masks import MaskSet, build_mask, read_cold_pixel_masks
+from robo43.calib.master import MasterFrame
 from robo43.calib.overscan import detect_overscan
 from robo43.calib.set import CalibrationSet
 from robo43.cli.common import configure_from_args
@@ -53,6 +54,68 @@ if TYPE_CHECKING:
 __all__ = ["SUBCOMMAND"]
 
 logger = logging.getLogger(__name__)
+
+
+def _compose_static_mask(calibdir_path: Path, settings: Settings) -> None:
+    """Write ``calibdir/mask.fits`` from hot (darks) and cold (flats) pixels.
+
+    Reuses an existing ``mask.fits`` unless a dark-current map or cold-pixel
+    file is newer.  Hot pixels come from the dark-current map, cold pixels
+    from every ``coldpix_*.fits``; with neither, no mask is written.  Never
+    aborts the reduction: any failure is logged and the run continues without
+    a static mask.
+    """
+    mask_path = calibdir_path / "mask.fits"
+    if mask_path.exists():
+        sources = [
+            p
+            for p in (
+                calibdir_path / "dark_current_map.fits",
+                calibdir_path / "master_dark_current.fits",
+                *calibdir_path.glob("coldpix_*.fits"),
+            )
+            if p.exists()
+        ]
+        mask_mtime = mask_path.stat().st_mtime_ns
+        if all(p.stat().st_mtime_ns <= mask_mtime for p in sources):
+            logger.info("mask.fits exists, reusing")
+            return
+        logger.info("mask.fits is older than its dark/cold-pixel inputs, rebuilding")
+    try:
+        hot = None
+        dc_file = calibdir_path / "dark_current_map.fits"
+        if not dc_file.exists():
+            dc_file = calibdir_path / "master_dark_current.fits"
+        if dc_file.exists():
+            hot = MasterFrame.load(dc_file).data
+        cold, cold_files = read_cold_pixel_masks(calibdir_path)
+        if hot is not None and cold is not None and hot.shape != cold.shape:
+            logger.error(
+                "dark-current map shape %s does not match cold-pixel mask shape %s; "
+                "ignoring the dark-current map for mask.fits",
+                hot.shape,
+                cold.shape,
+            )
+            hot = None
+        if hot is None and cold is None:
+            logger.info("no dark-current map or cold-pixel mask; not writing mask.fits")
+            return
+        source = "hot+cold" if hot is not None and cold is not None else (
+            "cold" if cold is not None else "hot"
+        )
+        mask = build_mask(dark_current_map=hot, cold_pixel_mask=cold, settings=settings.calib)
+        cards: list[tuple[str, Any, str]] = [
+            ("MASKSRC", source, "Static mask sources (hot=darks, cold=flats)"),
+            ("COLDNFIL", len(cold_files), "Number of cold-pixel mask files"),
+        ]
+        for i, name in enumerate(cold_files[:99], start=1):
+            cards.append((f"COLDF{i:02d}", name, "Cold-pixel mask file"))
+        mask.write(mask_path, cards=cards, overwrite=True)
+        logger.info("wrote %s (sources: %s)", mask_path, source)
+        logger.info("%s", mask.text_summary())
+    except Exception as exc:
+        logger.error("failed to build mask.fits: %s; continuing without a static mask", exc)
+
 
 #: Populated once per worker -- by ``_init_science_worker`` in a pooled
 #: (``nprocs > 1``) run, or directly by ``_run`` for the ``nprocs == 1``
@@ -613,6 +676,39 @@ def _run(args: argparse.Namespace) -> int:
         else:
             logger.info("master flats: no flat frames, would SKIP")
 
+        if (calibdir_path / "mask.fits").exists():
+            logger.info("mask.fits: would REUSE")
+        else:
+            min_flats = settings.calib.cold_pixel_min_flats
+            flat_group_sizes = [
+                len(group)
+                for group in group_flats_by_filter(
+                    flat_metas,
+                    separate_dome_and_sky=settings.calib.separate_dome_and_sky_flats,
+                ).values()
+            ]
+            hot_source = bool(dark_metas) or (calibdir_path / "dark_current_map.fits").exists()
+            cold_source = any(n >= min_flats for n in flat_group_sizes) or any(
+                calibdir_path.glob("coldpix_*.fits")
+            )
+            if hot_source or cold_source:
+                logger.info(
+                    "mask.fits: would BUILD from %s",
+                    " + ".join(
+                        label
+                        for label, used in (
+                            ("hot pixels", hot_source),
+                            ("cold pixels", cold_source),
+                        )
+                        if used
+                    ),
+                )
+            else:
+                logger.info(
+                    "mask.fits: no dark frames and no flat group with >= %d frames, would SKIP",
+                    min_flats,
+                )
+
         # Filter science frames by --filter if given
         if args.filter:
             filtered_science = [m for m in science_metas if m.filter in args.filter]
@@ -825,6 +921,9 @@ def _run(args: argparse.Namespace) -> int:
 
     if settings.runtime.release_memory:
         release_memory("reduce.master_flat", level=logging.INFO)
+
+    # Compose the static bad-pixel mask (hot from darks, cold from flats)
+    _compose_static_mask(calibdir_path, settings)
 
     # Load calibration set
     try:

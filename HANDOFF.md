@@ -4,6 +4,42 @@ Read this at the start of a new or cleared session. Newest entry first.
 
 ---
 
+## 2026-09-29 — cold-pixel mask from flats; static `mask.fits` now built
+
+**Branch:** `cold-pixel-mask`. **Suite:** 501 passed (`python3 -m pytest -o addopts="" -q`). No new ruff
+findings (the remaining ones in `flat.py`/`cli/reduce.py` predate this change).
+
+- **`mask.fits` was never written before.** `calib/masks.py::build_mask` existed but `robo43 reduce` never called
+  it, so no frame ever got a static HOT/DEAD/BAD_COLUMN mask. `cli/reduce.py::_compose_static_mask` now writes
+  `calib/mask.fits` after the master flats and before `CalibrationSet.load`:
+  darks + cold → hot ∪ cold; no darks → cold only; darks but no cold → hot only; neither → no mask.
+  Header `MASKSRC` records which; `COLDF01..` list the cold files. An existing `mask.fits` is reused only while it
+  is newer than `dark_current_map.fits` and every `coldpix_*.fits`. Failures are logged and the run continues.
+- **Cold pixels** (`calib/masks.py::cold_pixel_mask`): on each normalised master flat, the local level is a
+  32×32 px block median bilinearly interpolated (linear extrapolation at the edges); a pixel is cold when
+  `flat/local − 1 < −5 × mad_std`. Skipped with a WARNING when fewer than 20 flats were accepted (after the
+  level cut) in the group, to avoid tracing local/night minima. Written per flat group as
+  `calib/coldpix_<key>.fits` (uint8 `COLDPIX` HDU, cards NFLATS/COLDNSIG/COLDBOX/NCOLD/FRCOLD; always
+  overwritten together with its master) and OR'd into the master flat's DQ; master header card `COLDPIX`.
+- Cold pixels reuse the **`DQ.DEAD` bit** (description now "dead/cold or low-QE pixel (from flat frames)"), so
+  catalog flags, FATAL_FLAGS and relphot are unchanged. `mask.fits` carries `FRCOLD`/`COLDNSIG`.
+- New `[calib]` settings: `cold_pixel_nsigma = 5.0`, `cold_pixel_min_flats = 20`, `cold_pixel_box = 32`
+  (validated in `config._validate`). `--dry-run` reports mask BUILD/REUSE/SKIP.
+- Tests: `tests/test_cold_pixels.py` (new), plus additions in `test_flat.py` and `test_cli_reduce.py`.
+
+### Open items
+
+1. **Not run on real data.** Synthetic only (all injected cold pixels found, 0 false positives; 10k×10k in ~5 s,
+   ~1.7 GB peak). Validate on a real flat set with ≥ 20 frames and inspect the flagged fraction.
+2. **T80S gets no cold mask yet:** the recent nights pooled only 13 R sky flats. Pool ≥ 20 (more nights) to
+   enable it.
+3. **Behaviour change for runs with darks** (ROBO43): `mask.fits` now appears, so frames get HOT and BAD_COLUMN
+   flags that earlier reductions never applied. Expect more flagged sources than before.
+4. `docs/INTERFACE_CONTRACT.md` (around lines 178 and 609) still describes the old DEAD wording and settings.
+5. The open items from the entries below still stand.
+
+---
+
 ## 2026-09-28 — T80S night 20251106 reduced (MC0087)
 
 **Branch:** `main`, no code changes (operations only).

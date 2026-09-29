@@ -19,6 +19,7 @@ import numpy as np
 
 from robo43.calib.bias import apply_overscan_trim, resolve_common_gain, select_frames
 from robo43.calib.combine import combine_lazy, combine_stack
+from robo43.calib.masks import cold_pixel_mask, write_cold_pixel_mask
 from robo43.calib.master import MasterFrame
 from robo43.config import Settings
 from robo43.exceptions import CalibrationError
@@ -297,8 +298,11 @@ def build_master_flats(
        [flat_min_level_frac, flat_max_level_frac] * saturation_adu
     3. Combines accepted frames (or uses the single frame if n==1)
     4. Normalizes the combined data
-    5. Applies mask and sets fatal pixels to 1.0
-    6. Writes master frame to outdir/master_flat_<key>.fits (: -> _)
+    5. Builds the cold-pixel mask from the normalized master (skipped when
+       fewer than ``settings.calib.cold_pixel_min_flats`` flats were combined)
+       and writes it to outdir/coldpix_<key>.fits (: -> _)
+    6. Applies mask and sets fatal pixels to 1.0; cold pixels are flagged DEAD
+    7. Writes master frame to outdir/master_flat_<key>.fits (: -> _)
 
     ``fallback_source_nights`` maps a group key to ``(contributing_nights,
     borrowed)``: every night (including the current one) that contributed a
@@ -539,6 +543,23 @@ def build_master_flats(
         # Normalize the flat
         normalized_data, norm_cards = normalise_flat(master_data, settings.calib)
 
+        # Cold pixels are judged on the normalized master BEFORE any fatal-pixel
+        # replacement below, so an already-masked pixel cannot hide its defect.
+        # n_accepted counts the flats that survived the level cut and were
+        # combined (not the inputs).
+        cold = cold_pixel_mask(normalized_data, n_accepted, settings.calib)
+        coldpix_name = "NONE"
+        if cold is not None:
+            coldpix_name = f"coldpix_{group_key.replace(':', '_')}.fits"
+            write_cold_pixel_mask(
+                outdir_path / coldpix_name,
+                cold,
+                n_flats=n_accepted,
+                settings=settings.calib,
+                overwrite=True,  # regenerated together with its master
+            )
+            logger.info("Wrote cold-pixel mask to %s", outdir_path / coldpix_name)
+
         # Scale variance by level squared
         if master_variance is not None:
             norm_level = norm_cards[0][1]
@@ -561,10 +582,13 @@ def build_master_flats(
             # Flag dead pixels (below threshold)
             dead_mask = normalized_data < settings.calib.dead_pixel_frac
             master_mask[dead_mask] |= int(DQ.DEAD)
+            if cold is not None:
+                master_mask[cold] |= int(DQ.DEAD)
 
             mask_cards.append(("MASKFIL", "applied", "DQ mask applied"))
         else:
             mask_cards.append(("MASKFIL", "NONE", "No mask applied"))
+        mask_cards.append(("COLDPIX", coldpix_name, "Cold-pixel mask file"))
 
         # Assemble header cards
         header_cards = (

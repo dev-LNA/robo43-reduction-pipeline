@@ -44,7 +44,7 @@ class DQ(enum.IntFlag):
 
 DQ_DESCRIPTIONS: Mapping[DQ, str] = {
     DQ.HOT: "hot pixel (from the normalised dark-current map)",
-    DQ.DEAD: "dead or low-QE pixel (from the master flat)",
+    DQ.DEAD: "dead/cold or low-QE pixel (from flat frames)",
     DQ.UNSTABLE: "unstable pixel (high variance across the bias stack)",
     DQ.SATURATED: "saturated in this frame",
     DQ.COSMIC_RAY: "cosmic ray identified in this frame",

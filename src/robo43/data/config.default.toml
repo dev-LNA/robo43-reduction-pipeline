@@ -113,6 +113,14 @@ dark_doubling_temp_c = 6.5
 dark_temp_extrap_max_c = 5.0
 hot_pixel_nmad = 5.0
 dead_pixel_frac = 0.5
+# Cold (low-response) pixels from the master flat, flagged DQ.DEAD: residual
+# from the local block-median level below -cold_pixel_nsigma * MAD-sigma.
+cold_pixel_nsigma = 5.0
+# Skip the cold mask when fewer flats than this were combined (a master from
+# few flats traces local/night-specific minima rather than the sensor).
+cold_pixel_min_flats = 20
+# Block size (px) of the local-level (block-median) estimate.
+cold_pixel_box = 32
 unstable_pixel_nmad = 5.0
 bad_column_frac = 0.10
 cosmic_ray_rejection = true

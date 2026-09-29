@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from astropy.stats import mad_std
 from robo43.calib.combine import CombineResult
 from robo43.config import CalibSettings
 from robo43.exceptions import CalibrationError
+from robo43.io.fits_io import write_fits
 from robo43.products.dq import DQ, DQ_DTYPE, dq_bintable, dq_summary
 
 logger = logging.getLogger(__name__)
@@ -27,10 +29,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MaskSet",
     "build_mask",
+    "cold_pixel_mask",
     "detect_bad_columns",
     "minimal_mask",
     "nonlinearity_mask",
+    "read_cold_pixel_masks",
     "saturation_mask",
+    "write_cold_pixel_mask",
 ]
 
 
@@ -48,6 +53,8 @@ class MaskSet:
             cards.append(("FRHOT", self.summary["hot"], "Fraction of pixels flagged HOT"))
         if "dead" in self.summary:
             cards.append(("FRDEAD", self.summary["dead"], "Fraction of pixels flagged DEAD"))
+        if "cold" in self.summary:
+            cards.append(("FRCOLD", self.summary["cold"], "Fraction of pixels in the cold mask"))
         if "unstable" in self.summary:
             cards.append(
                 ("FRUNSTBL", self.summary["unstable"], "Fraction of pixels flagged UNSTABLE")
@@ -69,6 +76,10 @@ class MaskSet:
                     "Fractional threshold used for DEAD detection",
                 )
             )
+        if "cold_nsigma" in self.summary:
+            cards.append(
+                ("COLDNSIG", self.summary["cold_nsigma"], "N*sigma threshold used for cold pixels")
+            )
         if "unstable_nmad" in self.summary:
             cards.append(
                 (
@@ -81,7 +92,7 @@ class MaskSet:
 
     def text_summary(self) -> str:
         """Human-readable multi-line summary of the flagged-pixel fractions."""
-        threshold_keys = {"hot_nmad", "dead_frac", "unstable_nmad"}
+        threshold_keys = {"hot_nmad", "dead_frac", "cold_nsigma", "unstable_nmad"}
         lines = ["DQ mask summary:"]
         other_lines = []
         any_line = None
@@ -146,9 +157,14 @@ class MaskSet:
         ):
             if card in header:
                 summary[key] = full[key]
+        # Cold pixels share the DEAD bit, so their fraction cannot be
+        # recovered from the plane; it is restored from the header value.
+        if "FRCOLD" in header:
+            summary["cold"] = float(header["FRCOLD"])
         for card, key in (
             ("HOTNMAD", "hot_nmad"),
             ("DEADFRAC", "dead_frac"),
+            ("COLDNSIG", "cold_nsigma"),
             ("UNSTNMAD", "unstable_nmad"),
         ):
             if card in header:
@@ -267,25 +283,227 @@ def _unstable_pixel_mask(variance: np.ndarray, settings: CalibSettings) -> np.nd
     return variance > med + settings.unstable_pixel_nmad * sigma
 
 
+#: Rows per chunk when the cold-pixel residual is computed, bounding the
+#: float64 temporaries to ``_COLD_CHUNK_ROWS * width * 8`` bytes.
+_COLD_CHUNK_ROWS = 256
+
+
+def _block_grid_medians(data: np.ndarray, box: int) -> np.ndarray:
+    """NaN-aware median of ``data`` in square ``box`` x ``box`` blocks.
+
+    The last block row/column is the partial block when ``box`` does not
+    divide the shape.  Non-finite pixels are ignored; a block with no finite
+    pixel is NaN.  Works one block row at a time, so no full-frame float64
+    copy is made.
+    """
+    h, w = data.shape
+    n_by = -(-h // box)
+    n_bx = -(-w // box)
+    pad_w = n_bx * box - w
+    grid = np.full((n_by, n_bx), np.nan, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN blocks
+        for by in range(n_by):
+            strip = np.asarray(data[by * box : (by + 1) * box], dtype=np.float64)
+            strip = np.where(np.isfinite(strip), strip, np.nan)
+            if pad_w:
+                strip = np.pad(strip, ((0, 0), (0, pad_w)), constant_values=np.nan)
+            n_rows = strip.shape[0]
+            blocks = strip.reshape(n_rows, n_bx, box).transpose(1, 0, 2).reshape(n_bx, n_rows * box)
+            grid[by] = np.nanmedian(blocks, axis=1)
+    return grid
+
+
+def _block_interp_weights(
+    n: int, box: int, n_blocks: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bilinear interpolation indices/weights of block centres along one axis.
+
+    Returns ``(lo, hi, w)`` with the interpolated value at pixel ``i`` equal to
+    ``(1 - w[i]) * grid[lo[i]] + w[i] * grid[hi[i]]``.  Beyond the first/last
+    block centre the two outermost centres are extrapolated linearly (``w``
+    outside ``[0, 1]``) rather than clamped, so a smooth gradient leaves no
+    systematic residual in the outer half-block.
+    """
+    if n_blocks == 1:
+        zeros = np.zeros(n, dtype=np.intp)
+        return zeros, zeros, np.zeros(n, dtype=np.float64)
+    starts = np.arange(n_blocks) * box
+    centres = (starts + np.minimum(starts + box, n) - 1) / 2.0
+    pos = np.arange(n, dtype=np.float64)
+    lo = np.clip(np.searchsorted(centres, pos, side="right") - 1, 0, n_blocks - 2)
+    hi = lo + 1
+    return lo, hi, (pos - centres[lo]) / (centres[hi] - centres[lo])
+
+
+def cold_pixel_mask(
+    master_flat: np.ndarray, n_flats: int, settings: CalibSettings
+) -> np.ndarray | None:
+    """Boolean mask of cold (low-response) pixels in a normalised master flat.
+
+    The expected level at each pixel is the master flat's block median (square
+    blocks of ``settings.cold_pixel_box`` px, NaN-aware, partial blocks at the
+    ragged edges) bilinearly interpolated between block centres back to the
+    full shape.  A pixel is cold when its fractional residual
+    ``master_flat / local - 1`` is below ``-settings.cold_pixel_nsigma`` times
+    the MAD-sigma of that residual over the finite pixels.  Non-finite pixels
+    are never flagged (they are ``NO_DATA`` elsewhere).
+
+    Returns ``None`` -- the mask is skipped -- when fewer than
+    ``settings.cold_pixel_min_flats`` flats were combined, or when the flat
+    has no usable pixels or no positive residual scatter.  The arithmetic is
+    float64; only the full-frame residual is held as float32 (10k x 10k stays
+    at ~400 MB) since its precision is far below the scatter it is judged by.
+    """
+    if n_flats < settings.cold_pixel_min_flats:
+        logger.warning(
+            "cold-pixel mask skipped: %d flat(s) combined < cold_pixel_min_flats=%d "
+            "(fewer flats risk tracing local or night-specific minima)",
+            n_flats,
+            settings.cold_pixel_min_flats,
+        )
+        return None
+    if master_flat.ndim != 2:
+        msg = f"cold_pixel_mask: master_flat must be 2-D, got shape {master_flat.shape}"
+        raise CalibrationError(msg)
+    box = int(settings.cold_pixel_box)
+    if box < 1:
+        msg = f"cold_pixel_box must be >= 1, got {box}"
+        raise CalibrationError(msg)
+
+    h, w = master_flat.shape
+    grid = _block_grid_medians(master_flat, box)
+    finite_blocks = np.isfinite(grid)
+    if not finite_blocks.any():
+        logger.warning("cold-pixel mask skipped: master flat has no finite pixels")
+        return None
+    if not finite_blocks.all():
+        # A block with no finite pixel has no pixel to judge; only its
+        # interpolation weight matters, so give it the median block level.
+        grid = np.where(finite_blocks, grid, np.median(grid[finite_blocks]))
+
+    y_lo, y_hi, y_w = _block_interp_weights(h, box, grid.shape[0])
+    x_lo, x_hi, x_w = _block_interp_weights(w, box, grid.shape[1])
+
+    resid = np.full((h, w), np.nan, dtype=np.float32)
+    n_valid = 0
+    for r0 in range(0, h, _COLD_CHUNK_ROWS):
+        r1 = min(r0 + _COLD_CHUNK_ROWS, h)
+        yw = y_w[r0:r1, None]
+        band = (1.0 - yw) * grid[y_lo[r0:r1]] + yw * grid[y_hi[r0:r1]]
+        local = band[:, x_lo] * (1.0 - x_w) + band[:, x_hi] * x_w
+        chunk = np.asarray(master_flat[r0:r1], dtype=np.float64)
+        valid = np.isfinite(chunk) & (local > 0)
+        ratio = np.full(chunk.shape, np.nan, dtype=np.float64)
+        np.divide(chunk, local, out=ratio, where=valid)
+        resid[r0:r1] = ratio - 1.0
+        n_valid += int(np.count_nonzero(valid))
+    if n_valid == 0:
+        logger.warning("cold-pixel mask skipped: no pixel has a positive local level")
+        return None
+
+    sigma = float(mad_std(resid, ignore_nan=True))
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        logger.warning("cold-pixel mask skipped: residual scatter is not positive (%r)", sigma)
+        return None
+
+    cold = resid < -float(settings.cold_pixel_nsigma) * sigma
+    n_cold = int(np.count_nonzero(cold))
+    logger.info(
+        "cold-pixel mask: %d px (%.4f%%) below -%.1f sigma (sigma=%.4g, box=%d px, n_flats=%d)",
+        n_cold,
+        100.0 * n_cold / cold.size,
+        settings.cold_pixel_nsigma,
+        sigma,
+        box,
+        n_flats,
+    )
+    return cold
+
+
+def write_cold_pixel_mask(
+    path: str | Path,
+    cold: np.ndarray,
+    *,
+    n_flats: int,
+    settings: CalibSettings,
+    overwrite: bool = False,
+) -> Path:
+    """Write a cold-pixel mask as a ``uint8`` ``COLDPIX`` image extension."""
+    n_cold = int(np.count_nonzero(cold))
+    hdu = fits.ImageHDU(data=np.asarray(cold, dtype=np.uint8), name="COLDPIX")
+    hdu.header["NFLATS"] = (int(n_flats), "Flat frames combined into the master")
+    hdu.header["COLDNSIG"] = (
+        float(settings.cold_pixel_nsigma), "N*sigma threshold for cold pixels"
+    )
+    hdu.header["COLDBOX"] = (int(settings.cold_pixel_box), "Block size (px) of local level")
+    hdu.header["NCOLD"] = (n_cold, "Number of cold pixels")
+    hdu.header["FRCOLD"] = (n_cold / cold.size, "Fraction of pixels flagged cold")
+    return write_fits(path, fits.HDUList([fits.PrimaryHDU(), hdu]), overwrite=overwrite)
+
+
+def read_cold_pixel_masks(calibdir: str | Path) -> tuple[np.ndarray | None, list[str]]:
+    """OR every ``coldpix_*.fits`` in ``calibdir`` (one per flat group).
+
+    Returns ``(mask, filenames)``; ``(None, [])`` when there are none.  Raises
+    :class:`CalibrationError` when a file has no 2-D ``COLDPIX`` extension or
+    the shapes disagree.
+    """
+    files = sorted(Path(calibdir).glob("coldpix_*.fits"))
+    combined: np.ndarray | None = None
+    for path in files:
+        with fits.open(path) as hdul:
+            if "COLDPIX" not in hdul or hdul["COLDPIX"].data is None:
+                msg = f"{path} has no COLDPIX image extension"
+                raise CalibrationError(msg)
+            cold = np.asarray(hdul["COLDPIX"].data) != 0
+        if cold.ndim != 2:
+            msg = f"{path} COLDPIX is not 2-D (shape {cold.shape})"
+            raise CalibrationError(msg)
+        if combined is None:
+            combined = cold
+        elif cold.shape != combined.shape:
+            msg = (
+                f"{path.name} shape {cold.shape} does not match "
+                f"{files[0].name} shape {combined.shape}"
+            )
+            raise CalibrationError(msg)
+        else:
+            combined |= cold
+    return combined, [p.name for p in files]
+
+
 def build_mask(
     *,
     dark_current_map: np.ndarray | None = None,
     master_flat: np.ndarray | None = None,
     bias_variance: np.ndarray | CombineResult | None = None,
+    cold_pixel_mask: np.ndarray | None = None,
     settings: CalibSettings,
     profile: Any | None = None,
     shape: tuple[int, int] | None = None,
 ) -> MaskSet:
-    """Assemble a static ``DQ`` mask from whichever inputs are available."""
+    """Assemble a static ``DQ`` mask from whichever inputs are available.
+
+    ``cold_pixel_mask`` is a boolean array from :func:`cold_pixel_mask`; its
+    pixels get ``DQ.DEAD`` (cold shares the dead bit) and it is not passed to
+    :func:`detect_bad_columns`.
+    """
     if profile is not None:
         logger.debug("build_mask: profile=%r provided but not yet used", profile)
 
     variance = getattr(bias_variance, "variance", bias_variance)
 
-    if dark_current_map is None and master_flat is None and variance is None and shape is None:
+    if (
+        dark_current_map is None
+        and master_flat is None
+        and variance is None
+        and cold_pixel_mask is None
+        and shape is None
+    ):
         msg = (
             "build_mask requires at least one of dark_current_map, master_flat, "
-            "bias_variance, or shape"
+            "bias_variance, cold_pixel_mask, or shape"
         )
         raise CalibrationError(msg)
 
@@ -296,6 +514,8 @@ def build_mask(
         array_shape = master_flat.shape
     elif variance is not None:
         array_shape = variance.shape
+    elif cold_pixel_mask is not None:
+        array_shape = cold_pixel_mask.shape
 
     if array_shape is not None and shape is not None and tuple(shape) != tuple(array_shape):
         msg = f"shape {tuple(shape)} does not match input array shape {tuple(array_shape)}"
@@ -311,6 +531,8 @@ def build_mask(
         named_arrays.append(("master_flat", master_flat))
     if variance is not None:
         named_arrays.append(("bias_variance", variance))
+    if cold_pixel_mask is not None:
+        named_arrays.append(("cold_pixel_mask", cold_pixel_mask))
 
     if len(named_arrays) > 1:
         ref_name, ref_arr = named_arrays[0]
@@ -319,13 +541,18 @@ def build_mask(
                 msg = f"{name} shape {arr.shape} does not match {ref_name} shape {ref_arr.shape}"
                 raise CalibrationError(msg)
 
-    if dark_current_map is None and master_flat is None and variance is None:
+    if (
+        dark_current_map is None
+        and master_flat is None
+        and variance is None
+        and cold_pixel_mask is None
+    ):
         dq = np.zeros(working_shape, dtype=DQ_DTYPE)
         return MaskSet(dq=dq, summary={"any": 0.0, "fatal": 0.0})
 
     dq = np.zeros(working_shape, dtype=DQ_DTYPE)
 
-    hot_ran = dead_ran = unstable_ran = bad_column_ran = False
+    hot_ran = dead_ran = cold_ran = unstable_ran = bad_column_ran = False
 
     if dark_current_map is not None:
         hot = _hot_pixel_mask(dark_current_map, settings)
@@ -336,6 +563,11 @@ def build_mask(
         dead = _dead_pixel_mask(master_flat, settings)
         dq[dead] |= int(DQ.DEAD)
         dead_ran = True
+
+    if cold_pixel_mask is not None:
+        cold = np.asarray(cold_pixel_mask, dtype=bool)
+        dq[cold] |= int(DQ.DEAD)
+        cold_ran = True
 
     if variance is not None:
         unstable = _unstable_pixel_mask(variance, settings)
@@ -367,9 +599,13 @@ def build_mask(
     if hot_ran:
         summary["hot"] = full["hot"]
         summary["hot_nmad"] = settings.hot_pixel_nmad
-    if dead_ran:
+    if dead_ran or cold_ran:
         summary["dead"] = full["dead"]
+    if dead_ran:
         summary["dead_frac"] = settings.dead_pixel_frac
+    if cold_ran:
+        summary["cold"] = float(np.count_nonzero(cold)) / cold.size
+        summary["cold_nsigma"] = settings.cold_pixel_nsigma
     if unstable_ran:
         summary["unstable"] = full["unstable"]
     if bad_column_ran:

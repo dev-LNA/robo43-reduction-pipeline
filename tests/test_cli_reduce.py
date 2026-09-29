@@ -850,3 +850,115 @@ def test_reduce_parallel_matches_serial(tmp_path):
             if key in ignore_keys:
                 continue
             assert row_serial[key] == row_parallel[key], key
+
+
+def test_reduce_writes_cold_pixel_mask_from_flats(tmp_path):
+    """>= 20 flats and no darks: coldpix_*.fits and a cold-only mask.fits are written."""
+    from robo43.calib.masks import MaskSet
+    from robo43.products.dq import DQ
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    calib_dir = tmp_path / "calib"
+
+    shape = (128, 128)
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[0:128, 0:128]
+    smooth = 1.0 - 0.2 * np.hypot(yy - 63.5, xx - 63.5) / 90.0
+    cold_yx = [(10, 12), (64, 70), (100, 30), (120, 120)]
+    for i in range(20):
+        data = 30000.0 * smooth * (1.0 + rng.normal(0.0, 0.01, size=shape))
+        for y, x in cold_yx:
+            data[y, x] = 0.8 * 30000.0 * smooth[y, x]
+        hdu = fits.PrimaryHDU(data=data.astype(np.float32))
+        hdu.header["IMAGETYP"] = "FLAT"
+        hdu.header["EXPTIME"] = 5.0
+        hdu.header["FILTER"] = "R"
+        hdu.header["DATE-OBS"] = "2024-01-01T00:00:00"
+        hdu.header["GAIN"] = 2.0
+        hdu.header["RDNOISE"] = 5.0
+        hdu.header["SATURATE"] = 60000.0
+        hdu.writeto(frame_dir / f"flat_{i:02d}.fits", overwrite=True)
+    _write_synthetic_frame(frame_dir / "science_1.fits", frame_type="science", filter_name="R")
+
+    outdir = tmp_path / "output"
+    result = main([
+        "reduce",
+        str(frame_dir),
+        "--calibdir", str(calib_dir),
+        "--outdir", str(outdir),
+        "--no-overscan",
+        "--loglevel", "INFO",
+    ])
+    assert result == 0
+
+    assert (calib_dir / "coldpix_R_dome.fits").exists()
+    mask_path = calib_dir / "mask.fits"
+    assert mask_path.exists()
+    mask = MaskSet.read(mask_path)
+    assert mask.dq.shape == shape
+    for y, x in cold_yx:
+        assert int(mask.dq[y, x]) & int(DQ.DEAD)
+    assert mask.summary["cold"] == pytest.approx(len(cold_yx) / mask.dq.size)
+    with fits.open(mask_path) as hdul:
+        header = hdul["DQ"].header
+        assert header["MASKSRC"] == "cold"
+        assert header["COLDF01"] == "coldpix_R_dome.fits"
+    assert (outdir / "science_1_proc.fits").exists()
+
+
+def test_compose_static_mask_sources_and_reuse(tmp_path):
+    """hot+cold, cold only, hot only, neither, shape mismatch, and reuse of mask.fits."""
+    from robo43.calib.masks import MaskSet, write_cold_pixel_mask
+    from robo43.cli.reduce import _compose_static_mask
+    from robo43.products.dq import DQ
+
+    settings = _settings()
+    shape = (60, 60)
+    dark = np.random.default_rng(5).normal(1.0, 0.05, size=shape).astype(np.float32)
+    dark[7, 8] = 10.0
+    cold = np.zeros(shape, dtype=bool)
+    cold[30, 31] = True
+
+    def _calib(name, *, with_dark, with_cold, cold_shape=shape):
+        calib = tmp_path / name
+        calib.mkdir()
+        if with_dark:
+            fits.PrimaryHDU(data=dark).writeto(calib / "dark_current_map.fits")
+        if with_cold:
+            cold_arr = cold if cold_shape == shape else np.zeros(cold_shape, dtype=bool)
+            write_cold_pixel_mask(
+                calib / "coldpix_R_dome.fits", cold_arr, n_flats=20, settings=settings.calib
+            )
+        return calib
+
+    def _source(calib):
+        with fits.open(calib / "mask.fits") as hdul:
+            return hdul["DQ"].header["MASKSRC"]
+
+    both = _calib("both", with_dark=True, with_cold=True)
+    _compose_static_mask(both, settings)
+    dq = MaskSet.read(both / "mask.fits").dq
+    assert _source(both) == "hot+cold"
+    assert int(dq[7, 8]) & int(DQ.HOT)
+    assert int(dq[30, 31]) & int(DQ.DEAD)
+
+    cold_only = _calib("cold_only", with_dark=False, with_cold=True)
+    _compose_static_mask(cold_only, settings)
+    assert _source(cold_only) == "cold"
+
+    hot_only = _calib("hot_only", with_dark=True, with_cold=False)
+    _compose_static_mask(hot_only, settings)
+    assert _source(hot_only) == "hot"
+
+    neither = _calib("neither", with_dark=False, with_cold=False)
+    _compose_static_mask(neither, settings)
+    assert not (neither / "mask.fits").exists()
+
+    mismatch = _calib("mismatch", with_dark=True, with_cold=True, cold_shape=(60, 61))
+    _compose_static_mask(mismatch, settings)
+    assert _source(mismatch) == "cold"
+
+    before = (both / "mask.fits").stat().st_mtime_ns
+    _compose_static_mask(both, settings)
+    assert (both / "mask.fits").stat().st_mtime_ns == before

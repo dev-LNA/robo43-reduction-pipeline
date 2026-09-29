@@ -202,6 +202,14 @@ class CalibSettings:
     dark_temp_extrap_max_c: float = 5.0
     hot_pixel_nmad: float = 5.0
     dead_pixel_frac: float = 0.5
+    # A pixel is cold (flagged DQ.DEAD) when the master flat's residual from
+    # its local block-median level is below -cold_pixel_nsigma * MAD-sigma.
+    cold_pixel_nsigma: float = 5.0
+    # The cold mask is skipped when fewer flats than this were combined: with
+    # few flats the master traces local/night-specific minima, not the sensor.
+    cold_pixel_min_flats: int = 20
+    # Block size (px) of the local-level (block-median) estimate.
+    cold_pixel_box: int = 32
     unstable_pixel_nmad: float = 5.0
     # A line whose median departs from its immediate neighbours' by more than
     # this fraction is a persistent bad column/row.  A relative test is used
@@ -630,6 +638,15 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(msg)
     if settings.calib.flat_min_level_frac >= settings.calib.flat_max_level_frac:
         msg = "calib.flat_min_level_frac must be below calib.flat_max_level_frac"
+        raise ConfigError(msg)
+    if settings.calib.cold_pixel_nsigma <= 0:
+        msg = "calib.cold_pixel_nsigma must be > 0"
+        raise ConfigError(msg)
+    if settings.calib.cold_pixel_min_flats < 1:
+        msg = "calib.cold_pixel_min_flats must be >= 1"
+        raise ConfigError(msg)
+    if settings.calib.cold_pixel_box < 3:
+        msg = "calib.cold_pixel_box must be >= 3"
         raise ConfigError(msg)
     gaia_zp_aperture = settings.photometry.gaia_zp_aperture_arcsec
     gaia_zp_radii = settings.photometry.aperture_radii_arcsec
