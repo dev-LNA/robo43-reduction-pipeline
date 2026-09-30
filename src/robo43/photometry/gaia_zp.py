@@ -44,7 +44,7 @@ Reference-magnitude order (design requirement 1):
         installed (it is an optional dependency -- see the ``gaia`` extra in
         pyproject.toml) and the archive query succeeds; imported lazily so
         its absence never breaks anything else.
-    (b) Fallback: a Gaia G/BP/RP colour transform to a Johnson-Cousins/SDSS
+    (b) Fallback: a Gaia G/BP/RP colour transform to an SDSS
         magnitude (:data:`GAIA_TRANSFORMS`, coefficients from Riello et al.
         2021 -- see that dict's docstring for the exact citation), mapped
         per instrument via ``[instrument.filters.gaia_transform]``.
@@ -144,7 +144,7 @@ _GAIA_QUERY_COLUMNS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Path (b): Gaia DR3 -> Johnson-Cousins/SDSS colour-transform polynomials
+# Path (b): Gaia DR3 -> SDSS colour-transform polynomials
 # ---------------------------------------------------------------------------
 #
 # Source: Riello, M., De Angeli, F., Evans, D. W., et al. 2021, A&A, 649, A3,

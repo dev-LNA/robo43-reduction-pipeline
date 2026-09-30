@@ -38,7 +38,18 @@ flip_y = false
 [instrument.filters]
 # S-PLUS / Javalambre 12-band system. Only "R" has been seen in real headers
 # so far; the other spellings are assumed and must be checked against data.
+# T80S "R" is the S-PLUS rSDSS filter (~/Dropbox/splus_filters/rSDSS.csv:
+# pivot 6252 A, half-power 5530-6990 A), NOT Bessell/Cousins R. G, I, Z and U
+# are likewise gSDSS, iSDSS, zSDSS and uJAVA.
 valid = ["U", "F378", "F395", "F410", "F430", "G", "F515", "R", "F660", "I", "F861", "Z"]
+
+[instrument.filters.map]
+# S-PLUS band names -> the names T80S writes in FILTER.
+rSDSS = "R"
+gSDSS = "G"
+iSDSS = "I"
+zSDSS = "Z"
+uJAVA = "U"
 
 [instrument.keywords]
 gain_setting = ["PG5_2"]
@@ -90,6 +101,8 @@ F410 = "J0410"
 F430 = "J0430"
 G = "gJPLUS"
 F515 = "J0515"
+# rJPLUS == S-PLUS rSDSS: rSDSS.csv convolved with 60 Gaia XP spectra of T80S
+# stars agrees with gaiaxpy rJPLUS to 0.001 mag (rms 0.001), 2026-09-30.
 R = "rJPLUS"
 F660 = "J0660"
 I = "iJPLUS"
@@ -98,7 +111,7 @@ Z = "zJPLUS"
 
 [instrument.filters.gaia_transform]
 # Fallback when gaiaxpy is unavailable or the XP query fails: a Gaia DR3
-# G-band colour transform to a Johnson-Cousins/SDSS quantity (Riello et al.
+# G-band colour transform to an SDSS quantity (Riello et al.
 # 2021, A&A 649, A3, "Gaia Early Data Release 3: Photometric content and
 # validation", arXiv:2012.01916v1, Appendix C, Table C.2; see
 # robo43.photometry.gaia_zp.GAIA_TRANSFORMS for the exact coefficients).
@@ -107,6 +120,8 @@ Z = "zJPLUS"
 # narrow Javalambre filters and uJAVA have no Gaia broad-band analogue and
 # are deliberately left unmapped -- absolute calibration for them is only
 # ever available via [instrument.filters.gaia_xp] above.
+# For T80S R (S-PLUS rSDSS) the Riello sdss_r relation is off by 0.02-0.06 mag
+# (slope +0.06 mag/mag in BP-RP vs rJPLUS); fallback only.
 G = "sdss_g"
 R = "sdss_r"
 I = "sdss_i"
