@@ -40,6 +40,7 @@ __all__ = [
     "CoaddSettings",
     "DatabaseSettings",
     "DiagnosticsSettings",
+    "ForcedSettings",
     "PathSettings",
     "PhotometrySettings",
     "RuntimeSettings",
@@ -182,6 +183,68 @@ class PhotometrySettings:
     gaia_zp_surface_order: int = 1
     catalog_format: str = "mef"
     write_catalog: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ForcedSettings:
+    """Fixed-centroid ("forced") aperture photometry -- see :mod:`robo43.photometry.forced`.
+
+    Deliberately **not** part of :data:`SCIENCE_SECTIONS`: adding a section there
+    would change ``Settings.config_hash`` (``PIPECFG``) of every existing product.
+    The forced stage records its own parameters in ``forced_params.json``.
+    """
+
+    #: A source is "useful" for the centroid-frame score when it is unflagged
+    #: and has ``SNR >= snr_useful``.
+    snr_useful: float = 20.0
+    #: Stars used to measure frame transparency: unflagged, isolated, SNR above this.
+    transparency_snr_min: float = 50.0
+    #: Aperture (arcsec; nearest configured radius is used) whose flux ratio
+    #: defines transparency. Large, so that seeing changes do not leak into it.
+    transparency_aperture_arcsec: float = 8.0
+    transparency_min_stars: int = 20
+    #: Transparency is normalised so that this percentile of the night is 1.
+    transparency_norm_percentile: float = 95.0
+    #: Frames below this relative transparency cannot supply centroids.
+    transparency_min: float = 0.9
+    #: Frames whose astrometric RMS exceeds this (or that are unsolved) cannot supply centroids.
+    astrometry_rms_max_arcsec: float = 0.6
+    #: score = n_useful/max(n_useful) * (fwhm_min/fwhm) ** seeing_power
+    seeing_power: float = 2.0
+    n_centroid_frames: int = 3
+    #: A master source must be detected in this many of the selected frames
+    #: (capped by the number of selected frames whose footprint covers it).
+    min_frames: int = 2
+    match_radius_arcsec: float = 1.0
+    #: Master sources closer than this to a better-detected one are dropped.
+    dedupe_radius_arcsec: float = 0.7
+    #: Local sky annulus, subtracted on top of the 2-D sky model (``measure_sources`` does this
+    #: too); it starts ``local_bkg_gap_arcsec`` beyond the largest aperture and is
+    #: ``local_bkg_width_arcsec`` wide (0 switches it off).  The per-source estimate is then
+    #: replaced by the median over the ``local_bkg_smooth_k`` nearest master sources (<= 1: no
+    #: smoothing): the raw per-source annulus estimate is noisy enough to raise the bright-star
+    #: scatter by 7 % (r = 2") to 146 % (8") on 20251107, while the smoothed one keeps the local
+    #: sky level without that noise (see ``photometry/forced.py``).
+    local_bkg_gap_arcsec: float = 1.0
+    local_bkg_width_arcsec: float = 8.0
+    local_bkg_smooth_k: int = 128
+    #: Other master sources are masked out of the annulus within this many FWHM.
+    source_mask_fwhm: float = 1.0
+    #: Aperture (arcsec; nearest configured radius) behind SNR and the *_AUTO/alias columns.
+    snr_aperture_arcsec: float = 6.0
+    #: Bad/saturated/non-linear pixels within this radius set the per-source flags.
+    flag_radius_arcsec: float = 4.0
+    #: Per-frame detections within this radius lend their shape columns to a master source.
+    shape_match_radius_arcsec: float = 1.5
+    #: Keep master sources whose centre is off the frame as NaN, flagged rows
+    #: (default: omit them, like a catalogue does for a star that is not on the frame).
+    keep_offframe: bool = False
+    #: Do not measure frames whose astrometry is unsolved (``ASTRSOLV`` false or missing, or
+    #: ``ASTRRMS`` NaN or above ``astrometry_rms_max_arcsec``): sky-fixed apertures through a
+    #: missing or wrong WCS land off the stars (T80S 20251207: two such frames gave flux ratios of
+    #: 0.04-0.13 and were kept by relphot).  The frame gets an ``error`` row in
+    #: ``forced_status.csv`` and no catalogue; leave it out of the ``relphot ingest`` file list.
+    skip_unsolved: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +461,7 @@ class Settings:
     paths: PathSettings = field(default_factory=PathSettings)
     astrometry: AstrometrySettings = field(default_factory=AstrometrySettings)
     photometry: PhotometrySettings = field(default_factory=PhotometrySettings)
+    forced: ForcedSettings = field(default_factory=ForcedSettings)
     calib: CalibSettings = field(default_factory=CalibSettings)
     coadd: CoaddSettings = field(default_factory=CoaddSettings)
     diagnostics: DiagnosticsSettings = field(default_factory=DiagnosticsSettings)
@@ -436,6 +500,7 @@ _SECTIONS: dict[str, type] = {
     "paths": PathSettings,
     "astrometry": AstrometrySettings,
     "photometry": PhotometrySettings,
+    "forced": ForcedSettings,
     "calib": CalibSettings,
     "coadd": CoaddSettings,
     "diagnostics": DiagnosticsSettings,
@@ -664,6 +729,24 @@ def _validate(settings: Settings) -> None:
             f"(got {settings.photometry.gaia_zp_surface_order!r})"
         )
         raise ConfigError(msg)
+    fs = settings.forced
+    for where, ok in (
+        ("forced.n_centroid_frames must be >= 1", fs.n_centroid_frames >= 1),
+        ("forced.min_frames must be >= 1", fs.min_frames >= 1),
+        ("forced.transparency_min must be in (0, 1]", 0.0 < fs.transparency_min <= 1.0),
+        ("forced.seeing_power must be >= 0", fs.seeing_power >= 0.0),
+        (
+            "forced.transparency_norm_percentile must be in (50, 100]",
+            50.0 < fs.transparency_norm_percentile <= 100.0,
+        ),
+        ("forced.snr_useful must be > 0", fs.snr_useful > 0.0),
+        ("forced.match_radius_arcsec must be > 0", fs.match_radius_arcsec > 0.0),
+        ("forced.local_bkg_width_arcsec must be >= 0", fs.local_bkg_width_arcsec >= 0.0),
+        ("forced.local_bkg_smooth_k must be >= 0", fs.local_bkg_smooth_k >= 0),
+        ("forced.flag_radius_arcsec must be > 0", fs.flag_radius_arcsec > 0.0),
+    ):
+        if not ok:
+            raise ConfigError(where)
     if settings.runtime.strict and settings.runtime.assume_profile_defaults:
         msg = "--strict and --assume-profile-defaults are mutually exclusive"
         raise ConfigError(msg)

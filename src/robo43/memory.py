@@ -61,6 +61,7 @@ __all__ = [
 #: prevent.
 STAGE_BYTES_PER_PIXEL: dict[str, float] = {
     "photometry": 96.0,
+    "forced": 72.0,
     "astrometry": 40.0,
     "reduce.science": 48.0,
 }
