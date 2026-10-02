@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     from astropy.io import fits
     from astropy.wcs import WCS
 
-    from robo43.config import Settings
+    from robo43.config import PhotometrySettings, Settings
     from robo43.instruments.profile import InstrumentProfile
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,7 @@ __all__ = [
     "FLAG_SATURATED",
     "FLAG_TRUNCATED",
     "PhotometryResult",
+    "estimate_sky_background",
     "measure_sources",
     "pixel_scale_arcsec",
 ]
@@ -235,6 +236,26 @@ def pixel_scale_arcsec(header: fits.Header, wcs: WCS | None, profile: Instrument
     raise PhotometryError(msg)
 
 
+def estimate_sky_background(
+    sci: np.ndarray, bad_mask: np.ndarray, ps: PhotometrySettings
+) -> Background2D:
+    """The 2-D sky model both :func:`measure_sources` and the forced-photometry stage subtract.
+
+    ``bad_mask`` is True for pixels excluded from the estimate (see
+    :data:`_BAD_PIXEL_FLAGS`). Kept in one place so a fixed-position measurement
+    sees exactly the same sky as the per-frame detection run.
+    """
+    return Background2D(
+        sci.astype(np.float64),
+        box_size=ps.back_size,
+        filter_size=ps.back_filtersize,
+        sigma_clip=SigmaClip(sigma=3.0),
+        bkg_estimator=MedianBackground(),
+        mask=bad_mask,
+        exclude_percentile=50.0,
+    )
+
+
 def _empty_table(n_aper: int) -> Table:
     columns: dict[str, np.ndarray] = {
         name: np.zeros(0, dtype=dtype) for name, dtype in _SCALAR_DTYPES.items()
@@ -352,15 +373,7 @@ def measure_sources(
 
     bad_mask = (dq.astype(np.int64) & _BAD_PIXEL_FLAGS) != 0
 
-    bkg = Background2D(
-        sci.astype(np.float64),
-        box_size=ps.back_size,
-        filter_size=ps.back_filtersize,
-        sigma_clip=SigmaClip(sigma=3.0),
-        bkg_estimator=MedianBackground(),
-        mask=bad_mask,
-        exclude_percentile=50.0,
-    )
+    bkg = estimate_sky_background(sci, bad_mask, ps)
     sky_level = float(np.median(bkg.background))
     sky_rms = float(np.median(bkg.background_rms))
 

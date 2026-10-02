@@ -98,6 +98,36 @@ gaia_zp_color_term = true
 # detector (x, y), 2 = a full quadratic surface.
 gaia_zp_surface_order = 1
 
+[forced]
+# Fixed-centroid ("forced") aperture photometry, `robo43 forced`
+# (robo43.photometry.forced). Not part of the PIPECFG hash.
+snr_useful = 20.0
+transparency_snr_min = 50.0
+transparency_aperture_arcsec = 8.0
+transparency_min_stars = 20
+transparency_norm_percentile = 95.0
+# Frames below this relative transparency cannot supply centroids.
+transparency_min = 0.9
+astrometry_rms_max_arcsec = 0.6
+# score = n_useful/max(n_useful) * (fwhm_min/fwhm) ** seeing_power
+seeing_power = 2.0
+n_centroid_frames = 3
+min_frames = 2
+match_radius_arcsec = 1.0
+dedupe_radius_arcsec = 0.7
+# Local sky annulus on top of the 2-D sky model (width 0 = off); the per-source estimate is
+# replaced by the median over the smooth_k nearest master sources (<= 1: no smoothing).
+local_bkg_gap_arcsec = 1.0
+local_bkg_width_arcsec = 8.0
+local_bkg_smooth_k = 128
+source_mask_fwhm = 1.0
+snr_aperture_arcsec = 6.0
+flag_radius_arcsec = 4.0
+shape_match_radius_arcsec = 1.5
+keep_offframe = false
+# Skip frames with unsolved astrometry (no catalogue; error row in forced_status.csv).
+skip_unsolved = true
+
 [calib]
 combine_method = "mean"
 sigma_clip_low = 3.0
