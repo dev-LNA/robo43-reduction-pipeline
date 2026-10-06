@@ -24,7 +24,7 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 
 from robo43.exceptions import MetadataError
 from robo43.instruments.keywords import OBJECT_TYPE_PATTERNS
-from robo43.instruments.profile import InstrumentProfile
+from robo43.instruments.profile import InstrumentProfile, ReadoutModeVote
 from robo43.io.fits_io import read_header
 from robo43.io.meta import FieldOrigin, FrameMeta, Source
 
@@ -233,80 +233,69 @@ def derive_airmass(
         return None
 
 
-#: ``"<profile name>:<status>"`` keys (status "repaired" / "unresolved") whose
-#: first gain-setting repair case in this process was already logged at
-#: WARNING; later cases with the same key log at DEBUG only.
-_GAIN_REPAIR_WARNED: set[str] = set()
+#: ``"<profile name>:<status>"`` keys (status "disagree" / "default") whose
+#: first readout-mode case in this process was already logged at WARNING;
+#: later cases with the same key log at DEBUG only.
+_READOUT_MODE_WARNED: set[str] = set()
 
 
-def parse_duration_seconds(value: Any) -> float | None:
-    """Parse a header duration into seconds, or ``None`` if it is not one.
-
-    Accepts a number, a numeric string (``"16.227"``) or ``"HH:MM:SS.sss"``.
-    Booleans, empty or non-finite values, and anything else give ``None``.
-    Never raises.
-    """
+def _card_number(value: Any) -> float | None:
+    """A header card as a finite float, or ``None`` (never raises)."""
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
-    seconds: float
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        seconds = float(value)
-    elif isinstance(value, str):
-        text = value.strip()
-        try:
-            seconds = float(text)
-        except ValueError:
-            parts = text.split(":")
-            if len(parts) != 3:
-                return None
-            try:
-                hours, minutes, secs = (float(p) for p in parts)
-            except ValueError:
-                return None
-            seconds = hours * 3600.0 + minutes * 60.0 + secs
-    else:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
         return None
-    return seconds if math.isfinite(seconds) else None
+    return number if math.isfinite(number) else None
 
 
-def repair_gain_setting(
-    header: fits.Header, profile: InstrumentProfile, value: float, keyword: str
-) -> tuple[float, str | None, str]:
-    """Apply ``profile.gain_setting_repair`` to a frame's resolved gain setting.
+def _vote_mode(vote: ReadoutModeVote, number: float) -> str | None:
+    if vote.threshold is not None:
+        return vote.below if number < vote.threshold else vote.at_or_above
+    for target, mode in vote.values:
+        if math.isclose(number, target, rel_tol=0.0, abs_tol=1e-9):
+            return mode
+    return None
 
-    ``value`` is the float read from header keyword ``keyword``.  Returns
-    ``(new_value, detail, status)``:
 
-    * ``status == "none"``: no repair applies (the profile has none, or
-      ``value`` differs from the repair's ``when_value``); ``(value, None, "none")``.
-    * ``status == "repaired"``: the fallback card parsed; ``new_value`` is
-      ``value_above`` (seconds strictly above the threshold) or
-      ``value_at_or_below``.
-    * ``status == "unresolved"``: the fallback card is missing or unparseable;
-      ``new_value`` is ``value`` unchanged.
+def derive_readout_mode(
+    header: fits.Header, profile: InstrumentProfile
+) -> tuple[str, str, str] | None:
+    """Apply ``profile.readout_mode_rule`` to a frame's header.
 
-    ``detail`` is the human-readable reason for the last two statuses.
+    Returns ``None`` when the profile has no rule.  Otherwise
+    ``(mode, detail, status)``:
+
+    * ``status == "ok"``: the votes present agree; ``mode`` is their mode.
+    * ``status == "disagree"``: the votes present name different modes;
+      ``mode`` is the highest-priority vote's.
+    * ``status == "default"``: no vote is present; ``mode`` is the rule's
+      default.
+
+    ``detail`` names the deciding card(s), e.g. ``"mode0 from PG0_50=-12.96"``.
+    A missing, non-numeric or out-of-map card casts no vote.
     """
-    repair = profile.gain_setting_repair
-    if repair is None or value != repair.when_value:
-        return value, None, "none"
-    raw = header.get(repair.fallback_keyword)
-    seconds = parse_duration_seconds(raw)
-    if seconds is None:
-        detail = (
-            f"{keyword}={value:g} kept: {repair.fallback_keyword} is missing or "
-            f"unparseable ({raw!r})"
-        )
-        return value, detail, "unresolved"
-    if seconds > repair.threshold_seconds:
-        new_value, relation = repair.value_above, ">"
-    else:
-        new_value, relation = repair.value_at_or_below, "<="
-    detail = (
-        f"{keyword}={value:g} -> {new_value:g} because "
-        f"{repair.fallback_keyword}={seconds:g} s {relation} {repair.threshold_seconds:g} s"
-    )
-    return new_value, detail, "repaired"
+    rule = profile.readout_mode_rule
+    if rule is None:
+        return None
+    cast: list[tuple[str, float, str]] = []
+    for vote in rule.votes:
+        number = _card_number(header.get(vote.keyword))
+        if number is None:
+            continue
+        mode = _vote_mode(vote, number)
+        if mode is not None:
+            cast.append((vote.keyword, number, mode))
+    if not cast:
+        keywords = ", ".join(v.keyword for v in rule.votes)
+        return rule.default, f"{rule.default} by default: no vote from {keywords}", "default"
+    keyword, number, mode = cast[0]
+    detail = f"{mode} from {keyword}={number:g}"
+    if any(m != mode for _, _, m in cast[1:]):
+        others = ", ".join(f"{k}={n:g} -> {m}" for k, n, m in cast[1:])
+        return mode, f"{detail} (disagreeing: {others})", "disagree"
+    return mode, detail, "ok"
 
 
 def read_meta(
@@ -400,38 +389,6 @@ def read_meta(
                 values[field] = None
                 origins.pop(field, None)
 
-    # gain_setting repair: only for a profile declaring
-    # [instrument.gain_setting_repair], never for an overridden value. Done
-    # here, once, so every consumer of FrameMeta.gain_setting sees the
-    # repaired value; the origin becomes DERIVED with the reason as detail.
-    gain_origin = origins.get("gain_setting")
-    if (
-        profile.gain_setting_repair is not None
-        and "gain_setting" not in field_overrides
-        and values.get("gain_setting") is not None
-        and gain_origin is not None
-    ):
-        repaired, repair_detail, repair_status = repair_gain_setting(
-            header, profile, values["gain_setting"], gain_origin.detail
-        )
-        if repair_status == "repaired":
-            values["gain_setting"] = repaired
-            origins["gain_setting"] = FieldOrigin(Source.DERIVED, repair_detail)
-        if repair_status != "none":
-            warned_key = f"{profile.name}:{repair_status}"
-            if warned_key in _GAIN_REPAIR_WARNED:
-                logger.debug("%s: gain_setting repair: %s", path, repair_detail)
-            else:
-                _GAIN_REPAIR_WARNED.add(warned_key)
-                logger.warning(
-                    "%s: gain_setting repair: %s (further '%s' cases for profile "
-                    "'%s' are logged at DEBUG only)",
-                    path,
-                    repair_detail,
-                    repair_status,
-                    profile.name,
-                )
-
     # binning -> int
     if values.get("binning") is not None:
         try:
@@ -443,6 +400,31 @@ def read_meta(
     # readout_mode -> str (a free-text camera setting; no numeric cast)
     if values.get("readout_mode") is not None:
         values["readout_mode"] = str(values["readout_mode"])
+
+    # readout_mode from the profile's [instrument.readout_mode_rule]: replaces a
+    # value read from the header aliases, never an explicit --set / overrides
+    # value. Done here, once, so every consumer of FrameMeta.readout_mode sees
+    # it; the origin is DERIVED with the deciding card(s) as detail.
+    if profile.readout_mode_rule is not None and "readout_mode" not in field_overrides:
+        derived = derive_readout_mode(header, profile)
+        if derived is not None:
+            mode, mode_detail, mode_status = derived
+            values["readout_mode"] = mode
+            origins["readout_mode"] = FieldOrigin(Source.DERIVED, mode_detail)
+            if mode_status != "ok":
+                warned_key = f"{profile.name}:{mode_status}"
+                if warned_key in _READOUT_MODE_WARNED:
+                    logger.debug("%s: readout mode: %s", path, mode_detail)
+                else:
+                    _READOUT_MODE_WARNED.add(warned_key)
+                    logger.warning(
+                        "%s: readout mode: %s (further '%s' cases for profile "
+                        "'%s' are logged at DEBUG only)",
+                        path,
+                        mode_detail,
+                        mode_status,
+                        profile.name,
+                    )
 
     # mjd -> float (may be overwritten below by header value's own presence)
     if values.get("mjd") is not None:

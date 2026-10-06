@@ -12,6 +12,7 @@ the same name.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -44,7 +45,7 @@ _KNOWN_INSTRUMENT_KEYS = {
     "binning_keyword",
     "trust_header_wcs",
     "calib",
-    "gain_setting_repair",
+    "readout_mode_rule",
     "layout",
     "filters",
     "keywords",
@@ -121,26 +122,39 @@ class InstrumentCalibOptions:
 
 
 @dataclass(frozen=True, slots=True)
-class GainSettingRepair:
-    """Repair of a ``gain_setting`` header value lost to a failed header fill-up
-    (``[instrument.gain_setting_repair]``).
+class ReadoutModeVote:
+    """One header card's vote on a frame's readout mode.
 
-    When a frame's resolved ``gain_setting`` equals ``when_value``, the header
-    card ``fallback_keyword`` is read as a duration in seconds (a number, a
-    numeric string, or ``"HH:MM:SS.sss"``): strictly greater than
-    ``threshold_seconds`` the frame's ``gain_setting`` becomes ``value_above``,
-    otherwise (at or below the threshold) ``value_at_or_below``.  A missing or
-    unparseable fallback card leaves ``gain_setting`` unchanged (and is
-    logged), since there is no basis to choose between the two values.  A
-    profile without the table has no repair (``InstrumentProfile.
-    gain_setting_repair`` is ``None``).
+    Either a threshold vote (``threshold`` with ``below`` and ``at_or_above``:
+    the card's number below the threshold votes ``below``, at or above it
+    ``at_or_above``) or a value-map vote (``values``: ``(number, mode)`` pairs;
+    a card number equal to one of them votes that mode, any other number gives
+    no vote).  A missing or non-numeric card gives no vote.
     """
 
-    when_value: float
-    fallback_keyword: str
-    threshold_seconds: float
-    value_above: float
-    value_at_or_below: float
+    keyword: str
+    threshold: float | None = None
+    below: str | None = None
+    at_or_above: str | None = None
+    values: tuple[tuple[float, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReadoutModeRule:
+    """Profile-driven readout-mode derivation (``[instrument.readout_mode_rule]``).
+
+    ``votes`` are listed in priority order; the first vote that gives a mode
+    decides it.  When the votes present disagree a WARNING is logged (once per
+    process per profile); when no vote is present at all ``default`` is used
+    and a WARNING is logged the same way.  The result is the frame's
+    ``readout_mode`` (origin ``DERIVED``); it replaces a ``readout_mode`` read
+    from the header keyword aliases but never an explicit ``--set`` /
+    overrides value.  A profile without the table has no rule
+    (``InstrumentProfile.readout_mode_rule`` is ``None``).
+    """
+
+    default: str
+    votes: tuple[ReadoutModeVote, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,9 +201,9 @@ class InstrumentProfile:
     # rescaled to pixel_scale_arcsec instead of carrying the nominal one.
     trust_header_wcs: bool = True
     calib: InstrumentCalibOptions = field(default_factory=InstrumentCalibOptions)
-    # Optional repair of a lost gain_setting header value (see GainSettingRepair);
-    # None (the default) means every frame's gain_setting is taken as written.
-    gain_setting_repair: GainSettingRepair | None = None
+    # Optional derivation of readout_mode from header cards (see ReadoutModeRule);
+    # None (the default) means readout_mode is taken from the header aliases only.
+    readout_mode_rule: ReadoutModeRule | None = None
     version: str = "1"
     source: str = "packaged"
 
@@ -253,52 +267,122 @@ def _float_or_none(instrument: dict[str, Any], key: str, origin: str) -> float |
         raise ConfigError(msg) from exc
 
 
-_GAIN_SETTING_REPAIR_KEYS = (
-    "when_value",
-    "fallback_keyword",
-    "threshold_seconds",
-    "value_above",
-    "value_at_or_below",
-)
+_READOUT_RULE_KEYS = {"default", "votes"}
+_READOUT_VOTE_KEYS = {"keyword", "threshold", "below", "at_or_above", "map"}
 
 
-def _parse_gain_setting_repair(raw: Any, origin: str) -> GainSettingRepair:
-    """Validate an ``[instrument.gain_setting_repair]`` table (all five keys required)."""
-    if not isinstance(raw, dict):
-        msg = f"{origin}: [instrument.gain_setting_repair] must be a table"
-        raise ConfigError(msg)
-    unknown = set(raw) - set(_GAIN_SETTING_REPAIR_KEYS)
-    if unknown:
-        msg = f"{origin}: unknown key(s) {sorted(unknown)} in [instrument.gain_setting_repair]"
-        raise ConfigError(msg)
-    missing = [k for k in _GAIN_SETTING_REPAIR_KEYS if k not in raw]
-    if missing:
-        msg = f"{origin}: [instrument.gain_setting_repair] is missing key(s) {missing}"
-        raise ConfigError(msg)
-    keyword = raw["fallback_keyword"]
-    if not isinstance(keyword, str) or not keyword.strip():
+def _nonempty_str(value: Any, what: str, origin: str) -> str:
+    if not isinstance(value, str) or not value.strip():
         msg = (
-            f"{origin}: [instrument.gain_setting_repair] fallback_keyword must be "
-            f"a non-empty string, got {keyword!r}"
+            f"{origin}: [instrument.readout_mode_rule] {what} must be a "
+            f"non-empty string, got {value!r}"
         )
         raise ConfigError(msg)
-    numbers: dict[str, float] = {}
-    for key in ("when_value", "threshold_seconds", "value_above", "value_at_or_below"):
-        try:
-            numbers[key] = float(raw[key])
-        except (TypeError, ValueError) as exc:
+    return value.strip()
+
+
+def _finite_number(value: Any, what: str, origin: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = (
+            f"{origin}: [instrument.readout_mode_rule] {what} must be a "
+            f"number, got {value!r}"
+        )
+        raise ConfigError(msg)
+    number = float(value)
+    if not math.isfinite(number):
+        msg = f"{origin}: [instrument.readout_mode_rule] {what} must be finite, got {value!r}"
+        raise ConfigError(msg)
+    return number
+
+
+def _parse_readout_mode_vote(raw: Any, index: int, origin: str) -> ReadoutModeVote:
+    label = f"votes[{index}]"
+    if not isinstance(raw, dict):
+        msg = f"{origin}: [instrument.readout_mode_rule] {label} must be a table"
+        raise ConfigError(msg)
+    unknown = set(raw) - _READOUT_VOTE_KEYS
+    if unknown:
+        msg = (
+            f"{origin}: unknown key(s) {sorted(unknown)} in "
+            f"[instrument.readout_mode_rule] {label}"
+        )
+        raise ConfigError(msg)
+    if "keyword" not in raw:
+        msg = f"{origin}: [instrument.readout_mode_rule] {label} is missing key 'keyword'"
+        raise ConfigError(msg)
+    keyword = _nonempty_str(raw["keyword"], f"{label} keyword", origin)
+    threshold_keys = {"threshold", "below", "at_or_above"} & set(raw)
+    has_map = "map" in raw
+    if has_map and threshold_keys:
+        msg = (
+            f"{origin}: [instrument.readout_mode_rule] {label} cannot combine 'map' "
+            f"with {sorted(threshold_keys)}"
+        )
+        raise ConfigError(msg)
+    if has_map:
+        raw_map = raw["map"]
+        if not isinstance(raw_map, dict) or not raw_map:
             msg = (
-                f"{origin}: [instrument.gain_setting_repair] {key} must be a "
-                f"number, got {raw[key]!r}"
+                f"{origin}: [instrument.readout_mode_rule] {label} map must be a "
+                f"non-empty table of number = mode, got {raw_map!r}"
             )
-            raise ConfigError(msg) from exc
-    return GainSettingRepair(
-        when_value=numbers["when_value"],
-        fallback_keyword=keyword.strip(),
-        threshold_seconds=numbers["threshold_seconds"],
-        value_above=numbers["value_above"],
-        value_at_or_below=numbers["value_at_or_below"],
+            raise ConfigError(msg)
+        pairs: list[tuple[float, str]] = []
+        for raw_key, raw_mode in raw_map.items():
+            try:
+                number = float(raw_key)
+            except (TypeError, ValueError) as exc:
+                msg = (
+                    f"{origin}: [instrument.readout_mode_rule] {label} map key "
+                    f"{raw_key!r} is not a number"
+                )
+                raise ConfigError(msg) from exc
+            if not math.isfinite(number):
+                msg = (
+                    f"{origin}: [instrument.readout_mode_rule] {label} map key "
+                    f"{raw_key!r} must be finite"
+                )
+                raise ConfigError(msg)
+            pairs.append((number, _nonempty_str(raw_mode, f"{label} map value", origin)))
+        return ReadoutModeVote(keyword=keyword, values=tuple(pairs))
+    missing = [k for k in ("threshold", "below", "at_or_above") if k not in raw]
+    if missing:
+        msg = (
+            f"{origin}: [instrument.readout_mode_rule] {label} needs either 'map' or "
+            f"'threshold', 'below' and 'at_or_above' (missing {missing})"
+        )
+        raise ConfigError(msg)
+    return ReadoutModeVote(
+        keyword=keyword,
+        threshold=_finite_number(raw["threshold"], f"{label} threshold", origin),
+        below=_nonempty_str(raw["below"], f"{label} below", origin),
+        at_or_above=_nonempty_str(raw["at_or_above"], f"{label} at_or_above", origin),
     )
+
+
+def _parse_readout_mode_rule(raw: Any, origin: str) -> ReadoutModeRule:
+    """Validate an ``[instrument.readout_mode_rule]`` table (``default`` and ``votes`` required)."""
+    if not isinstance(raw, dict):
+        msg = f"{origin}: [instrument.readout_mode_rule] must be a table"
+        raise ConfigError(msg)
+    unknown = set(raw) - _READOUT_RULE_KEYS
+    if unknown:
+        msg = f"{origin}: unknown key(s) {sorted(unknown)} in [instrument.readout_mode_rule]"
+        raise ConfigError(msg)
+    missing = [k for k in ("default", "votes") if k not in raw]
+    if missing:
+        msg = f"{origin}: [instrument.readout_mode_rule] is missing key(s) {missing}"
+        raise ConfigError(msg)
+    default = _nonempty_str(raw["default"], "default", origin)
+    raw_votes = raw["votes"]
+    if not isinstance(raw_votes, list) or not raw_votes:
+        msg = (
+            f"{origin}: [instrument.readout_mode_rule] votes must be a non-empty "
+            f"list of tables ([[instrument.readout_mode_rule.votes]])"
+        )
+        raise ConfigError(msg)
+    votes = tuple(_parse_readout_mode_vote(v, i, origin) for i, v in enumerate(raw_votes))
+    return ReadoutModeRule(default=default, votes=votes)
 
 
 def _profile_from_toml_dict(
@@ -375,9 +459,9 @@ def _profile_from_toml_dict(
             msg = f"[instrument.calib] {_key} must be >= 1, got {getattr(calib_options, _key)}"
             raise ConfigError(msg)
 
-    gain_setting_repair = (
-        _parse_gain_setting_repair(instrument["gain_setting_repair"], path_for_errors)
-        if "gain_setting_repair" in instrument
+    readout_mode_rule = (
+        _parse_readout_mode_rule(instrument["readout_mode_rule"], path_for_errors)
+        if "readout_mode_rule" in instrument
         else None
     )
 
@@ -440,7 +524,7 @@ def _profile_from_toml_dict(
         search_radius_deg=search_radius_deg,
         trust_header_wcs=trust_header_wcs,
         calib=calib_options,
-        gain_setting_repair=gain_setting_repair,
+        readout_mode_rule=readout_mode_rule,
         version=str(version),
         source=source,
     )
