@@ -39,6 +39,7 @@ SUBCOMMAND_MODULES: tuple[str, ...] = (
     "coadd",
     "photometry",
     "forced",
+    "tilegain",
     "catalog",
     "colour",
     "thumb",

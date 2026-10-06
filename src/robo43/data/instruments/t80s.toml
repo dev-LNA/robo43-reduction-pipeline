@@ -93,6 +93,50 @@ map = { "17" = "mode0", "68" = "mode5" }
 keyword = "PG5_2"
 map = { "0" = "mode0", "1" = "mode5" }
 
+[instrument.tile_gain_pattern]
+# Relative gain of each of the 16 amplifier tiles for each readout mode, one value per tile in
+# row-major tile order (tile = row_block * 8 + col_block; 8 x 2 tiles of 1152 x 4616 px in the
+# trimmed 9216 x 9232 frame, the order of OverscanGeometry.science_tile_slices). Normalised to
+# median 1, like the summary gain K (the median over tiles): the gain of tile t is
+# K_run * p_t, where K_run is the run's measured summary gain (robo43.calib.gain). The noisy
+# per-tile photon-transfer values (0.5-1.1 % rms error per measurement, from the bias-limited
+# variance of one to three flat pairs per tile) are then not used for the flat or science
+# conversion; they stay in gain_measurements.json as ptc_gain_e_per_adu. The true tile gain
+# pattern is a stable property of the readout mode (0.01-0.04 % over three months) and differs
+# between the modes by 0.46 % rms (max 0.93 %). A mode with no entry keeps its per-tile PTC gains.
+# Products built with a table carry GAINPAT = 'table:<mode>'; a master flat is reused for another
+# night only if it carries the same GAINPAT (robo43.calib.pool.find_nearest_master_flat).
+#
+# Derived 2026-10-06 (robo43 commit 74d8339 + this change) from the amplifier-boundary
+# continuity of master flats: `robo43 tilegain derive --instrument t80s --mode MODE --grid 8x2
+# MASTER...` (robo43.calib.tilegain: 16-px strips with a 64-px margin, gradient-corrected steps,
+# log-multiplicative least squares over the 22 boundaries, mean of ln p over the masters). Every
+# master was converted to ADU with the per-tile gains in its own header (GAIN00..GAIN15).
+# Fit residual 0.023-0.044 % rms per mode5 master (0.029 / 0.034 % mode0), the same as the null
+# (pseudo-boundary, 32 per master) rms of 0.021-0.042 % (0.024 / 0.031 %): the steps are pure
+# per-tile factors.
+#
+# mode5: 7 masters master_flat_R_dome.fits built from raw R sky flats of single nights
+# 20251027 (8 flats), 20251111 (6), 20251121 (5), 20251202 (10), 20251217 (7), 20251224 (8),
+# 20260104 (8) with the 22 biases of 20251209 + 20251210 (raw night directories), flat_min_level_frac
+# 0.15. Scatter between the masters (std of 100 ln p): rms 0.028 %, max 0.038 % per tile.
+# (The 16 production masters 20251104-20251218 all use the same 13 flats, so they are not
+# independent: they agree with each other to 0.002 % and with this table to 0.016 % rms.)
+# mode0: 2 masters master_flat_G_dome.fits built from the G sky flats of 20250605 (4 flats, no
+# measurable gain, ADU master) and 20250620 (6 of 7 accepted) with the 22 biases of 20250608 +
+# 20250609. Scatter between the two: rms 0.013 %, max 0.035 % per tile. The production master
+# 20250610/calib/master_flat_G_dome.fits (both nights) agrees with this table to 0.017 % rms.
+# mode5 / mode0 reproduces the cross-mode correction of tests/reports/t80s_flat_crossmode_REPORT.md
+# (relphot repository) to 0.03 % rms.
+mode0 = [
+    1.000789, 1.000631, 0.991503, 0.983752, 0.986264, 0.981943, 0.962495, 0.973566,
+    1.024559, 1.015082, 0.999369, 1.010051, 1.004900, 1.009956, 1.003919, 0.990410,
+]
+mode5 = [
+    0.998777, 1.000320, 1.003677, 0.985880, 0.987270, 0.985879, 0.961582, 0.971447,
+    1.024238, 1.016980, 0.999680, 1.013516, 1.014673, 1.016286, 1.016400, 0.993853,
+]
+
 [instrument.imagetyp_map]
 # T80S writes IMAGETYP = 'sky-flat' for twilight flats (bias frames are
 # already 'ZERO' and science 'OBJECT', which the default map handles).

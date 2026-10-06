@@ -63,6 +63,26 @@ signal_faint``), which is what lets pairs of slightly different level be
 combined without residual flat-pattern leakage; the PTC relation is
 generalised accordingly (see :func:`_pair_gain_estimate`), and reduces
 exactly to the classical two-equal-level-frame formula when ``r == 1``.
+
+Tile gain pattern (``[instrument.tile_gain_pattern]``)
+------------------------------------------------------
+A per-tile PTC value is wrong by 0.5-1.1 % rms per measurement (one or a few
+flat pairs; the bias-pair variance is the limit), which leaves ~1 % rms
+amplifier steps in every electron master flat and in any science frame that
+is flat-fielded with a master built from another gain set. The *relative*
+tile gain pattern is a stable property of the readout mode (flat continuity
+across the amplifier boundaries gives it to ~0.03 %; see
+:mod:`robo43.calib.tilegain` and ``tests/reports/t80s_flat_crossmode_REPORT.md``
+in the relphot repository). When the instrument profile tabulates it for a
+frame group's readout mode, :func:`apply_tile_gain_pattern` (called at the end
+of :func:`measure_gain`) replaces every tile's gain by ``K_run * p_t``, where
+``K_run`` is the group's frame-level summary K (the median of the per-tile PTC
+values, measured exactly as before) and ``p_t`` is the tabulated pattern,
+normalised to median 1 so that the median of the tile gains stays ``K_run``.
+The noisy per-tile PTC value is kept in ``ptc_gain_e_per_adu``; the master flat
+build and the science conversion read ``gain_e_per_adu`` and so share the same
+gains by construction. A group with no tabulated pattern, or without a
+measurable ``K_run``, is untouched.
 """
 
 from __future__ import annotations
@@ -94,9 +114,12 @@ __all__ = [
     "DEFAULT_GAIN_MEASUREMENTS_NAME",
     "GainMeasurement",
     "GainMeasurementSet",
+    "TileGainPattern",
+    "apply_tile_gain_pattern",
     "measure_gain",
     "no_measurement_cards",
     "per_tile_header_cards",
+    "tile_gain_pattern_for",
 ]
 
 #: Default basename of the cached measurement file written into the calib
@@ -146,6 +169,14 @@ class GainMeasurement:
     # Total number of science tiles (amplifiers) in this group; 1 for a
     # single-amplifier instrument or an unmeasurable multi-amp geometry.
     n_tiles: int = 1
+    # The tile's own photon-transfer value, kept for diagnostics when a tile
+    # gain pattern replaced ``gain_e_per_adu`` (see apply_tile_gain_pattern);
+    # ``None`` when ``gain_e_per_adu`` is the PTC value itself.
+    ptc_gain_e_per_adu: float | None = None
+    # Label of the tile gain pattern behind this group's per-tile gains
+    # (``"table:<readout_mode>"``), or ``None`` when the per-tile PTC values
+    # are used as measured.
+    gain_pattern: str | None = None
 
     def header_cards(self) -> list[tuple[str, Any, str]]:
         """FITS header cards recording this measurement on a reduced product.
@@ -154,7 +185,7 @@ class GainMeasurement:
         whichever ``GainMeasurement`` this is called on; per-amplifier
         cards come from :func:`per_tile_header_cards` instead.
         """
-        return [
+        cards: list[tuple[str, Any, str]] = [
             ("GAINVAL", self.gain_e_per_adu, "measured gain (e-/ADU)"),
             ("GAINSRC", self.source, "origin of GAINVAL: measured/none"),
             ("GAINSET", self.gain_setting, "camera GAIN header setting index"),
@@ -164,6 +195,11 @@ class GainMeasurement:
             ("GAINSCT", self.scatter_frac, "relative scatter across gain pairs"),
             ("GAINNTL", self.n_tiles, "number of amplifier tiles measured"),
         ]
+        if self.gain_pattern is not None:
+            cards.append(
+                ("GAINPAT", self.gain_pattern, "tile gains = GAINVAL x tabulated pattern")
+            )
+        return cards
 
 
 def per_tile_header_cards(
@@ -183,9 +219,8 @@ def per_tile_header_cards(
     cards: list[tuple[str, Any, str]] = []
     for tm in tile_measurements:
         idx = tm.tile_index if tm.tile_index >= 0 else 0
-        cards.append(
-            (f"GAIN{idx:02d}", tm.gain_e_per_adu, f"measured gain, tile {idx} (e-/ADU)")
-        )
+        what = "gain used" if tm.gain_pattern is not None else "measured gain"
+        cards.append((f"GAIN{idx:02d}", tm.gain_e_per_adu, f"{what}, tile {idx} (e-/ADU)"))
         cards.append(
             (f"RDNS{idx:02d}", tm.read_noise_e, f"measured read noise, tile {idx} (e-)")
         )
@@ -206,6 +241,110 @@ def no_measurement_cards(
         ),
         ("READOUTM", readout_mode or "UNKNOWN", "camera readout mode"),
     ]
+
+
+#: Record fields written to ``gain_measurements.json`` only while they are set,
+#: so a group without a tile gain pattern is serialised byte-for-byte as before.
+_OPTIONAL_RECORD_FIELDS = ("ptc_gain_e_per_adu", "gain_pattern")
+
+
+def _record_dict(measurement: GainMeasurement) -> dict[str, Any]:
+    record = asdict(measurement)
+    for name in _OPTIONAL_RECORD_FIELDS:
+        if record[name] is None:
+            del record[name]
+    return record
+
+
+@dataclass(frozen=True, slots=True)
+class TileGainPattern:
+    """A profile's relative per-tile gain pattern for one readout mode.
+
+    ``values[t]`` is tile ``t``'s gain (e-/ADU) relative to the frame-level
+    summary K: normalised to median 1, so ``K_run * values`` has median
+    ``K_run`` -- the same definition as the summary K, the median over tiles.
+    Tile order is the row-major order of
+    :attr:`~robo43.calib.overscan.OverscanGeometry.science_tile_slices`.
+    """
+
+    readout_mode: str
+    values: tuple[float, ...]
+
+    @property
+    def label(self) -> str:
+        """The ``GAINPAT`` header value recognising this pattern on a product."""
+        return f"table:{self.readout_mode}"
+
+
+def tile_gain_pattern_for(
+    profile: InstrumentProfile | None, readout_mode: str | None
+) -> TileGainPattern | None:
+    """The profile's tile gain pattern for ``readout_mode``, or ``None`` when
+    the profile has no ``[instrument.tile_gain_pattern]`` table or no entry for
+    that mode (a frame without a readout mode never matches)."""
+    table = getattr(profile, "tile_gain_pattern", None)
+    if not table or not readout_mode:
+        return None
+    mode = str(readout_mode).strip()
+    values = table.get(mode)
+    if values is None:
+        return None
+    return TileGainPattern(readout_mode=mode, values=tuple(values))
+
+
+def apply_tile_gain_pattern(
+    gain_set: GainMeasurementSet, profile: InstrumentProfile | None
+) -> GainMeasurementSet:
+    """Replace each group's per-tile PTC gains by ``K_run * p_t`` where the
+    profile tabulates a pattern for the group's readout mode.
+
+    ``K_run`` is the group's frame-level summary ``gain_e_per_adu`` (left
+    untouched). Each tile record keeps its own PTC value in
+    ``ptc_gain_e_per_adu`` and gets ``gain_pattern = "table:<mode>"``; its read
+    noise in electrons is rescaled by the same gain ratio (the noise in ADU is
+    what was measured). A group with no pattern for its mode, no per-tile
+    records, or a tile count different from the pattern's is returned
+    unchanged (the last case with a WARNING). Idempotent, and a no-op for a
+    profile without a table.
+    """
+    if not getattr(profile, "tile_gain_pattern", None):
+        return gain_set
+    measurements = dict(gain_set.measurements)
+    tile_measurements = dict(gain_set.tile_measurements)
+    for key, summary in gain_set.measurements.items():
+        pattern = tile_gain_pattern_for(profile, key[0])
+        if pattern is None:
+            continue
+        tiles = gain_set.tile_measurements.get(key)
+        if not tiles or len(tiles) != len(pattern.values):
+            logger.warning(
+                "gain group %s: tile gain pattern %s has %d value(s) but the group has "
+                "%d tile record(s); keeping the per-tile PTC gains.",
+                key, pattern.label, len(pattern.values), len(tiles) if tiles else 0,
+            )
+            continue
+        k_run = summary.gain_e_per_adu
+        new_tiles = []
+        for tm, p in zip(tiles, pattern.values, strict=True):
+            gain = k_run * p
+            ptc = tm.ptc_gain_e_per_adu if tm.ptc_gain_e_per_adu is not None else tm.gain_e_per_adu
+            new_tiles.append(
+                dataclasses.replace(
+                    tm,
+                    gain_e_per_adu=gain,
+                    read_noise_e=tm.read_noise_e * gain / tm.gain_e_per_adu,
+                    ptc_gain_e_per_adu=ptc,
+                    gain_pattern=pattern.label,
+                )
+            )
+        tile_measurements[key] = tuple(new_tiles)
+        measurements[key] = dataclasses.replace(summary, gain_pattern=pattern.label)
+        logger.info(
+            "gain group %s: per-tile gains = K_run (%.4f e-/ADU) x tile gain pattern %s "
+            "(PTC per-tile values kept as ptc_gain_e_per_adu).",
+            key, k_run, pattern.label,
+        )
+    return GainMeasurementSet(measurements, tile_measurements)
 
 
 def _normalise_key(
@@ -274,9 +413,9 @@ class GainMeasurementSet:
         return self.tile_measurements.get(key)
 
     def to_json(self) -> list[dict[str, Any]]:
-        records = [asdict(m) for m in self.measurements.values()]
+        records = [_record_dict(m) for m in self.measurements.values()]
         for tiles in self.tile_measurements.values():
-            records.extend(asdict(m) for m in tiles)
+            records.extend(_record_dict(m) for m in tiles)
         return records
 
     def write(self, path: str | Path) -> None:
@@ -566,7 +705,10 @@ def measure_gain(
     its own pairs' per-pair estimates (see :func:`_pair_gain_estimate}`); a
     group's frame-level summary (``tile_index == -1``) is the median of its
     tiles' K/read-noise, for header cards and callers that predate per-tile
-    measurement.
+    measurement. When ``profile`` tabulates a tile gain pattern for a group's
+    readout mode, the returned per-tile gains are ``K_run * p_t`` instead (see
+    :func:`apply_tile_gain_pattern`); ``K_run`` and every other quantity above
+    are unchanged.
     """
     if not settings.calib.gain_measure:
         logger.info("Runtime gain measurement disabled (calib.gain_measure=False).")
@@ -794,4 +936,4 @@ def measure_gain(
             [round(tr.gain_e_per_adu, 4) if tr is not None else None for tr in tile_results],
         )
 
-    return GainMeasurementSet(measurements, tile_measurements)
+    return apply_tile_gain_pattern(GainMeasurementSet(measurements, tile_measurements), profile)
