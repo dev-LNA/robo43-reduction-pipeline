@@ -56,6 +56,23 @@ gain_setting = ["PG5_2"]
 binning = ["PG5_4"]
 ccd_temp = ["CCD-TEMP"]
 
+[instrument.gain_setting_repair]
+# Some raw frames (e.g. nights 20250605, 20250610, 20250629) were written with
+# PG5_2 = 0 because the header fill-up failed; the newer, already-processed
+# files carry PG5_2 = 1 (long read time) or 2 (short read time). For such a
+# frame PG0_4 ("CCD Read Time", seconds) decides: strictly greater than
+# threshold_seconds -> gain_setting = value_above (1); at or below it ->
+# value_at_or_below (2). When PG0_4 is missing or unparseable gain_setting
+# stays 0 and a WARNING is logged (once per process, then DEBUG). Applied in
+# robo43.io.headers.read_meta, so every consumer (calibration pooling, gain
+# grouping, reduction, inventory) sees the repaired value. Not applied to a
+# gain_setting given via --set / an overrides file.
+when_value = 0
+fallback_keyword = "PG0_4"
+threshold_seconds = 12.0
+value_above = 1
+value_at_or_below = 2
+
 [instrument.imagetyp_map]
 # T80S writes IMAGETYP = 'sky-flat' for twilight flats (bias frames are
 # already 'ZERO' and science 'OBJECT', which the default map handles).

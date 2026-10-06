@@ -9,6 +9,7 @@ values -- and recording where every value came from.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import warnings
 from pathlib import Path
@@ -232,6 +233,82 @@ def derive_airmass(
         return None
 
 
+#: ``"<profile name>:<status>"`` keys (status "repaired" / "unresolved") whose
+#: first gain-setting repair case in this process was already logged at
+#: WARNING; later cases with the same key log at DEBUG only.
+_GAIN_REPAIR_WARNED: set[str] = set()
+
+
+def parse_duration_seconds(value: Any) -> float | None:
+    """Parse a header duration into seconds, or ``None`` if it is not one.
+
+    Accepts a number, a numeric string (``"16.227"``) or ``"HH:MM:SS.sss"``.
+    Booleans, empty or non-finite values, and anything else give ``None``.
+    Never raises.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    seconds: float
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        seconds = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            seconds = float(text)
+        except ValueError:
+            parts = text.split(":")
+            if len(parts) != 3:
+                return None
+            try:
+                hours, minutes, secs = (float(p) for p in parts)
+            except ValueError:
+                return None
+            seconds = hours * 3600.0 + minutes * 60.0 + secs
+    else:
+        return None
+    return seconds if math.isfinite(seconds) else None
+
+
+def repair_gain_setting(
+    header: fits.Header, profile: InstrumentProfile, value: float, keyword: str
+) -> tuple[float, str | None, str]:
+    """Apply ``profile.gain_setting_repair`` to a frame's resolved gain setting.
+
+    ``value`` is the float read from header keyword ``keyword``.  Returns
+    ``(new_value, detail, status)``:
+
+    * ``status == "none"``: no repair applies (the profile has none, or
+      ``value`` differs from the repair's ``when_value``); ``(value, None, "none")``.
+    * ``status == "repaired"``: the fallback card parsed; ``new_value`` is
+      ``value_above`` (seconds strictly above the threshold) or
+      ``value_at_or_below``.
+    * ``status == "unresolved"``: the fallback card is missing or unparseable;
+      ``new_value`` is ``value`` unchanged.
+
+    ``detail`` is the human-readable reason for the last two statuses.
+    """
+    repair = profile.gain_setting_repair
+    if repair is None or value != repair.when_value:
+        return value, None, "none"
+    raw = header.get(repair.fallback_keyword)
+    seconds = parse_duration_seconds(raw)
+    if seconds is None:
+        detail = (
+            f"{keyword}={value:g} kept: {repair.fallback_keyword} is missing or "
+            f"unparseable ({raw!r})"
+        )
+        return value, detail, "unresolved"
+    if seconds > repair.threshold_seconds:
+        new_value, relation = repair.value_above, ">"
+    else:
+        new_value, relation = repair.value_at_or_below, "<="
+    detail = (
+        f"{keyword}={value:g} -> {new_value:g} because "
+        f"{repair.fallback_keyword}={seconds:g} s {relation} {repair.threshold_seconds:g} s"
+    )
+    return new_value, detail, "repaired"
+
+
 def read_meta(
     path: str | os.PathLike[str],
     profile: InstrumentProfile,
@@ -322,6 +399,38 @@ def read_meta(
             except (TypeError, ValueError):
                 values[field] = None
                 origins.pop(field, None)
+
+    # gain_setting repair: only for a profile declaring
+    # [instrument.gain_setting_repair], never for an overridden value. Done
+    # here, once, so every consumer of FrameMeta.gain_setting sees the
+    # repaired value; the origin becomes DERIVED with the reason as detail.
+    gain_origin = origins.get("gain_setting")
+    if (
+        profile.gain_setting_repair is not None
+        and "gain_setting" not in field_overrides
+        and values.get("gain_setting") is not None
+        and gain_origin is not None
+    ):
+        repaired, repair_detail, repair_status = repair_gain_setting(
+            header, profile, values["gain_setting"], gain_origin.detail
+        )
+        if repair_status == "repaired":
+            values["gain_setting"] = repaired
+            origins["gain_setting"] = FieldOrigin(Source.DERIVED, repair_detail)
+        if repair_status != "none":
+            warned_key = f"{profile.name}:{repair_status}"
+            if warned_key in _GAIN_REPAIR_WARNED:
+                logger.debug("%s: gain_setting repair: %s", path, repair_detail)
+            else:
+                _GAIN_REPAIR_WARNED.add(warned_key)
+                logger.warning(
+                    "%s: gain_setting repair: %s (further '%s' cases for profile "
+                    "'%s' are logged at DEBUG only)",
+                    path,
+                    repair_detail,
+                    repair_status,
+                    profile.name,
+                )
 
     # binning -> int
     if values.get("binning") is not None:
