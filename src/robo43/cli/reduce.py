@@ -32,6 +32,13 @@ from robo43.calib.gain import DEFAULT_GAIN_MEASUREMENTS_NAME, GainMeasurementSet
 from robo43.calib.masks import MaskSet, build_mask, read_cold_pixel_masks
 from robo43.calib.master import MasterFrame
 from robo43.calib.overscan import detect_overscan
+from robo43.calib.pool import (
+    WindowPoolResult,
+    apply_window_pools,
+    infer_science_night,
+    install_master_flat,
+    limit_bias_for_gain,
+)
 from robo43.calib.set import CalibrationSet
 from robo43.cli.common import configure_from_args
 from robo43.cli.registry import Subcommand, register
@@ -398,8 +405,69 @@ def _run(args: argparse.Namespace) -> int:
             "YYYYMMDD night directory"
         )
 
+    # Symmetric-window pooling (robo43.calib.pool), enabled per instrument
+    # profile ([instrument.calib] bias_pool / flat_pool_window_nights). It
+    # works from the science frames' own directory, so it also applies when
+    # the inputs are an explicit file list rather than one night directory;
+    # explicit bias/flat inputs are merged into the pools without duplicates.
+    # A profile without those keys never enters this block.
+    pool_result: WindowPoolResult | None = None
+    pool_current_night: date | None = None
+    window_pool_requested = profile.calib.bias_pool or (
+        profile.calib.flat_pool and profile.calib.flat_pool_window_nights > 0
+    )
+    if window_pool_requested:
+        pool_night = (
+            (night_dir, current_night)
+            if night_dir is not None and current_night is not None
+            else infer_science_night(
+                [m for m in select_frames(metas, "science") if m.is_valid]
+            )
+        )
+        if not settings.calib.calib_fallback or args.no_calib_fallback:
+            logger.info("calibration pooling disabled (multi-night calibration fallback off)")
+        elif pool_night is None:
+            logger.warning(
+                "calibration pooling inactive: the science frames are not all in "
+                "one YYYYMMDD night directory"
+            )
+        else:
+            pool_night_dir, pool_current_night = pool_night
+            pool_result = apply_window_pools(
+                metas,
+                profile=profile,
+                settings=settings,
+                night_dir=pool_night_dir,
+                current_night=pool_current_night,
+                filters=args.filter,
+            )
+            metas = pool_result.metas
+            for pooled_flats in pool_result.flats.values():
+                if pooled_flats.reuse is not None:
+                    continue  # an existing master is copied instead of built
+                for group_key in group_flats_by_filter(
+                    list(pooled_flats.metas),
+                    separate_dome_and_sky=settings.calib.separate_dome_and_sky_flats,
+                ):
+                    flat_fallback_source_nights[group_key] = (
+                        pooled_flats.nights,
+                        pooled_flats.borrowed,
+                    )
+    bias_pool_active = pool_result is not None and pool_result.bias_active
+    flat_window_active = pool_result is not None and pool_result.flat_active
+    flat_window_requested = pool_result is not None and (
+        profile.calib.flat_pool and profile.calib.flat_pool_window_nights > 0
+    )
+    #: filter -> existing master flat to copy into calibdir instead of building
+    #: one (the short in-window pool then only feeds the gain measurement).
+    planned_flat_reuse = {
+        filter_name: sel.reuse
+        for filter_name, sel in (pool_result.flats.items() if pool_result else ())
+        if sel.reuse is not None
+    }
+
     if calib_fallback_enabled:
-        if not select_frames(metas, "bias"):
+        if not bias_pool_active and not select_frames(metas, "bias"):
             non_bias_metas = [m for m in metas if m.frame_type != "bias"]
             target_config = dominant_camera_config(non_bias_metas)
             if target_config is None:
@@ -470,7 +538,11 @@ def _run(args: argparse.Namespace) -> int:
         )
         covered_filters = {key.split(":", 1)[0] for key in local_flat_groups}
 
-        if profile.calib.flat_pool:
+        if flat_window_requested:
+            # Symmetric-window flat pools were already built above
+            # (apply_window_pools); neither legacy branch below applies.
+            pass
+        elif profile.calib.flat_pool:
             # New pooling policy (per instrument profile): always pool, per
             # filter, whether or not the night has any local flats of its
             # own for that filter -- see robo43.calib.fallback.pool_flat_frames.
@@ -646,8 +718,18 @@ def _run(args: argparse.Namespace) -> int:
         # Report what masters would be built/reused
         bias_metas = select_frames(metas, "bias")
         dark_metas = select_frames(metas, "dark")
-        flat_metas = select_frames(metas, "flat")
+        flat_metas = [
+            m for m in select_frames(metas, "flat") if m.filter not in planned_flat_reuse
+        ]
         science_metas = select_frames(metas, "science")
+        for reuse_filter, reuse_choice in planned_flat_reuse.items():
+            logger.info(
+                "master_flat %s: would COPY %s (night %s, %+d day(s))",
+                reuse_filter,
+                reuse_choice.path,
+                reuse_choice.night.strftime("%Y%m%d"),
+                reuse_choice.distance_days,
+            )
 
         bias_master_path = calibdir_path / "master_bias.fits"
         if bias_metas:
@@ -749,7 +831,14 @@ def _run(args: argparse.Namespace) -> int:
     else:
         try:
             gain_measurements = measure_gain(
-                metas, settings=settings, profile=profile, overscan=overscan_geometry
+                # A pooled bias set is capped for the measurement (it keeps one
+                # full-frame float64 array alive per bias frame): nearest nights.
+                limit_bias_for_gain(metas, profile.calib.bias_pool_gain_max_frames)
+                if bias_pool_active
+                else metas,
+                settings=settings,
+                profile=profile,
+                overscan=overscan_geometry,
             )
             gain_measurements.write(gain_file)
             logger.info(
@@ -786,6 +875,7 @@ def _run(args: argparse.Namespace) -> int:
                         overscan=overscan_geometry,
                         gain_measurements=gain_measurements,
                         fallback_source_nights=bias_fallback_nights,
+                        pool=pool_result.bias if bias_pool_active else None,
                     )
                 except Exception as exc:
                     logger.error("failed to build master_bias: %s", exc)
@@ -801,6 +891,7 @@ def _run(args: argparse.Namespace) -> int:
                     overscan=overscan_geometry,
                     gain_measurements=gain_measurements,
                     fallback_source_nights=bias_fallback_nights,
+                    pool=pool_result.bias if bias_pool_active else None,
                 )
             except Exception as exc:
                 logger.error("failed to build master_bias: %s", exc)
@@ -845,8 +936,51 @@ def _run(args: argparse.Namespace) -> int:
     if settings.runtime.release_memory:
         release_memory("reduce.master_dark", level=logging.INFO)
 
+    # Reuse existing master flats where the pool policy chose them over a short
+    # pool: copy each into calibdir (unless one is already there) with
+    # provenance cards. A failed copy leaves that filter to be built from its
+    # (short) pool.
+    reused_flat_filters: set[str] = set()
+    for reuse_filter, reuse_choice in planned_flat_reuse.items():
+        existing = list(calibdir_path.glob(f"master_flat_{reuse_filter}*.fits"))
+        if existing:
+            logger.info(
+                "master flat for filter %s already in calibdir (%s); not copying %s",
+                reuse_filter, existing[0].name, reuse_choice.path,
+            )
+            reused_flat_filters.add(reuse_filter)
+            continue
+        try:
+            installed = install_master_flat(
+                reuse_choice,
+                calibdir_path,
+                current_night=pool_current_night,
+                window_nights=profile.calib.flat_pool_window_nights,
+                target_frames=profile.calib.flat_pool_target_frames,
+            )
+        except Exception as exc:
+            logger.error(
+                "failed to reuse master flat %s for filter %s: %s; building from the "
+                "short pool instead",
+                reuse_choice.path, reuse_filter, exc,
+            )
+            continue
+        reused_flat_filters.add(reuse_filter)
+        logger.warning(
+            "master flat for filter %s reused from night %s (%+d day(s), %s frame(s)): "
+            "%s -> %s",
+            reuse_filter,
+            reuse_choice.night.strftime("%Y%m%d"),
+            reuse_choice.distance_days,
+            reuse_choice.n_frames if reuse_choice.n_frames is not None else "unknown",
+            reuse_choice.path,
+            installed,
+        )
+
     # Build master flats
-    flat_metas = select_frames(metas, "flat")
+    flat_metas = [
+        m for m in select_frames(metas, "flat") if m.filter not in reused_flat_filters
+    ]
     if flat_metas:
         # Determine which filters are represented and which masters already exist
         separate_dome_and_sky = settings.calib.separate_dome_and_sky_flats
@@ -908,6 +1042,12 @@ def _run(args: argparse.Namespace) -> int:
                         overscan=overscan_geometry,
                         gain_measurements=gain_measurements,
                         fallback_source_nights=flat_fallback_source_nights,
+                        pool_window_nights=(
+                            profile.calib.flat_pool_window_nights if flat_window_active else None
+                        ),
+                        pool_target_frames=(
+                            profile.calib.flat_pool_target_frames if flat_window_active else None
+                        ),
                     )
                 except Exception as exc:
                     logger.error("failed to build master_flats: %s", exc)

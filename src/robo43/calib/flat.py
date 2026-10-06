@@ -280,6 +280,8 @@ def build_master_flats(
     overscan: OverscanGeometry | None = None,
     gain_measurements: GainMeasurementSet | None = None,
     fallback_source_nights: Mapping[str, tuple[tuple[str, ...], bool]] | None = None,
+    pool_window_nights: int | None = None,
+    pool_target_frames: int | None = None,
 ) -> dict[str, MasterFrame]:
     """Build and write master flat frames, one per filter (and illumination source).
 
@@ -310,6 +312,13 @@ def build_master_flats(
     one did. A group absent from the mapping gets ``CALFBACK=False`` and no
     ``FLATNGT`` card, exactly as before this parameter's pooling-era meaning
     was added.
+
+    ``pool_window_nights`` / ``pool_target_frames`` (both ``None`` unless the
+    flats came from :mod:`robo43.calib.pool`) add the pooling-policy cards
+    ``FLATWIN`` (window, +/- nights) and ``FLATTGT`` (target frames) to every
+    master built in this call; the contributing nights (``FLATNGT`` or
+    ``FLATN1``/``FLATN2``/``FLATNNGT``) and the frames combined
+    (``FLATNFRM``) come from ``fallback_source_nights`` as before.
 
     Returns a dict mapping group keys to the written MasterFrame objects.
     Raises CalibrationError if no flat frames are found or if a group has
@@ -478,6 +487,14 @@ def build_master_flats(
             else:
                 contributing_nights, borrowed = (), False
             fallback_cards = _flat_fallback_cards(contributing_nights, borrowed, n_accepted)
+            if pool_window_nights is not None:
+                fallback_cards.append(
+                    ("FLATWIN", pool_window_nights, "Flat pool window (+/- nights)")
+                )
+            if pool_target_frames is not None:
+                fallback_cards.append(
+                    ("FLATTGT", pool_target_frames, "Flat pool target frames")
+                )
 
             if n_accepted >= 2:
                 if stream:

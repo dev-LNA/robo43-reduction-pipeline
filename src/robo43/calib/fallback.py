@@ -113,11 +113,13 @@ class FallbackResult:
 
 
 def _previous_night_dirs(
-    night_dir: Path, current_night: date, max_nights: int
+    night_dir: Path, current_night: date, max_nights: int, min_days: int = 0
 ) -> list[tuple[date, Path]]:
     """Sibling ``YYYYMMDD`` directories under ``night_dir.parent`` strictly
     earlier than ``current_night`` and within ``max_nights`` calendar days,
-    nearest first."""
+    nearest first.  ``min_days`` (default 0: no effect, since every night
+    returned is already at least one day back) additionally drops nights
+    ``min_days`` days back or closer."""
     parent = night_dir.parent
     if not parent.is_dir():
         return []
@@ -130,6 +132,8 @@ def _previous_night_dirs(
         if night is None or night >= current_night:
             continue
         if (current_night - night).days > max_nights:
+            continue
+        if (current_night - night).days <= min_days:
             continue
         found.append((night, entry))
     found.sort(key=lambda pair: pair[0], reverse=True)
@@ -147,9 +151,14 @@ def collect_fallback_frames(
     profile: InstrumentProfile,
     settings: Settings,
     filter_name: str | None = None,
+    skip_within_days: int = 0,
 ) -> FallbackResult:
     """Search strictly earlier sibling nights for ``min_count`` frames of
     ``frame_type`` matching ``target_config``.
+
+    ``skip_within_days`` (default 0: search every earlier night) leaves out
+    the nights that many days back or closer -- used by
+    :mod:`robo43.calib.pool` to search only beyond its window.
 
     ``filter_name`` must be given (and is matched exactly) for
     ``frame_type == "flat"``; it is ignored for ``"bias"`` and ``"dark"``,
@@ -170,7 +179,9 @@ def collect_fallback_frames(
     pooled_metas: list[FrameMeta] = []
     pooled_nights: list[str] = []
 
-    for night, night_path in _previous_night_dirs(night_dir, current_night, max_nights):
+    for night, night_path in _previous_night_dirs(
+        night_dir, current_night, max_nights, min_days=skip_within_days
+    ):
         night_str = night.strftime("%Y%m%d")
         candidates = list(iter_fits_files([night_path], recursive=False))
         night_matches: list[FrameMeta] = []

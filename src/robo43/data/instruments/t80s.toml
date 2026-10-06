@@ -72,19 +72,38 @@ index_scales = "derive"
 search_radius_deg = 0.5
 
 [instrument.calib]
-# Flats drift slowly (dust, mirror coatings) but T80S nights routinely lack
-# enough of their own flats per filter: always pool the current night's own
-# flats with the previous flat_pool_min_nights (10) nights' worth (every
-# night in that span, however many frames that already is), extend night by
-# night up to flat_pool_max_nights (20) if still short of
-# flat_pool_target_frames (20) frames, and accept fewer than the target
-# rather than reaching further. Only when NO flat at all falls within 20
-# days does the search fall through to the older-night nearest-neighbour
-# fallback (calib.fallback_max_nights_flat).
+# Calibration frames are pooled from the sibling night directories on BOTH
+# sides of the night being reduced (see robo43.calib.pool); only frames with
+# the science frames' readout mode / gain setting / binning (and, for flats,
+# the same filter) count, whole nights are added nearest first (earlier night
+# first on a tie), and a pool short of its target is used as-is with a WARNING.
+#
+# Master bias: the night's own bias plus every night within +/-10 days, until
+# at least 20 frames. Applies always, not only when the night has no bias.
+# Fewer than 20 frames in the window: WARNING and build from what is there.
+# bias_pool_gain_max_frames limits how many of them the runtime gain
+# measurement reads (it holds one full-frame array per bias frame in RAM).
+bias_pool = true
+bias_pool_window_nights = 10
+bias_pool_target_frames = 20
+bias_pool_gain_max_frames = 12
+# Master flat, per filter: every night within +/-30 days (60 days in all),
+# until at least 20 frames (the cold-pixel mask needs >= 20). Twilight flats
+# drift slowly (dust, mirror coatings). flat_pool_window_nights > 0 replaces
+# the older backward-only 10/20-night pool (flat_pool_min_nights /
+# flat_pool_max_nights, now unused here).
+# A filter whose window holds fewer than flat_pool_target_frames flats is NOT
+# built from the short pool: the existing master flat of that filter closest
+# in time to the night (either direction, no maximum distance, earlier night
+# on a tie; built from >= 20 frames when its header says so) is copied from
+# <root>/YYYYMMDD/calib/ of the listed reduced trees. Only if no such master
+# exists is the short pool built, with a WARNING. (Bias is separate: with no
+# bias at all in its window the search goes on to earlier nights, calib.
+# fallback_max_nights_bias.)
 flat_pool = true
-flat_pool_min_nights = 10
-flat_pool_max_nights = 20
+flat_pool_window_nights = 30
 flat_pool_target_frames = 20
+flat_master_roots = ["/mnt/sto01/T80S/reduced"]
 
 [instrument.filters.gaia_xp]
 # GaiaXPy PhotometricSystem.JPLUS band names (confirmed against the
