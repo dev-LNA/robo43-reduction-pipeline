@@ -80,12 +80,43 @@ class InstrumentCalibOptions:
     ``flat_pool_max_nights`` days if the pool is still short of
     ``flat_pool_target_frames``, and accept fewer than the target rather
     than searching further within that window.
+
+    Two further, independent policies pool on **both** sides of the night
+    (:mod:`robo43.calib.pool`); both default to off, and a profile that does
+    not set their keys behaves exactly as before:
+
+    * ``bias_pool = true`` pools the master bias from the night's own bias
+      plus sibling nights within ``bias_pool_window_nights`` calendar days
+      (earlier and later), nearest first, whole nights, until at least
+      ``bias_pool_target_frames`` frames.  ``bias_pool_gain_max_frames`` caps
+      how many of those frames the runtime gain measurement reads (it keeps
+      one full-frame array alive per bias frame); 0 = no cap.
+    * ``flat_pool = true`` together with ``flat_pool_window_nights > 0``
+      replaces the backward-only flat pool above by the same symmetric,
+      nearest-first, whole-night pool within ``flat_pool_window_nights``
+      days, until at least ``flat_pool_target_frames`` frames;
+      ``flat_pool_min_nights`` / ``flat_pool_max_nights`` are then unused.
+      With ``flat_master_roots`` (a list of directories ``<root>/YYYYMMDD/
+      calib/`` holding earlier reductions' masters) a flat pool short of the
+      target is replaced by the existing master of that filter closest in
+      time (see :func:`robo43.calib.pool.find_nearest_master_flat`); without
+      it a short pool is built as-is.
+
+    In both, only frames matching the science frames' camera configuration
+    (readout mode, gain setting, binning, frame shape) and, for flats, the
+    filter are counted.
     """
 
     flat_pool: bool = False
     flat_pool_min_nights: int = 10
     flat_pool_max_nights: int = 20
     flat_pool_target_frames: int = 20
+    flat_pool_window_nights: int = 0
+    flat_master_roots: tuple[str, ...] = ()
+    bias_pool: bool = False
+    bias_pool_window_nights: int = 10
+    bias_pool_target_frames: int = 20
+    bias_pool_gain_max_frames: int = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +280,25 @@ def _profile_from_toml_dict(
         flat_pool_min_nights=int(raw_calib.get("flat_pool_min_nights", 10)),
         flat_pool_max_nights=int(raw_calib.get("flat_pool_max_nights", 20)),
         flat_pool_target_frames=int(raw_calib.get("flat_pool_target_frames", 20)),
+        flat_pool_window_nights=int(raw_calib.get("flat_pool_window_nights", 0)),
+        flat_master_roots=tuple(str(r) for r in raw_calib.get("flat_master_roots", ())),
+        bias_pool=bool(raw_calib.get("bias_pool", False)),
+        bias_pool_window_nights=int(raw_calib.get("bias_pool_window_nights", 10)),
+        bias_pool_target_frames=int(raw_calib.get("bias_pool_target_frames", 20)),
+        bias_pool_gain_max_frames=int(raw_calib.get("bias_pool_gain_max_frames", 12)),
     )
+    for _key in (
+        "flat_pool_window_nights",
+        "bias_pool_window_nights",
+        "bias_pool_gain_max_frames",
+    ):
+        if getattr(calib_options, _key) < 0:
+            msg = f"[instrument.calib] {_key} must be >= 0, got {getattr(calib_options, _key)}"
+            raise ConfigError(msg)
+    for _key in ("flat_pool_target_frames", "bias_pool_target_frames"):
+        if getattr(calib_options, _key) < 1:
+            msg = f"[instrument.calib] {_key} must be >= 1, got {getattr(calib_options, _key)}"
+            raise ConfigError(msg)
 
     version = instrument.get("version", "1")
 

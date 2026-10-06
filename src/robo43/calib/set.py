@@ -160,7 +160,19 @@ class CalibrationSet:
                     bias_path = bias_file
                     bias_fallback = bool(header.get("CALFBACK", False))
                     if bias_fallback:
-                        bias_source_nights = tuple(str(header["BIASNGT"]).split(","))
+                        # A pooled master bias over many nights records
+                        # BIASN1/BIASN2/BIASNNGT instead of BIASNGT, to stay
+                        # within the FITS string-card length limit (see
+                        # robo43.calib.bias._bias_pool_cards).
+                        if "BIASNGT" in header:
+                            bias_source_nights = tuple(str(header["BIASNGT"]).split(","))
+                        elif "BIASN1" in header and "BIASN2" in header:
+                            bias_source_nights = (
+                                str(header["BIASN1"]),
+                                str(header["BIASN2"]),
+                            )
+                        else:
+                            bias_source_nights = ()
                     # Try to load variance from VAR extension
                     try:
                         with fits.open(bias_file) as hdul:
