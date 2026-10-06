@@ -212,6 +212,13 @@ def reduce_frame(
         from robo43.calib.gain import no_measurement_cards
 
         header_cards.extend(no_measurement_cards(meta.gain_setting, meta.readout_mode))
+    from robo43.io.meta import Source
+
+    gain_set_origin = meta.origin("gain_setting")
+    if gain_set_origin is not None and gain_set_origin.source is Source.DERIVED:
+        # GAINSET above is the repaired value (profile gain_setting_repair);
+        # the raw header's own gain-setting card still holds the lost value.
+        header_cards.append(("GSETFIX", True, "GAINSET repaired by profile gain_setting_repair"))
     header_cards.append(("MEDRAW", float(np.nanmedian(data)), "median of the raw frame (ADU)"))
 
     # --- Step 1: Overscan and Trim ---

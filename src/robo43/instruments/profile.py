@@ -44,6 +44,7 @@ _KNOWN_INSTRUMENT_KEYS = {
     "binning_keyword",
     "trust_header_wcs",
     "calib",
+    "gain_setting_repair",
     "layout",
     "filters",
     "keywords",
@@ -120,6 +121,29 @@ class InstrumentCalibOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class GainSettingRepair:
+    """Repair of a ``gain_setting`` header value lost to a failed header fill-up
+    (``[instrument.gain_setting_repair]``).
+
+    When a frame's resolved ``gain_setting`` equals ``when_value``, the header
+    card ``fallback_keyword`` is read as a duration in seconds (a number, a
+    numeric string, or ``"HH:MM:SS.sss"``): strictly greater than
+    ``threshold_seconds`` the frame's ``gain_setting`` becomes ``value_above``,
+    otherwise (at or below the threshold) ``value_at_or_below``.  A missing or
+    unparseable fallback card leaves ``gain_setting`` unchanged (and is
+    logged), since there is no basis to choose between the two values.  A
+    profile without the table has no repair (``InstrumentProfile.
+    gain_setting_repair`` is ``None``).
+    """
+
+    when_value: float
+    fallback_keyword: str
+    threshold_seconds: float
+    value_above: float
+    value_at_or_below: float
+
+
+@dataclass(frozen=True, slots=True)
 class InstrumentProfile:
     """Everything the pipeline needs to know about one instrument."""
 
@@ -163,6 +187,9 @@ class InstrumentProfile:
     # rescaled to pixel_scale_arcsec instead of carrying the nominal one.
     trust_header_wcs: bool = True
     calib: InstrumentCalibOptions = field(default_factory=InstrumentCalibOptions)
+    # Optional repair of a lost gain_setting header value (see GainSettingRepair);
+    # None (the default) means every frame's gain_setting is taken as written.
+    gain_setting_repair: GainSettingRepair | None = None
     version: str = "1"
     source: str = "packaged"
 
@@ -224,6 +251,54 @@ def _float_or_none(instrument: dict[str, Any], key: str, origin: str) -> float |
     except (TypeError, ValueError) as exc:
         msg = f"{origin}: {key} must be a number, got {value!r}"
         raise ConfigError(msg) from exc
+
+
+_GAIN_SETTING_REPAIR_KEYS = (
+    "when_value",
+    "fallback_keyword",
+    "threshold_seconds",
+    "value_above",
+    "value_at_or_below",
+)
+
+
+def _parse_gain_setting_repair(raw: Any, origin: str) -> GainSettingRepair:
+    """Validate an ``[instrument.gain_setting_repair]`` table (all five keys required)."""
+    if not isinstance(raw, dict):
+        msg = f"{origin}: [instrument.gain_setting_repair] must be a table"
+        raise ConfigError(msg)
+    unknown = set(raw) - set(_GAIN_SETTING_REPAIR_KEYS)
+    if unknown:
+        msg = f"{origin}: unknown key(s) {sorted(unknown)} in [instrument.gain_setting_repair]"
+        raise ConfigError(msg)
+    missing = [k for k in _GAIN_SETTING_REPAIR_KEYS if k not in raw]
+    if missing:
+        msg = f"{origin}: [instrument.gain_setting_repair] is missing key(s) {missing}"
+        raise ConfigError(msg)
+    keyword = raw["fallback_keyword"]
+    if not isinstance(keyword, str) or not keyword.strip():
+        msg = (
+            f"{origin}: [instrument.gain_setting_repair] fallback_keyword must be "
+            f"a non-empty string, got {keyword!r}"
+        )
+        raise ConfigError(msg)
+    numbers: dict[str, float] = {}
+    for key in ("when_value", "threshold_seconds", "value_above", "value_at_or_below"):
+        try:
+            numbers[key] = float(raw[key])
+        except (TypeError, ValueError) as exc:
+            msg = (
+                f"{origin}: [instrument.gain_setting_repair] {key} must be a "
+                f"number, got {raw[key]!r}"
+            )
+            raise ConfigError(msg) from exc
+    return GainSettingRepair(
+        when_value=numbers["when_value"],
+        fallback_keyword=keyword.strip(),
+        threshold_seconds=numbers["threshold_seconds"],
+        value_above=numbers["value_above"],
+        value_at_or_below=numbers["value_at_or_below"],
+    )
 
 
 def _profile_from_toml_dict(
@@ -300,6 +375,12 @@ def _profile_from_toml_dict(
             msg = f"[instrument.calib] {_key} must be >= 1, got {getattr(calib_options, _key)}"
             raise ConfigError(msg)
 
+    gain_setting_repair = (
+        _parse_gain_setting_repair(instrument["gain_setting_repair"], path_for_errors)
+        if "gain_setting_repair" in instrument
+        else None
+    )
+
     version = instrument.get("version", "1")
 
     raw_layout = instrument.get("layout", {})
@@ -359,6 +440,7 @@ def _profile_from_toml_dict(
         search_radius_deg=search_radius_deg,
         trust_header_wcs=trust_header_wcs,
         calib=calib_options,
+        gain_setting_repair=gain_setting_repair,
         version=str(version),
         source=source,
     )
