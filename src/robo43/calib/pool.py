@@ -56,6 +56,7 @@ from robo43.calib.fallback import (
     dominant_camera_config,
     parse_night_dirname,
 )
+from robo43.calib.gain import tile_gain_pattern_for
 from robo43.exceptions import ConfigError
 from robo43.io.fits_io import iter_fits_files
 from robo43.io.headers import read_meta
@@ -432,6 +433,7 @@ def find_nearest_master_flat(
     readout_mode: str | None,
     min_frames: int,
     exclude: Sequence[Path] = (),
+    gain_pattern: str | None = None,
 ) -> tuple[MasterFlatChoice | None, int]:
     """The existing master flat of ``filter_name`` closest in time to
     ``current_night``, searched in ``<root>/YYYYMMDD/calib/master_flat_*.fits``.
@@ -449,6 +451,11 @@ def find_nearest_master_flat(
       ``READOUTM`` card or ``READOUTM = UNKNOWN`` (built before the readout mode
       was known) matches only frames without a readout mode and is skipped,
       logged at DEBUG, for a frame with one;
+    * when ``gain_pattern`` is given (the ``GAINPAT`` label of the tile gain
+      pattern the profile tabulates for the frames' readout mode, e.g.
+      ``table:mode5``), its ``GAINPAT`` card equals it: a master built without
+      that pattern carries amplifier steps that the frames' gains (K_run x
+      pattern) do not cancel, so it is skipped, logged at DEBUG;
     * its header frame count (``FLATNACC``, else ``FLATNFRM``, else
       ``NCOMBINE``) is at least ``min_frames`` -- a master without any count
       card is accepted.  Masters failing only this test are counted in
@@ -494,6 +501,13 @@ def find_nearest_master_flat(
                         "master flat scan: skipping %s: READOUTM %r does not match "
                         "the frames' readout mode %r",
                         path, master_readout, readout_mode,
+                    )
+                    continue
+                if gain_pattern is not None and header.get("GAINPAT") != gain_pattern:
+                    logger.debug(
+                        "master flat scan: skipping %s: GAINPAT %r is not the tile gain "
+                        "pattern %r the frames' gains use",
+                        path, header.get("GAINPAT"), gain_pattern,
                     )
                     continue
                 n_frames = next(
@@ -586,6 +600,7 @@ def pool_flat_frames_window(
     scanner: NightScanner,
     fallback_max_nights: int,
     master_roots: Sequence[str | Path] = (),
+    gain_pattern: str | None = None,
 ) -> PoolSelection:
     """Pool one filter's flats within ``+/- window_nights`` days of
     ``current_night``.
@@ -601,7 +616,10 @@ def pool_flat_frames_window(
     master is built from them.  When no master qualifies the short pool is
     built with a WARNING, and an empty one means no master flat for the filter.
     Without ``master_roots`` an empty pool falls back to the nearest earlier
-    night's frames within ``fallback_max_nights``.
+    night's frames within ``fallback_max_nights``.  ``gain_pattern`` (the
+    ``GAINPAT`` label of the profile's tile gain pattern for the frames' readout
+    mode, ``None`` when it has none) restricts the reusable masters to those
+    built with that pattern.
     """
     pooled, n_explicit_only = _pool_window(
         night_dir, current_night,
@@ -619,14 +637,16 @@ def pool_flat_frames_window(
                 gain_setting=target_config[1],
                 readout_mode=target_config[0],
                 min_frames=target_frames,
+                gain_pattern=gain_pattern,
             )
             if reuse is None:
                 logger.warning(
                     "%d %s flat frame(s) within +/-%d day(s) of night %s (target %d) "
                     "and no existing master flat of that filter with >= %d frames "
-                    "(%d older master(s) too short) under %s%s",
+                    "(%d older master(s) too short)%s under %s%s",
                     len(pooled), filter_name, window_nights, night_dir.name,
                     target_frames, target_frames, n_disqualified,
+                    f" built with tile gain pattern {gain_pattern}" if gain_pattern else "",
                     ", ".join(str(r) for r in master_roots),
                     "; building from the short pool" if pooled
                     else "; continuing without a master flat for that filter",
@@ -828,6 +848,7 @@ def apply_window_pools(
             config = dominant_camera_config([m for m in science if m.filter == filter_name])
             if config is None:
                 continue
+            tile_pattern = tile_gain_pattern_for(profile, config[0])
             flat_sel = pool_flat_frames_window(
                 night_dir, current_night,
                 target_config=config,
@@ -840,6 +861,7 @@ def apply_window_pools(
                 scanner=scanner,
                 fallback_max_nights=settings.calib.fallback_max_nights_flat,
                 master_roots=opts.flat_master_roots,
+                gain_pattern=tile_pattern.label if tile_pattern is not None else None,
             )
             out = [
                 m for m in out

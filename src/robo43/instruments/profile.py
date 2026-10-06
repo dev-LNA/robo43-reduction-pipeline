@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import statistics
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ _KNOWN_INSTRUMENT_KEYS = {
     "trust_header_wcs",
     "calib",
     "readout_mode_rule",
+    "tile_gain_pattern",
     "layout",
     "filters",
     "keywords",
@@ -206,6 +208,13 @@ class InstrumentProfile:
     readout_mode_rule: ReadoutModeRule | None = None
     version: str = "1"
     source: str = "packaged"
+    # Optional relative per-tile (per-amplifier) gain pattern per readout mode
+    # (``[instrument.tile_gain_pattern]``): readout mode -> one value per
+    # tile in row-major tile order, normalised to median 1. When a mode has an
+    # entry, robo43.calib.gain.apply_tile_gain_pattern makes that mode's
+    # per-tile gains K_run * p_t instead of the noisy per-tile PTC values.
+    # Empty (the default) means every group keeps its per-tile PTC gains.
+    tile_gain_pattern: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
     def canonical_filter(self, raw: str | None) -> str | None:
         """Map a raw ``FILTER`` header value onto its canonical name."""
@@ -385,6 +394,81 @@ def _parse_readout_mode_rule(raw: Any, origin: str) -> ReadoutModeRule:
     return ReadoutModeRule(default=default, votes=votes)
 
 
+#: How far from 1 the median of a tile gain pattern may be (the tool writes 6
+#: decimals, so rounding stays far inside this).
+_TILE_PATTERN_MEDIAN_TOL = 1e-5
+
+
+def _parse_tile_gain_pattern(
+    raw: Any,
+    *,
+    n_tiles: int,
+    readout_mode_rule: ReadoutModeRule | None,
+    origin: str,
+) -> dict[str, tuple[float, ...]]:
+    """Validate an ``[instrument.tile_gain_pattern]`` table.
+
+    Each key is a readout mode (one of the modes the profile's
+    ``[instrument.readout_mode_rule]`` can produce, when it has one) and each
+    value a list of exactly ``n_tiles`` (``[instrument.layout] n_amplifiers``)
+    finite, positive numbers with median 1 (the definition of the summary K,
+    the median over tiles).
+    """
+    where = f"{origin}: [instrument.tile_gain_pattern]"
+    if not isinstance(raw, dict):
+        msg = f"{where} must be a table"
+        raise ConfigError(msg)
+    known_modes: set[str] | None = None
+    if readout_mode_rule is not None:
+        known_modes = {readout_mode_rule.default}
+        for vote in readout_mode_rule.votes:
+            if vote.below is not None:
+                known_modes.add(vote.below)
+            if vote.at_or_above is not None:
+                known_modes.add(vote.at_or_above)
+            known_modes.update(mode for _number, mode in vote.values)
+    table: dict[str, tuple[float, ...]] = {}
+    for mode, values in raw.items():
+        label = f"{where} {mode!r}"
+        if not isinstance(mode, str) or not mode.strip():
+            msg = f"{where} keys must be non-empty readout-mode names, got {mode!r}"
+            raise ConfigError(msg)
+        if known_modes is not None and mode not in known_modes:
+            msg = (
+                f"{label}: unknown readout mode (the profile's readout_mode_rule "
+                f"produces {sorted(known_modes)})"
+            )
+            raise ConfigError(msg)
+        if not isinstance(values, list):
+            msg = f"{label} must be a list of {n_tiles} numbers"
+            raise ConfigError(msg)
+        if len(values) != n_tiles:
+            msg = (
+                f"{label} has {len(values)} value(s), expected {n_tiles} "
+                f"([instrument.layout] n_amplifiers)"
+            )
+            raise ConfigError(msg)
+        numbers: list[float] = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                msg = f"{label} values must be numbers, got {value!r}"
+                raise ConfigError(msg)
+            number = float(value)
+            if not math.isfinite(number) or number <= 0:
+                msg = f"{label} values must be finite and > 0, got {value!r}"
+                raise ConfigError(msg)
+            numbers.append(number)
+        median = statistics.median(numbers)
+        if abs(median - 1.0) > _TILE_PATTERN_MEDIAN_TOL:
+            msg = (
+                f"{label} must be normalised to median 1 (the summary K is the median "
+                f"over tiles), got median {median!r}"
+            )
+            raise ConfigError(msg)
+        table[mode] = tuple(numbers)
+    return table
+
+
 def _profile_from_toml_dict(
     data: dict[str, Any], *, path_for_errors: str, source: str
 ) -> InstrumentProfile:
@@ -476,6 +560,17 @@ def _profile_from_toml_dict(
         flip_y=raw_layout.get("flip_y", False),
     )
 
+    tile_gain_pattern = (
+        _parse_tile_gain_pattern(
+            instrument["tile_gain_pattern"],
+            n_tiles=layout.n_amplifiers,
+            readout_mode_rule=readout_mode_rule,
+            origin=path_for_errors,
+        )
+        if "tile_gain_pattern" in instrument
+        else {}
+    )
+
     raw_filters = instrument.get("filters", {})
     valid_filters = tuple(raw_filters.get("valid", ()))
     filter_map = dict(raw_filters.get("map", {}))
@@ -527,6 +622,7 @@ def _profile_from_toml_dict(
         readout_mode_rule=readout_mode_rule,
         version=str(version),
         source=source,
+        tile_gain_pattern=tile_gain_pattern,
     )
 
 
