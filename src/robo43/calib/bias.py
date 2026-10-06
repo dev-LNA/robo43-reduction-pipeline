@@ -199,6 +199,14 @@ def build_master_bias(
         msg = "no bias frames found to build a master bias"
         raise CalibrationError(msg)
 
+    modes = sorted({(m.readout_mode or "").strip() or "UNKNOWN" for m in bias_metas})
+    if len(modes) > 1:
+        msg = (
+            "refusing to combine bias frames of different readout modes into one "
+            f"master bias: {', '.join(modes)}"
+        )
+        raise CalibrationError(msg)
+
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
 

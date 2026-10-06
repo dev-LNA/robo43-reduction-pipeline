@@ -83,10 +83,7 @@ _STEP_PARAM_KEYS: dict[str, tuple[str, ...]] = {
     # GAINVAL="NONE"/GAINSRC="none" alone (via no_measurement_cards()) is
     # what makes a skipped gain step -- for want of a measurement -- visible
     # in this log without a measurement's other keys being present.
-    "gain": (
-        "GAINVAL", "GAINSRC", "GAINSET", "GSETFIX", "READOUTM", "GAINRN", "GAINNPR", "GAINSCT",
-        "BUNIT",
-    ),
+    "gain": ("GAINVAL", "GAINSRC", "GAINSET", "READOUTM", "GAINRN", "GAINNPR", "GAINSCT", "BUNIT"),
     "weight": (),
 }
 

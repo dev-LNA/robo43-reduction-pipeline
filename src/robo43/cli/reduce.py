@@ -35,6 +35,7 @@ from robo43.calib.overscan import detect_overscan
 from robo43.calib.pool import (
     WindowPoolResult,
     apply_window_pools,
+    enforce_single_bias_mode,
     infer_science_night,
     install_master_flat,
     limit_bias_for_gain,
@@ -42,6 +43,7 @@ from robo43.calib.pool import (
 from robo43.calib.set import CalibrationSet
 from robo43.cli.common import configure_from_args
 from robo43.cli.registry import Subcommand, register
+from robo43.exceptions import ConfigError
 from robo43.instruments.profile import resolve_profile
 from robo43.io.fits_io import iter_fits_files, read_header
 from robo43.io.headers import read_meta
@@ -684,6 +686,16 @@ def _run(args: argparse.Namespace) -> int:
                         settings.calib.min_flat_frames,
                         settings.calib.fallback_max_nights_flat,
                     )
+
+    # Only bias frames of one readout mode may be combined into the master bias
+    # (and, per group, measured for gain): explicit inputs and borrowed frames
+    # of another mode than the science frames' are dropped with a WARNING; a
+    # calibration-only run spanning several modes is refused.
+    try:
+        metas = enforce_single_bias_mode(metas)
+    except ConfigError as exc:
+        logger.error("%s", exc)
+        return 2
 
     # Overscan detection
     overscan_geometry = None

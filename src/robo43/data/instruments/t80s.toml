@@ -56,22 +56,42 @@ gain_setting = ["PG5_2"]
 binning = ["PG5_4"]
 ccd_temp = ["CCD-TEMP"]
 
-[instrument.gain_setting_repair]
-# Some raw frames (e.g. nights 20250605, 20250610, 20250629) were written with
-# PG5_2 = 0 because the header fill-up failed; the newer, already-processed
-# files carry PG5_2 = 1 (long read time) or 2 (short read time). For such a
-# frame PG0_4 ("CCD Read Time", seconds) decides: strictly greater than
-# threshold_seconds -> gain_setting = value_above (1); at or below it ->
-# value_at_or_below (2). When PG0_4 is missing or unparseable gain_setting
-# stays 0 and a WARNING is logged (once per process, then DEBUG). Applied in
-# robo43.io.headers.read_meta, so every consumer (calibration pooling, gain
-# grouping, reduction, inventory) sees the repaired value. Not applied to a
-# gain_setting given via --set / an overrides file.
-when_value = 0
-fallback_keyword = "PG0_4"
-threshold_seconds = 12.0
-value_above = 1
-value_at_or_below = 2
+[instrument.readout_mode_rule]
+# T80S has two camera readout modes that must never share calibrations:
+# "mode0" (gain ~2.06 e-/ADU, read noise ~7.1 e-; nights 20250531-20250629)
+# and "mode5" (the standard: gain ~0.93 e-/ADU, read noise ~4.35 e-; nights
+# 20251027 onward). The headers have no readout-mode keyword; these cards
+# separate the modes with no exception in 2991 frames of 65 nights. Votes are
+# listed in priority order and the first one present decides. If the votes
+# present disagree a WARNING is logged (once per process, then DEBUG); with no
+# vote at all `default` is used, with a WARNING logged the same way. The
+# result is FrameMeta.readout_mode (origin "derived"), set in
+# robo43.io.headers.read_meta so every consumer (calibration pooling, gain
+# grouping, reduction, inventory) sees it; it replaces a readout_mode read from
+# the header aliases but never a --set / overrides value. gain_setting stays
+# the raw PG5_2 value (0 = "Gain, (Normal)", 1 = "Gain, (High)"; 0 is a valid
+# value, not a header failure).
+default = "mode5"
+
+[[instrument.readout_mode_rule.votes]]
+# PG0_50 "Gain S, Volts": a live readback, -13.00..-12.87 in mode0 and
+# 0.024..0.121 in mode5.
+keyword = "PG0_50"
+threshold = -6.0
+below = "mode0"
+at_or_above = "mode5"
+
+[[instrument.readout_mode_rule.votes]]
+# PG5_1 "DSI Sample Time, 10 ns": 17 in mode0, 68 in mode5; any other value
+# casts no vote.
+keyword = "PG5_1"
+map = { "17" = "mode0", "68" = "mode5" }
+
+[[instrument.readout_mode_rule.votes]]
+# PG5_2 "Gain, (Normal)" / "Gain, (High)": 0 in mode0, 1 in mode5; any other
+# value casts no vote.
+keyword = "PG5_2"
+map = { "0" = "mode0", "1" = "mode5" }
 
 [instrument.imagetyp_map]
 # T80S writes IMAGETYP = 'sky-flat' for twilight flats (bias frames are

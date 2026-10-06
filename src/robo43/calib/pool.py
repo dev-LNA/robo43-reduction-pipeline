@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import math
 import shutil
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -55,6 +56,7 @@ from robo43.calib.fallback import (
     dominant_camera_config,
     parse_night_dirname,
 )
+from robo43.exceptions import ConfigError
 from robo43.io.fits_io import iter_fits_files
 from robo43.io.headers import read_meta
 
@@ -71,12 +73,14 @@ __all__ = [
     "PoolSelection",
     "WindowPoolResult",
     "apply_window_pools",
+    "enforce_single_bias_mode",
     "find_nearest_master_flat",
     "infer_science_night",
     "install_master_flat",
     "limit_bias_for_gain",
     "pool_bias_frames",
     "pool_flat_frames_window",
+    "restrict_bias_to_mode",
     "window_night_dirs",
 ]
 
@@ -413,7 +417,10 @@ def pool_bias_frames(
 
 
 def _same_readout(a: str | None, b: str | None) -> bool:
-    return (a or "UNKNOWN") == (b or "UNKNOWN")
+    """Whether a master's ``READOUTM`` card ``a`` and a frame's readout mode ``b``
+    are the same mode; ``None``, empty and ``UNKNOWN`` all stand for no mode,
+    which matches only another no-mode value."""
+    return (str(a).strip() if a else "UNKNOWN") == (str(b).strip() if b else "UNKNOWN")
 
 
 def find_nearest_master_flat(
@@ -436,9 +443,12 @@ def find_nearest_master_flat(
 
     * its file name carries ``filter_name`` (the master header has no filter
       card; ``master_flat_<filter>[_dome|_sky].fits``);
-    * its ``GAINSET`` and ``READOUTM`` cards equal the science frames' gain
-      setting and readout mode (``READOUTM = UNKNOWN`` stands for no readout
-      mode); a missing card is accepted;
+    * its ``GAINSET`` card equals the science frames' gain setting (a missing
+      card is accepted) and its ``READOUTM`` card equals their readout mode
+      (e.g. the profile-derived ``mode0`` / ``mode5``): a master with no
+      ``READOUTM`` card or ``READOUTM = UNKNOWN`` (built before the readout mode
+      was known) matches only frames without a readout mode and is skipped,
+      logged at DEBUG, for a frame with one;
     * its header frame count (``FLATNACC``, else ``FLATNFRM``, else
       ``NCOMBINE``) is at least ``min_frames`` -- a master without any count
       card is accepted.  Masters failing only this test are counted in
@@ -478,7 +488,13 @@ def find_nearest_master_flat(
                     and not math.isclose(float(master_gain), float(gain_setting), rel_tol=1e-6)
                 ):
                     continue
-                if not _same_readout(header.get("READOUTM"), readout_mode):
+                master_readout = header.get("READOUTM")
+                if not _same_readout(master_readout, readout_mode):
+                    logger.debug(
+                        "master flat scan: skipping %s: READOUTM %r does not match "
+                        "the frames' readout mode %r",
+                        path, master_readout, readout_mode,
+                    )
                     continue
                 n_frames = next(
                     (int(header[k]) for k in _MASTER_FRAME_COUNT_KEYS if k in header), None
@@ -684,6 +700,65 @@ def limit_bias_for_gain(metas: Sequence[FrameMeta], max_frames: int) -> list[Fra
     return kept
 
 
+def _mode_label(meta: FrameMeta) -> str:
+    """A frame's readout mode as compared between frames: ``UNKNOWN`` for none."""
+    return (meta.readout_mode or "").strip() or "UNKNOWN"
+
+
+def restrict_bias_to_mode(
+    metas: Sequence[FrameMeta], mode: str | None, *, where: str
+) -> list[FrameMeta]:
+    """``metas`` without the bias frames whose readout mode is not ``mode``.
+
+    Frames of every other type are kept.  When bias frames are dropped, one
+    WARNING names ``where`` and lists the dropped count per readout mode.
+    """
+    keep_label = (mode or "").strip() or "UNKNOWN"
+    kept: list[FrameMeta] = []
+    dropped: Counter[str] = Counter()
+    for meta in metas:
+        if meta.frame_type == "bias" and _mode_label(meta) != keep_label:
+            dropped[_mode_label(meta)] += 1
+        else:
+            kept.append(meta)
+    if dropped:
+        logger.warning(
+            "%s: dropped %d bias frame(s) of a readout mode other than the science "
+            "frames' %r (never combined into one master bias); dropped per mode: %s",
+            where, sum(dropped.values()), keep_label,
+            ", ".join(f"{label}: {count}" for label, count in sorted(dropped.items())),
+        )
+    return kept
+
+
+def enforce_single_bias_mode(metas: Sequence[FrameMeta]) -> list[FrameMeta]:
+    """Make sure the bias frames of a run share one readout mode.
+
+    A run whose bias frames are all of one mode is returned unchanged.  With
+    several modes among them: when the run has valid science frames, only the
+    bias frames of the science frames' (most common) mode are kept and the
+    others are dropped with a WARNING listing the dropped count per mode
+    (:func:`restrict_bias_to_mode`); a calibration-only run (no valid science
+    frame to choose a mode by) raises :class:`~robo43.exceptions.ConfigError`
+    instead of combining them.
+    """
+    bias = [m for m in metas if m.frame_type == "bias"]
+    per_mode = Counter(_mode_label(m) for m in bias)
+    if len(per_mode) <= 1:
+        return list(metas)
+    science = [m for m in metas if m.frame_type == "science" and m.is_valid]
+    if not science:
+        msg = (
+            "the bias frames span several readout modes ("
+            + ", ".join(f"{label}: {count}" for label, count in sorted(per_mode.items()))
+            + ") and there are no science frames to choose between them; refusing to "
+            "combine different readout modes into one master bias"
+        )
+        raise ConfigError(msg)
+    target = Counter(_mode_label(m) for m in science).most_common(1)[0][0]
+    return restrict_bias_to_mode(metas, target, where="master bias inputs")
+
+
 def apply_window_pools(
     metas: Sequence[FrameMeta],
     *,
@@ -735,7 +810,12 @@ def apply_window_pools(
                 target_config=config,
                 window_nights=opts.bias_pool_window_nights,
                 target_frames=opts.bias_pool_target_frames,
-                explicit_metas=[m for m in metas if m.frame_type == "bias"],
+                explicit_metas=[
+                    m for m in restrict_bias_to_mode(
+                        metas, config[0], where="explicit bias inputs"
+                    )
+                    if m.frame_type == "bias"
+                ],
                 scanner=scanner, profile=profile, settings=settings,
             )
             out = [m for m in out if m.frame_type != "bias"] + list(bias_sel.metas)
