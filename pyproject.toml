@@ -17,7 +17,8 @@ dependencies = [
     "scipy>=1.14",
     "pandas>=2.2",
     "matplotlib>=3.9",
-    "photutils>=2.0",
+    # _bound_kron_radius (photometry/catalog.py) uses the private SourceCatalog._measured_kron_radius
+    "photutils>=2.3,<2.4",
     # Required at runtime by photutils.segmentation.deblend_sources' watershed
     # path (skimage.segmentation.watershed), imported lazily and only when a
     # source actually needs splitting; photutils does not declare it itself.
