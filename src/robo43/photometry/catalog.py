@@ -110,6 +110,14 @@ __all__ = [
 #: is deliberately excluded -- see the module docstring.
 _BAD_PIXEL_FLAGS = int(DQ.SATURATED | DQ.NO_DATA | DQ.DEAD | DQ.HOT | DQ.BAD_COLUMN)
 
+#: photutils measures the first-moment Kron radius inside an elliptical
+#: aperture of 6 x (semimajor_sigma, semiminor_sigma), so for non-negative
+#: data it never exceeds 6. Mixed-sign data (noise blobs next to DEAD columns,
+#: whose unmasked pixels reach +-1e5 e) can drive sum(w*I) towards zero and the
+#: radius to thousands; the Kron aperture mask then needs tens of GB (T80S
+#: TOO-20250630-001421: 7210.8 -> a 42 GiB array, OOM).
+_KRON_MEASURED_RADIUS_MAX = 6.0
+
 #: SExtractor-compatible FLAGS bits. Bits 1 and 2 are always set together by
 #: this module (a deblended child is, by definition, one of >1 siblings that
 #: shared a single pre-deblend parent segment) since nothing here computes a
@@ -254,6 +262,34 @@ def estimate_sky_background(
         mask=bad_mask,
         exclude_percentile=50.0,
     )
+
+
+def _bound_kron_radius(cat: SourceCatalog) -> int:
+    """Reset measured Kron radii above the physical bound to the minimum.
+
+    Uses the fallback photutils itself applies when the moment sums are
+    negative (``kron_params[1]``). Must run before any Kron-derived property
+    (kron_radius, kron_aperture, kron_flux, fluxfrac_radius) is accessed, since
+    those are cached. Returns the number of sources reset.
+    """
+    try:
+        measured = cat._measured_kron_radius  # cached lazyproperty array (photutils 2.3)
+    except AttributeError as exc:
+        msg = "photutils SourceCatalog has no _measured_kron_radius; update _bound_kron_radius"
+        raise PhotometryError(msg) from exc
+    with np.errstate(invalid="ignore"):
+        bad = measured > _KRON_MEASURED_RADIUS_MAX
+    n_bad = int(np.count_nonzero(bad))
+    if n_bad:
+        logger.info(
+            "Kron radius above %.1f for %d source(s) (max %.1f); reset to the minimum %.2f",
+            _KRON_MEASURED_RADIUS_MAX,
+            n_bad,
+            float(np.max(measured[bad])),
+            float(cat.kron_params[1]),
+        )
+        measured[bad] = cat.kron_params[1]
+    return n_bad
 
 
 def _empty_table(n_aper: int) -> Table:
@@ -464,6 +500,7 @@ def measure_sources(
         wcs=wcs,
         localbkg_width=localbkg_width,
     )
+    _bound_kron_radius(cat)
 
     n = len(cat.labels)
 

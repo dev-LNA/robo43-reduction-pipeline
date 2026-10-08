@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
+from photutils.segmentation import SourceCatalog, detect_sources
 
+import robo43.photometry.catalog as catalog_mod
 from robo43.config import CalibSettings, PhotometrySettings, Settings
 from robo43.exceptions import PhotometryError
 from robo43.instruments.profile import InstrumentLayout, InstrumentProfile
@@ -20,6 +22,7 @@ from robo43.photometry.catalog import (
     FLAG_NEIGHBOR,
     FLAG_SATURATED,
     PhotometryResult,
+    _bound_kron_radius,
     measure_sources,
     pixel_scale_arcsec,
 )
@@ -302,3 +305,45 @@ def test_pixel_scale_raises_when_nothing_usable():
     header = fits.Header()
     with pytest.raises(PhotometryError):
         pixel_scale_arcsec(header, None, _profile(pixel_scale_arcsec=None))
+
+
+def _star_catalog() -> SourceCatalog:
+    sci, err, _ = _frame_with_star()
+    data = sci.astype(np.float64) - BACKGROUND_LEVEL
+    segm = detect_sources(data, 10 * READ_NOISE_E, npixels=5)
+    return SourceCatalog(data, segm, error=err.astype(np.float64))
+
+
+def test_bound_kron_radius_resets_unphysical_radius_to_minimum():
+    cat = _star_catalog()
+    cat._measured_kron_radius[:] = 7210.8  # the value that blew up TOO-20250630-001421
+    assert _bound_kron_radius(cat) == len(cat.labels)
+    assert np.all(np.atleast_1d(cat.kron_radius.value) == cat.kron_params[1])
+    assert np.all(np.isfinite(np.atleast_1d(cat.kron_flux)))
+
+
+def test_bound_kron_radius_leaves_physical_radii_untouched():
+    cat = _star_catalog()
+    before = cat._measured_kron_radius.copy()
+    assert np.all(before[np.isfinite(before)] <= 6.0)
+    assert _bound_kron_radius(cat) == 0
+    np.testing.assert_array_equal(cat._measured_kron_radius, before)
+
+
+def test_measure_sources_bounds_the_kron_radius(monkeypatch):
+    built = []
+
+    class _HugeKron(SourceCatalog):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.__dict__["_measured_kron_radius"] = np.full(len(self.labels), 300.0)
+            built.append(self)
+
+    monkeypatch.setattr(catalog_mod, "SourceCatalog", _HugeKron)
+    sci, err, dq = _frame_with_star()
+    result = measure_sources(
+        sci, err, dq, header=_header(), settings=_settings(), profile=_profile()
+    )
+    assert result.n_sources >= 1
+    assert built
+    assert np.all(np.atleast_1d(built[-1].kron_radius.value) <= 6.0)
