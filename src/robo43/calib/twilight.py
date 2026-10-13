@@ -1,30 +1,40 @@
 """Twilight (sky) flat handling: classification, level scaling, star masking, QC.
 
-Twilight flats are taken with the telescope moved between exposures, so no star
-repeats at the same pixel -- but the frame levels differ strongly (the sky
-fades or brightens through the sequence).  Combining them with a per-pixel
-sigma clip on the *unscaled* frames fails: the across-frame scatter is
-dominated by the level differences, 3-sigma clipping never reaches a star, and
-every star survives in the master as a compact positive residual.
+Twilight flats are taken with the telescope moved between exposures, so stars
+do not repeat at one pixel (or only within a small dither) -- but the frame
+levels differ strongly (the sky fades or brightens through the sequence).
+Combining them with a per-pixel sigma clip on the *unscaled* frames fails: the
+across-frame scatter is dominated by the level differences, 3-sigma clipping
+never reaches a star, and every star survives in the master as a compact
+positive residual.
 
 This module supplies the pieces :func:`robo43.calib.flat.build_master_flats`
 uses for a twilight group:
 
-* :func:`is_twilight_flat` -- reliable twilight/sky classification of one flat
-  (OBJECT, raw IMAGETYP, or file name);
+* :func:`is_twilight_flat` -- twilight/sky classification of one flat from the
+  raw IMAGETYP, the OBJECT value or the file name (word-token matching, in
+  that order of priority);
 * :func:`scales_from_levels` / :func:`frame_level` -- per-frame multiplicative
   scales that bring every frame to a common level (the median of the frame
   levels), applied *before* clipping;
-* :func:`combine_twilight` -- the memory-bounded (row-block) combine: each
-  scaled frame is compared with a heavily smoothed copy of itself, positive
-  excursions above ``star_nsigma`` robust sigmas are masked (dilated by
-  ``star_dilate_px``), the masked pixels are excluded from the sigma-clipped
-  combine, and pixels masked in too many frames (stars never repeat at one
-  pixel: that is real structure, e.g. a hot pixel) are combined from all
-  their frames instead;
+* :func:`combine_twilight` -- the memory-bounded (row-block), two-pass combine
+  (see below);
 * :func:`flat_star_qc` -- counts compact positive peaks left in a normalised
   master (3x3 mean of master / local median above a threshold) so a master
   with star residuals is detected and recorded in the header.
+
+Two-pass star masking (:func:`combine_twilight`).  Pass 1 compares every scaled
+frame with a heavily smoothed copy of itself, masks the positive excursions
+(dilated) and builds a preliminary master from the unmasked entries.  A pixel
+masked in (nearly) all frames is either static structure (hot pixel, edge: its
+residual is the same in every frame) or a star that sits there in every frame
+because the dither is small (its residual changes from frame to frame); the
+across-frame scatter of the residual tells them apart.  Pass 2 divides each
+frame by the preliminary master -- static structure divides out, stars do not
+-- detects the positive residual against the smooth reference of *that ratio*,
+masks it (dilated) and sigma-clip-combines the unmasked entries.  A pixel with
+a star in every frame (nothing left to combine) takes the preliminary master's
+smooth value, flagged with zero weight, ``n_used`` 0 and a set mask.
 
 The same code path serves the in-memory and the on-disk (memmap) storage of
 the corrected frames: both are presented as row-block ``loaders``.
@@ -33,7 +43,6 @@ the corrected frames: both are presented as row-block ``loaders``.
 from __future__ import annotations
 
 import logging
-import math
 import re
 import warnings
 from collections.abc import Callable, Sequence
@@ -48,6 +57,8 @@ from robo43.calib.combine import CombineResult, _combine_core, row_block_size
 from robo43.calib.masks import _block_grid_medians, _block_interp_weights
 from robo43.config import CalibSettings
 from robo43.exceptions import CalibrationError
+from robo43.instruments.profile import InstrumentProfile
+from robo43.io.headers import read_raw_imagetyp
 from robo43.io.meta import FrameMeta
 
 logger = logging.getLogger(__name__)
@@ -62,6 +73,7 @@ __all__ = [
     "frame_level",
     "is_twilight_flat",
     "method_cards",
+    "raw_imagetyp",
     "scales_from_levels",
 ]
 
@@ -70,9 +82,26 @@ __all__ = [
 #: on top of the stack that :func:`robo43.calib.combine.row_block_size` sizes.
 _BLOCK_MEMORY_FRACTION = 0.75
 
-#: File names such as ``skyflat-20251224-001234.fits.fz``, ``sky_flat_01.fits``
-#: or ``twilight-R-03.fits``.
-_TWILIGHT_NAME_RE = re.compile(r"sky[\s_-]?flat|twilight")
+#: Whole words (case-folded) that mark a twilight flat in IMAGETYP, OBJECT or a
+#: file name; a word ending in "flat"/"flats" whose stem is one of
+#: ``_TWILIGHT_STEMS`` (``twilightflat``) counts too.
+_TWILIGHT_WORDS = frozenset({"sky", "twilight", "twi", "dusk", "dawn", "skyflat", "twiflat"})
+_TWILIGHT_STEMS = frozenset({"sky", "twilight", "twi", "dusk", "dawn"})
+
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
+_LETTER_DIGIT_RE = re.compile(r"(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])")
+_NON_ALNUM_RE = re.compile(r"[^0-9A-Za-z]+")
+
+#: ``(path, mtime_ns, size, profile name)`` -> raw IMAGETYP read from the header.
+_IMAGETYP_CACHE: dict[tuple[str, int, int, str], str | None] = {}
+_IMAGETYP_CACHE_MAX = 8192
+
+#: A pixel left with too few unmasked frames is "star-like" (not static
+#: structure) when at least this many pixels within ``2 * star_dilate_px + 2``
+#: of it (a square window) have an across-frame residual variance above the
+#: static tolerance: a star puts dozens of varying pixels in its neighbourhood,
+#: noise puts almost none (see :func:`_mask_block`).
+_STATIC_MIN_VARYING = 8
 
 #: Block rows read per step while building a frame's smooth reference grid.
 _REF_CHUNK_BLOCKS = 32
@@ -88,20 +117,26 @@ class TwilightParams:
     ``star_nsigma``: detection threshold, in robust sigmas of the frame's
     residual from its smooth reference, for the pixel itself and for its 3x3
     mean.  ``star_block_px`` / ``star_smooth_blocks``: the reference is the
-    ``star_block_px`` block median of the scaled frame, median-filtered over
+    ``star_block_px`` block median of the scaled frame (pass 1) or of the
+    frame / preliminary master ratio (pass 2), median-filtered over
     ``star_smooth_blocks`` x ``star_smooth_blocks`` blocks (80 px for the
     defaults) and bilinearly interpolated back.  ``star_dilate_px``: square
     dilation of the detections to cover the wings.  ``star_min_frames``: a
     pixel left with fewer unmasked frames than this (capped at ``n - 1``) is
-    combined from all its frames instead; so is a pixel masked in more than
-    ``star_persist_frac`` of the frames (see :func:`combine_twilight`).
-    ``scale_all_flats``: also scale
-    non-twilight (dome) flats to a common level before clipping.  ``qc_*``:
-    the star-residual QC (window of the local median, threshold on the 3x3
-    mean of master / local median, blob area range counted as a compact peak,
-    warning density in peaks per Mpixel).  The 3x3 mean is used because a
-    sensor's pixel-response scatter (0.9 % rms on T80S) puts ~25 000 single
-    pixels per 85 Mpx above 1.03 in a perfectly clean master.
+    tested for static structure.  ``star_static_tol``: a pixel whose
+    across-frame residual variance exceeds ``star_static_tol`` ** 2 times the
+    block's typical (median) pixel variance is "varying" (a star of changing
+    strength sits on it); such a pixel with fewer unmasked frames than
+    ``star_min_frames`` that has at least 8 varying pixels within
+    ``2 * star_dilate_px + 2`` px is star-like, any other one is static
+    structure (hot pixel, edge) and is combined from all its frames.
+    ``scale_all_flats``: also scale non-twilight
+    (dome) flats to a common level before clipping.  ``qc_*``: the
+    star-residual QC (window of the local median, threshold on the 3x3 mean of
+    master / local median, blob area range counted as a compact peak, warning
+    density in peaks per Mpixel).  The 3x3 mean is used because a sensor's
+    pixel-response scatter (0.9 % rms on T80S) puts ~25 000 single pixels per
+    85 Mpx above 1.03 in a perfectly clean master.
     """
 
     star_nsigma: float = 4.0
@@ -109,11 +144,11 @@ class TwilightParams:
     star_smooth_blocks: int = 5
     star_dilate_px: int = 3
     star_min_frames: int = 3
-    star_persist_frac: float = 0.5
+    star_static_tol: float = 3.0
     scale_all_flats: bool = False
     qc_window_px: int = 61
     qc_threshold: float = 1.03
-    qc_warn_per_mpix: float = 30.0
+    qc_warn_per_mpix: float = 2.0
     qc_min_area_px: int = 4
     qc_max_area_px: int = 400
 
@@ -129,8 +164,8 @@ class TwilightParams:
             problems.append("star_dilate_px must be >= 0")
         if self.star_min_frames < 1:
             problems.append("star_min_frames must be >= 1")
-        if not 0.0 < self.star_persist_frac <= 1.0:
-            problems.append("star_persist_frac must be in (0, 1]")
+        if not self.star_static_tol > 0:
+            problems.append("star_static_tol must be > 0")
         if self.qc_window_px < 3:
             problems.append("qc_window_px must be >= 3")
         if not self.qc_threshold > 1.0:
@@ -143,24 +178,84 @@ class TwilightParams:
             raise CalibrationError("invalid TwilightParams: " + "; ".join(problems))
 
 
-def is_twilight_flat(meta: FrameMeta) -> bool:
+def _word_tokens(text: str) -> list[str]:
+    """Lower-case words of ``text``: split on non-alphanumerics, camelCase and letter/digit."""
+    spaced = _LETTER_DIGIT_RE.sub(" ", _CAMEL_RE.sub(" ", text))
+    return [token.lower() for token in _NON_ALNUM_RE.split(spaced) if token]
+
+
+def _is_twilight_word(token: str) -> bool:
+    candidates = [token]
+    if len(token) > 3 and token.endswith("s"):
+        candidates.append(token[:-1])  # plural: skyflats, twilights
+    for cand in candidates:
+        if cand in _TWILIGHT_WORDS:
+            return True
+        if cand.endswith("flat") and cand[: -len("flat")] in _TWILIGHT_STEMS:
+            return True
+    return False
+
+
+def _text_verdict(text: str | None) -> bool | None:
+    """``False`` for a "dome" word in ``text``, ``True`` for a twilight word, else ``None``.
+
+    A dome word wins over a twilight word in the same text ("dome_sky_flat",
+    "Dome flat (no sky)").
+    """
+    if not text:
+        return None
+    tokens = _word_tokens(str(text))
+    if any("dome" in token for token in tokens):
+        return False
+    if any(_is_twilight_word(token) for token in tokens):
+        return True
+    return None
+
+
+def raw_imagetyp(meta: FrameMeta, profile: InstrumentProfile | None = None) -> str | None:
+    """Raw IMAGETYP string of a frame.
+
+    Taken from ``meta.origins["imagetyp"]`` (recorded by
+    :func:`robo43.io.headers.read_meta`); when an inventory predating that
+    origin has none, the FITS header is read again
+    (:func:`robo43.io.headers.read_raw_imagetyp`, cached per file).  ``None``
+    when neither yields a value (including an unreadable or missing file).
+    """
+    origin = meta.origins.get("imagetyp") if meta.origins else None
+    if origin is not None and str(origin.detail).strip():
+        return str(origin.detail)
+    path = Path(meta.path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    profile_name = profile.name if profile is not None else ""
+    key = (str(path), stat.st_mtime_ns, stat.st_size, profile_name)
+    if key not in _IMAGETYP_CACHE:
+        if len(_IMAGETYP_CACHE) >= _IMAGETYP_CACHE_MAX:
+            _IMAGETYP_CACHE.clear()
+        _IMAGETYP_CACHE[key] = read_raw_imagetyp(path, profile)
+    return _IMAGETYP_CACHE[key]
+
+
+def is_twilight_flat(meta: FrameMeta, profile: InstrumentProfile | None = None) -> bool:
     """True when this flat frame is a twilight (sky) flat.
 
-    Any one of three signals suffices: the OBJECT value (lower-cased) contains
-    "sky" or "twilight"; the raw IMAGETYP value recorded in
-    ``meta.origins["imagetyp"]`` (``robo43.io.headers``) contains "sky" or
-    "twilight" (T80S writes ``IMAGETYP = 'sky-flat'`` and no OBJECT); or the
-    file name looks like ``skyflat-*`` / ``sky_flat*`` / ``twilight*``.
+    The raw IMAGETYP (T80S writes ``IMAGETYP = 'sky-flat'`` and no OBJECT), the
+    OBJECT value and the file name are examined in that order of priority; the
+    first one that carries a signal decides.  Each is split into words (on
+    non-alphanumerics, camelCase and letter/digit boundaries); a word in
+    {sky, twilight, twi, dusk, dawn, skyflat, twiflat} is a twilight signal,
+    any word containing "dome" is a dome signal, and a dome signal wins over a
+    twilight one in the same source ("dome_sky_flat_01.fits", "Husky Dome" and
+    "Dome flat (no sky)" are not twilight flats; "TwiFlat", "FLAT-DUSK" and
+    "dawn flat" are).  A frame with no signal anywhere is not twilight.
     """
-    obj = (meta.object or "").lower()
-    if "sky" in obj or "twilight" in obj:
-        return True
-    origin = meta.origins.get("imagetyp") if meta.origins else None
-    if origin is not None:
-        raw = str(origin.detail).lower()
-        if "sky" in raw or "twilight" in raw:
-            return True
-    return bool(_TWILIGHT_NAME_RE.search(Path(meta.path).name.lower()))
+    for text in (raw_imagetyp(meta, profile), meta.object, Path(meta.path).name):
+        verdict = _text_verdict(text)
+        if verdict is not None:
+            return verdict
+    return False
 
 
 def central_region(shape: tuple[int, int], frac: float) -> tuple[slice, slice]:
@@ -175,8 +270,14 @@ def central_region(shape: tuple[int, int], frac: float) -> tuple[slice, slice]:
 
 
 def frame_level(frame: np.ndarray, frac: float) -> float:
-    """Median of the central ``frac`` region of a corrected flat frame."""
-    return float(np.median(frame[central_region(frame.shape, frac)]))
+    """NaN-ignoring median of the central ``frac`` region of a corrected flat frame.
+
+    ``nan`` when the region has no finite value (the caller drops such a frame).
+    """
+    region = frame[central_region(frame.shape, frac)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # "All-NaN slice encountered"
+        return float(np.nanmedian(region))
 
 
 def scales_from_levels(levels: Sequence[float]) -> tuple[float, np.ndarray]:
@@ -219,9 +320,10 @@ class TwilightInfo:
     scales: tuple[float, ...]
     params: TwilightParams
     block_px: int
-    min_frames: int  # a pixel with fewer unmasked frames than this is combined unmasked
-    masked_fraction: float  # of frame*pixel entries excluded as stars
-    n_fallback_px: int  # pixels combined from all frames (too few unmasked)
+    min_frames: int  # a pixel with fewer unmasked frames than this is tested for static structure
+    masked_fraction: float  # of frame*pixel entries excluded as stars (final pass)
+    n_static_px: int  # pass 1: masked in most frames but static structure -> combined unmasked
+    n_filled_px: int  # pass 2: a star in every frame -> preliminary master's smooth value
 
     def header_cards(self) -> list[tuple[str, Any, str]]:
         p = self.params
@@ -230,14 +332,16 @@ class TwilightInfo:
             ("FLATSCAL", "center_median", "Frames scaled to a common level before clipping"),
             ("FLATLREF", self.l_ref, "Common level the frames were scaled to"),
             ("STARMASK", True, "Per-frame star masking applied"),
+            ("STARPASS", 2, "Star-mask passes (2nd on frame/prelim master)"),
             ("STARNSIG", p.star_nsigma, "Star detection threshold (robust sigma)"),
             ("STARBLK", self.block_px, "Smooth-reference block size (px)"),
             ("STARSMTH", p.star_smooth_blocks, "Smooth-reference median filter (blocks)"),
             ("STARDIL", p.star_dilate_px, "Star mask dilation (px)"),
-            ("STARPERS", p.star_persist_frac, "Masked in more frames than this: not stars"),
-            ("STARMINF", self.min_frames, "Min unmasked frames per pixel (else fallback)"),
+            ("STARSTAT", p.star_static_tol, "Static-structure scatter tolerance (x noise)"),
+            ("STARMINF", self.min_frames, "Min unmasked frames before static test"),
             ("STARMFRC", self.masked_fraction, "Fraction of frame*pixel entries masked"),
-            ("STARNFB", self.n_fallback_px, "Pixels combined unmasked (too few frames)"),
+            ("STARNFB", self.n_static_px, "Static px masked in most frames, kept"),
+            ("STARNFL", self.n_filled_px, "Px with a star in every frame, filled"),
         ]
 
 
@@ -265,13 +369,17 @@ def _reference_grid(
     box: int,
     smooth: int,
     fill_level: float,
+    divisor: np.ndarray | None = None,
 ) -> np.ndarray:
     """Heavily smoothed block-median grid ``(h // box, w // box)`` of one scaled frame.
 
     Read in strips of block rows so no full frame is held; non-finite pixels
-    take ``fill_level``.  The block medians are median-filtered over
-    ``smooth`` x ``smooth`` blocks (clipped to the grid) so stars, which fill
-    only part of a block, do not enter the reference.
+    take ``fill_level``.  With ``divisor`` (the preliminary master) the grid is
+    that of ``scaled frame / divisor`` instead, a pixel where either is not
+    finite or the divisor is not positive taking ``fill_level``.  The block
+    medians are median-filtered over ``smooth`` x ``smooth`` blocks (clipped
+    to the grid) so stars, which fill only part of a block, do not enter the
+    reference.
     """
     h, w = shape
     n_by, n_bx = h // box, w // box
@@ -280,7 +388,14 @@ def _reference_grid(
         b1 = min(b0 + _REF_CHUNK_BLOCKS, n_by)
         raw = np.asarray(loader((slice(b0 * box, b1 * box), slice(0, n_bx * box))))
         strip = raw.astype(np.float32) * np.float32(scale)
-        strip[~np.isfinite(strip)] = np.float32(fill_level)
+        if divisor is None:
+            strip[~np.isfinite(strip)] = np.float32(fill_level)
+        else:
+            denom = np.asarray(divisor[b0 * box : b1 * box, : n_bx * box], dtype=np.float32)
+            usable = np.isfinite(strip) & np.isfinite(denom) & (denom > 0)
+            ratio = np.full(strip.shape, np.float32(fill_level), dtype=np.float32)
+            np.divide(strip, denom, out=ratio, where=usable)
+            strip = ratio
         blocks = strip.reshape(b1 - b0, box, n_bx, box).transpose(0, 2, 1, 3)
         grid[b0:b1] = np.median(blocks.reshape(b1 - b0, n_bx, box * box), axis=-1)
     odd_limit = min(n_by - (1 - n_by % 2), n_bx - (1 - n_bx % 2))
@@ -313,8 +428,8 @@ def _robust_sigma(values: np.ndarray) -> tuple[float, float]:
 
 def _detect_stars(
     frame: np.ndarray, reference: np.ndarray, core: slice, params: TwilightParams
-) -> np.ndarray:
-    """Boolean star mask (same shape as ``frame``) of one scaled frame block.
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(star mask, residual)`` of one scaled frame block, both of the frame's shape.
 
     The residual ``frame / reference - 1`` is thresholded at ``star_nsigma``
     robust sigmas (sigma and median taken over the ``core`` rows only, the
@@ -337,7 +452,119 @@ def _detect_stars(
         grown = ndimage.maximum_filter1d(detected.view(np.uint8), size, axis=0, mode="constant")
         grown = ndimage.maximum_filter1d(grown, size, axis=1, mode="constant")
         detected = grown.astype(bool)
-    return detected
+    return detected, resid
+
+
+def _median_variance_factor(dof: int) -> float:
+    """Median of a chi-square variable with ``dof`` degrees of freedom, divided by ``dof``
+    (Wilson-Hilferty approximation)."""
+    return (1.0 - 2.0 / (9.0 * dof)) ** 3
+
+
+def _nan_median_axis0(stack: np.ndarray) -> np.ndarray:
+    """Median over axis 0 ignoring non-finite entries (float64); NaN where none is finite.
+
+    Sorts a float32 copy of the stack (half the memory of the float64 stack).
+    """
+    n = stack.shape[0]
+    srt = stack.astype(np.float32)
+    usable = np.isfinite(srt)
+    srt[~usable] = np.inf
+    srt.sort(axis=0)
+    count = usable.sum(axis=0)
+    lo = np.clip((count - 1) // 2, 0, n - 1)[None]
+    hi = np.clip(count // 2, 0, n - 1)[None]
+    low = np.take_along_axis(srt, lo, axis=0)[0].astype(np.float64)
+    high = np.take_along_axis(srt, hi, axis=0)[0].astype(np.float64)
+    med = 0.5 * (low + high)
+    med[count == 0] = np.nan
+    return med
+
+
+@dataclass(slots=True)
+class _BlockMasks:
+    """Result of :func:`_mask_block` for one row block (core rows only)."""
+
+    stack: np.ndarray  # (n, rows, w) float64, scaled frames
+    star: np.ndarray  # (n, rows, w) bool, entries to exclude
+    static: np.ndarray  # (rows, w) bool, masked in most frames but static: star mask lifted
+    empty: np.ndarray  # (rows, w) bool, no frame left to combine
+    ref_mean: np.ndarray  # (rows, w) float64, mean over frames of the reference
+
+
+def _mask_block(
+    loaders: Sequence[Callable[[tuple[slice, slice]], np.ndarray]],
+    scales: np.ndarray,
+    grids: Sequence[np.ndarray],
+    y_interp: tuple[np.ndarray, np.ndarray, np.ndarray],
+    x_interp: tuple[np.ndarray, np.ndarray, np.ndarray],
+    rows: tuple[int, int, int, int],
+    width: int,
+    prelim: np.ndarray | None,
+    params: TwilightParams,
+    min_frames: int,
+) -> _BlockMasks:
+    """Scale, read and star-mask one row block ``r0:r1`` (haloed rows ``ra:rb``).
+
+    ``rows = (ra, rb, r0, r1)``; the halo carries the filters' context and the
+    neighbourhood of the static test.  Each frame is compared with its
+    reference: the smooth grid, upsampled (pass 1, ``prelim`` None), or the
+    smooth grid of the frame / preliminary-master ratio times the preliminary
+    master (pass 2).
+
+    A pixel left with fewer than ``min_frames`` unmasked frames is either a
+    star sitting on it in every frame (small dither) or static structure.  The
+    residual of static structure is the same in every frame, so its
+    across-frame variance is only noise; that of a star changes with the
+    star's position.  The variance is compared with the block's median pixel
+    variance (``star_static_tol`` ** 2, "varying"): the pixel is star-like
+    when at least ``_STATIC_MIN_VARYING`` varying pixels lie within
+    ``2 * star_dilate_px + 2`` px of it (a star's faint wings are not
+    individually distinguishable from noise, its core is), otherwise static,
+    and its star mask is lifted.  A star-like pixel with no unmasked frame is
+    ``empty``, as is one with no finite value at all.
+    """
+    ra, rb, r0, r1 = rows
+    n = len(loaders)
+    nr = r1 - r0
+    nh = rb - ra
+    core = slice(r0 - ra, r1 - ra)
+    stack = np.empty((n, nr, width), dtype=np.float64)
+    star = np.zeros((n, nh, width), dtype=bool)
+    sum_r = np.zeros((nh, width), dtype=np.float64)
+    sum_r2 = np.zeros((nh, width), dtype=np.float64)
+    ref_sum = np.zeros((nh, width), dtype=np.float64)
+    for i, loader in enumerate(loaders):
+        raw = np.asarray(loader((slice(ra, rb), slice(0, width))))
+        scaled = raw.astype(np.float64) * float(scales[i])
+        reference = _upsample(grids[i], y_interp, x_interp, ra, rb)
+        if prelim is not None:
+            reference = reference * prelim[ra:rb]
+        detected, resid = _detect_stars(scaled.astype(np.float32), reference, core, params)
+        star[i] = detected
+        stack[i] = scaled[core]
+        r = resid.astype(np.float64)
+        sum_r += r
+        sum_r2 += r * r
+        ref_sum += reference
+
+    n_clean = n - star.sum(axis=0)
+    few = n_clean < min_frames
+    static = np.zeros((nr, width), dtype=bool)
+    empty = np.zeros((nr, width), dtype=bool)
+    if few[core].any():
+        var = np.maximum((sum_r2 - sum_r * sum_r / n) / (n - 1), 0.0)
+        noise_var = float(np.median(var[core])) / _median_variance_factor(n - 1)
+        varying = few & (var > params.star_static_tol**2 * noise_var)
+        window = 2 * (2 * params.star_dilate_px + 2) + 1
+        n_varying = ndimage.uniform_filter(varying.astype(np.float32), size=window, mode="constant")
+        starlike = few & (n_varying * np.float32(window * window) >= _STATIC_MIN_VARYING - 0.5)
+        static_halo = few & ~starlike
+        star[:, static_halo] = False
+        static = static_halo[core]
+        no_data = ~np.isfinite(stack).any(axis=0)
+        empty = (starlike[core] & (n_clean[core] == 0)) | (few[core] & no_data)
+    return _BlockMasks(stack, star[:, core], static, empty, ref_sum[core] / n)
 
 
 def combine_twilight(
@@ -352,7 +579,7 @@ def combine_twilight(
     gain_e_per_adu: float | None = None,
     fill: float = 0.0,
 ) -> tuple[CombineResult, TwilightInfo]:
-    """Scale, star-mask and sigma-clip-combine twilight flats, row block by row block.
+    """Scale, star-mask (two passes) and sigma-clip-combine twilight flats, row block by row block.
 
     ``loaders`` and ``shape`` are as for :func:`robo43.calib.combine.combine_lazy`
     (any storage: in-memory arrays or a memmap); ``levels`` holds each frame's
@@ -361,17 +588,28 @@ def combine_twilight(
     sigma clip compares like with like and the master (and its variance) stay
     in the frames' units at level ``l_ref``.
 
-    Per row block (with a halo of ``star_dilate_px + 2`` rows for the filters)
-    each frame's stars are masked by :func:`_detect_stars` against that
-    frame's smooth reference grid, and masked entries become NaN, which the
-    sigma clip excludes.  A pixel left with fewer unmasked frames than
-    ``min_frames`` (``star_min_frames`` capped at ``n - 1``, but at least the
-    frames outside ``star_persist_frac`` of them) is combined from all its
-    frames: stars do not repeat at a pixel, so a pixel masked in most frames
-    is real flat structure (hot pixels, edges), and masking only the frames
-    where noise lifts it over the threshold would bias it low.
-    ``CombineResult.rejected_fraction`` counts clip rejections
-    only; the star-masked fraction is on the returned :class:`TwilightInfo`.
+    Both passes run per row block (with a halo of ``3 * star_dilate_px + 4``
+    rows for the filters and the static test), see :func:`_mask_block`.  Pass 1 masks each frame's
+    stars against its smooth reference grid and stores a preliminary master
+    (float32, one frame): the median of the unmasked entries, the median of
+    all frames at a static pixel, the mean smooth reference at a pixel with a
+    star in every frame.  Pass 2 builds each frame's reference grid on
+    ``frame / preliminary master`` -- static structure (hot pixels, edges)
+    divides out, so it is no longer mistaken for a star, and a star that
+    repeats within a few pixels from frame to frame (small dither) stays
+    visible -- masks the stars again, sets masked entries to NaN and
+    sigma-clips them out.  A pixel with a star in every frame has nothing
+    left to combine: it takes the preliminary master's value with zero
+    weight, ``n_used`` 0 and the mask set.  Where a pixel ends with a single
+    contributing frame in a group of three or more, its weight is zeroed and
+    its mask set (the variance of one sample is unknown).
+    ``CombineResult.rejected_fraction`` counts clip rejections only; the
+    star-masked fraction is on the returned :class:`TwilightInfo`.
+
+    A group must hold at least 2 frames; ``min_frames`` is
+    ``star_min_frames`` capped at ``n - 1``.  Cost: about twice the
+    single-pass time (every frame is read and filtered twice more in pass 2)
+    and one extra float32 frame of memory; the row-block stack is unchanged.
     """
     params = params if params is not None else TwilightParams()
     loader_list = list(loaders)
@@ -391,22 +629,51 @@ def combine_twilight(
     h, w = shape
     box = min(params.star_block_px, max(2, min(h, w) // 4))
     n_by, n_bx = h // box, w // box
+    y_interp = _interp_axis(h, box, n_by)
+    x_interp = _interp_axis(w, box, n_bx)
+
+    halo = (params.star_dilate_px + 2) + (2 * params.star_dilate_px + 2)  # filters + static test
+    min_frames = min(params.star_min_frames, max(1, n - 1))
+    rows_per_block = row_block_size(shape, n, settings.max_memory_mb * _BLOCK_MEMORY_FRACTION)
+    blocks = [
+        (max(0, r0 - halo), min(h, r0 + rows_per_block + halo), r0, min(r0 + rows_per_block, h))
+        for r0 in range(0, h, rows_per_block)
+    ]
+
+    # Pass 1: each frame against its own smooth reference -> preliminary master.
     grids = [
         _reference_grid(
             loader, shape, float(scale), box=box, smooth=params.star_smooth_blocks, fill_level=l_ref
         )
         for loader, scale in zip(loader_list, scales, strict=True)
     ]
-    y_interp = _interp_axis(h, box, n_by)
-    x_interp = _interp_axis(w, box, n_bx)
+    prelim = np.empty(shape, dtype=np.float32)
+    n_static = 0
+    for rows in blocks:
+        bm = _mask_block(
+            loader_list, scales, grids, y_interp, x_interp, rows, w, None, params, min_frames
+        )
+        n_static += int(bm.static.sum())
+        bm.stack[bm.star] = np.nan
+        med = _nan_median_axis0(bm.stack)
+        nothing = ~np.isfinite(med)
+        med[nothing] = bm.ref_mean[nothing]
+        prelim[rows[2] : rows[3]] = med
+        del bm
 
-    halo = params.star_dilate_px + 2
-    min_frames = max(
-        min(params.star_min_frames, max(1, n - 1)),
-        math.ceil(n * (1.0 - params.star_persist_frac)),
-    )
-    rows_per_block = row_block_size(shape, n, settings.max_memory_mb * _BLOCK_MEMORY_FRACTION)
-
+    # Pass 2: each frame against its smooth reference of frame / preliminary master.
+    grids = [
+        _reference_grid(
+            loader,
+            shape,
+            float(scale),
+            box=box,
+            smooth=params.star_smooth_blocks,
+            fill_level=1.0,
+            divisor=prelim,
+        )
+        for loader, scale in zip(loader_list, scales, strict=True)
+    ]
     data = np.empty(shape, dtype=np.float32)
     variance = np.empty(shape, dtype=np.float32)
     weight = np.empty(shape, dtype=np.float32)
@@ -415,30 +682,22 @@ def combine_twilight(
 
     clip_rejected = 0.0
     n_masked_total = 0
-    n_fallback = 0
-    for r0 in range(0, h, rows_per_block):
-        r1 = min(r0 + rows_per_block, h)
-        ra, rb = max(0, r0 - halo), min(h, r1 + halo)
-        core = slice(r0 - ra, r0 - ra + (r1 - r0))
-        stack = np.empty((n, r1 - r0, w), dtype=np.float64)
-        star_cube = np.zeros((n, r1 - r0, w), dtype=bool)
-        for i, loader in enumerate(loader_list):
-            raw = np.asarray(loader((slice(ra, rb), slice(0, w))))
-            scaled = raw.astype(np.float64) * float(scales[i])
-            reference = _upsample(grids[i], y_interp, x_interp, ra, rb)
-            star_cube[i] = _detect_stars(scaled.astype(np.float32), reference, core, params)[core]
-            stack[i] = scaled[core]
-        too_few = (n - star_cube.sum(axis=0)) < min_frames
-        n_fallback += int(too_few.sum())
-        if too_few.any():
-            star_cube[:, too_few] = False
-        n_masked = int(star_cube.sum())
+    n_filled = 0
+    n_static_final = 0
+    for rows in blocks:
+        r0, r1 = rows[2], rows[3]
+        bm = _mask_block(
+            loader_list, scales, grids, y_interp, x_interp, rows, w, prelim, params, min_frames
+        )
+        n_static_final += int(bm.static.sum())
+        n_filled += int(bm.empty.sum())
+        n_masked = int(bm.star.sum())
         n_masked_total += n_masked
-        stack[star_cube] = np.nan
+        bm.stack[bm.star] = np.nan
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # astropy: NaNs "automatically clipped"
             block = _combine_core(
-                stack,
+                bm.stack,
                 settings,
                 method=method_,
                 read_noise_e=read_noise_e,
@@ -446,13 +705,26 @@ def combine_twilight(
                 weights=None,
                 fill=fill,
             )
-        rows = slice(r0, r1)
-        data[rows] = block.data
-        variance[rows] = block.variance
-        weight[rows] = block.weight
-        mask[rows] = block.mask
-        n_used[rows] = block.n_used
+        block_data = block.data
+        block_weight = block.weight
+        block_mask = block.mask
+        if bm.empty.any():
+            block_data[bm.empty] = prelim[r0:r1][bm.empty]
+            block_weight[bm.empty] = 0.0
+            block_mask[bm.empty] = True
+        if n >= 3:
+            single = block.n_used == 1
+            if single.any():
+                block_weight[single] = 0.0
+                block_mask[single] = True
+        sel = slice(r0, r1)
+        data[sel] = block_data
+        variance[sel] = block.variance
+        weight[sel] = block_weight
+        mask[sel] = block_mask
+        n_used[sel] = block.n_used
         clip_rejected += max(0.0, block.rejected_fraction * n * (r1 - r0) * w - n_masked)
+        del bm
 
     total = float(n * h * w)
     result = CombineResult(
@@ -475,15 +747,18 @@ def combine_twilight(
         block_px=box,
         min_frames=min_frames,
         masked_fraction=n_masked_total / total,
-        n_fallback_px=n_fallback,
+        n_static_px=n_static,
+        n_filled_px=n_filled,
     )
     logger.info(
         "twilight combine: %d frames scaled to %.1f, %.4f%% of entries star-masked, "
-        "%d px fell back to unmasked frames",
+        "%d static px kept (pass 1; %d in pass 2), %d px with a star in every frame filled",
         n,
         l_ref,
         100.0 * info.masked_fraction,
-        n_fallback,
+        n_static,
+        n_static_final,
+        n_filled,
     )
     return result, info
 

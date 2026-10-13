@@ -23,7 +23,7 @@ from astropy.wcs import WCS, FITSFixedWarning
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from robo43.exceptions import MetadataError
-from robo43.instruments.keywords import OBJECT_TYPE_PATTERNS
+from robo43.instruments.keywords import DEFAULT_KEYWORD_ALIASES, OBJECT_TYPE_PATTERNS
 from robo43.instruments.profile import InstrumentProfile, ReadoutModeVote
 from robo43.io.fits_io import read_header
 from robo43.io.meta import FieldOrigin, FrameMeta, Source
@@ -83,6 +83,31 @@ def _find_alias_value(
             source = Source.HEADER if index == 0 else Source.ALIAS
             return value, FieldOrigin(source, alias)
     return None, None
+
+
+def read_raw_imagetyp(
+    path: str | os.PathLike[str], profile: InstrumentProfile | None = None
+) -> str | None:
+    """Raw IMAGETYP string (any of the profile's IMAGETYP aliases) of ``path``.
+
+    Re-reads the file's header; for inventories whose frames carry no
+    ``origins["imagetyp"]`` (built before it was recorded).  ``None`` when the
+    header has no such value or cannot be read.
+    """
+    try:
+        header = read_header(path, profile)
+    except Exception as exc:  # unreadable/corrupt file: no information, not an error here
+        logger.debug("cannot read IMAGETYP of %s: %s", path, exc)
+        return None
+    if profile is not None:
+        aliases = profile.aliases_for("imagetyp")
+    else:
+        aliases = DEFAULT_KEYWORD_ALIASES["imagetyp"]
+    for alias in aliases:
+        value = header.get(alias)
+        if value is not None and str(value).strip() != "":
+            return str(value)
+    return None
 
 
 def normalise_radec(ra: Any, dec: Any) -> tuple[float | None, float | None]:

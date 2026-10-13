@@ -13,6 +13,7 @@ star-masked before it is combined (:mod:`robo43.calib.twilight`).
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -51,17 +52,20 @@ __all__ = ["build_master_flats", "group_flats_by_filter", "normalise_flat"]
 
 
 def group_flats_by_filter(
-    metas: Sequence[FrameMeta], *, separate_dome_and_sky: bool = True
+    metas: Sequence[FrameMeta],
+    *,
+    separate_dome_and_sky: bool = True,
+    profile: InstrumentProfile | None = None,
 ) -> dict[str, list[FrameMeta]]:
     """Group flat frames by filter, optionally separating dome and sky flats.
 
     Returns a dict mapping group keys to lists of FrameMeta objects in input
     order. When ``separate_dome_and_sky`` is True, twilight flats
-    (:func:`robo43.calib.twilight.is_twilight_flat`: OBJECT, raw IMAGETYP or
-    file name says sky/twilight) are grouped to key ``"{filter}:sky"``; all
-    others to ``"{filter}:dome"``. When False, all
-    flats of a filter go to the same key regardless of object. Flats with
-    ``filter is None`` are skipped with a warning.
+    (:func:`robo43.calib.twilight.is_twilight_flat`: raw IMAGETYP, OBJECT or
+    file name says sky/twilight; ``profile`` supplies its IMAGETYP aliases) are
+    grouped to key ``"{filter}:sky"``; all others to ``"{filter}:dome"``. When
+    False, all flats of a filter go to the same key regardless of object. Flats
+    with ``filter is None`` are skipped with a warning.
     """
     flat_metas = select_frames(metas, "flat")
 
@@ -72,7 +76,8 @@ def group_flats_by_filter(
             continue
 
         if separate_dome_and_sky:
-            key = f"{meta.filter}:sky" if is_twilight_flat(meta) else f"{meta.filter}:dome"
+            twilight = is_twilight_flat(meta, profile)
+            key = f"{meta.filter}:sky" if twilight else f"{meta.filter}:dome"
         else:
             key = meta.filter
 
@@ -309,10 +314,13 @@ def build_master_flats(
     2. Applies the level cut: accepts only frames with median in
        [flat_min_level_frac, flat_max_level_frac] * saturation_adu
     3. Combines accepted frames (or uses the single frame if n==1). A twilight
-       group (every frame :func:`robo43.calib.twilight.is_twilight_flat`) is
-       scaled to a common level (central-region median) before clipping and
-       its stars are masked per frame (:func:`robo43.calib.twilight.combine_twilight`),
-       in memory and streaming alike; a dome group is combined as before unless
+       group (every frame :func:`robo43.calib.twilight.is_twilight_flat`; a
+       mixed group is warned about and treated as dome) is scaled to a common
+       level (NaN-ignoring central-region median; a frame without a finite,
+       positive level is dropped with a warning) before clipping and its stars
+       are masked per frame in two passes
+       (:func:`robo43.calib.twilight.combine_twilight`), in memory and
+       streaming alike; a dome group is combined as before unless
        ``twilight_params.scale_all_flats`` also scales it
     4. Normalizes the combined data and counts the compact positive peaks left
        in it (:func:`robo43.calib.twilight.flat_star_qc`; cards ``FLATQC*``,
@@ -361,8 +369,18 @@ def build_master_flats(
 
         # A group is twilight only when every frame is; such a group is scaled
         # to a common level and star-masked. Dome groups are scaled only when
-        # tw_params.scale_all_flats asks for it.
-        group_twilight = all(is_twilight_flat(m) for m in group_metas)
+        # tw_params.scale_all_flats asks for it. A mixed group (possible when
+        # dome and sky flats are not separated) is treated as dome.
+        n_twilight = sum(1 for m in group_metas if is_twilight_flat(m, profile))
+        group_twilight = n_twilight == n_group
+        if 0 < n_twilight < n_group:
+            logger.warning(
+                "flat group %s is mixed: %d of %d frames are twilight flats; treating "
+                "the whole group as dome (no per-frame star masking)",
+                group_key,
+                n_twilight,
+                n_group,
+            )
         scale_group = group_twilight or tw_params.scale_all_flats
 
         # Conservative (raw, untrimmed) estimate of holding both a corrected
@@ -502,6 +520,30 @@ def build_master_flats(
             accepted_indices, level_cut_cards, _level_cut_applied = _flat_level_cut(
                 frame_medians, group_metas, group_key, profile, settings
             )
+            if scale_group:
+                # A frame whose central-region level is not finite and positive
+                # (all-NaN region, negative sky) cannot be scaled: drop it.
+                unscalable = [
+                    i
+                    for i in accepted_indices
+                    if not (math.isfinite(frame_levels[i]) and frame_levels[i] > 0.0)
+                ]
+                for i in unscalable:
+                    logger.warning(
+                        "dropping flat frame %s from group %s: its central-region level is "
+                        "%s (not finite and > 0), so it cannot be scaled",
+                        group_metas[i].path,
+                        group_key,
+                        frame_levels[i],
+                    )
+                if unscalable:
+                    accepted_indices = [i for i in accepted_indices if i not in unscalable]
+                    if not accepted_indices:
+                        msg = (
+                            f"no frame of flat group {group_key} has a finite, positive "
+                            "central-region level"
+                        )
+                        raise CalibrationError(msg)
             n_accepted = len(accepted_indices)
 
             if n_accepted == 0:
@@ -651,8 +693,9 @@ def build_master_flats(
         star_qc = flat_star_qc(normalized_data, tw_params)
         if star_qc.per_mpix > tw_params.qc_warn_per_mpix:
             logger.warning(
-                "master flat %s has %d compact positive peaks (%.1f per Mpx > %.1f) above "
-                "%.2f x its local median: star residuals are likely (max ratio %.3f)",
+                "master flat %s has %d compact positive peaks (%.2f per Mpx, threshold %.2f "
+                "per Mpx; a peak is a 3x3 mean above %.2f x the local median, max ratio "
+                "%.3f): star residuals are likely",
                 group_key,
                 star_qc.n_peaks,
                 star_qc.per_mpix,
