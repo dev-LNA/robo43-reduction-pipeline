@@ -510,6 +510,13 @@ def read_meta(
         )
         _set("frame_type", frame_type, frame_origin)
 
+    # Keep the raw IMAGETYP string (e.g. T80S 'sky-flat') so later stages can
+    # tell twilight flats from dome flats; not a FrameMeta field, but it
+    # survives an inventory round trip through origins_json.
+    raw_imagetyp, imagetyp_origin = _find_alias_value(header, profile, "imagetyp")
+    if raw_imagetyp is not None and imagetyp_origin is not None:
+        origins["imagetyp"] = FieldOrigin(imagetyp_origin.source, str(raw_imagetyp))
+
     # mjd -- derive from date_obs if not already found.
     if values.get("mjd") is None and values.get("date_obs") is not None:
         _set("mjd", float(values["date_obs"].mjd), FieldOrigin(Source.DERIVED, "date_obs"))

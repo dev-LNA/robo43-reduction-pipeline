@@ -1005,11 +1005,21 @@ def _run(args: argparse.Namespace) -> int:
 
             for group_key in flat_groups:
                 # A filter's master already exists if ANY of these files is present:
-                # master_flat_<group_key>.fits, master_flat_<group_key>_dome.fits,
-                # master_flat_<group_key>_sky.fits
-                # Note: group_key already has ':' replaced with '_' in the actual filename
-                filename_key = group_key.replace(":", "_")
-                flat_master_files = list(calibdir_path.glob(f"master_flat_{filename_key}*.fits"))
+                # master_flat_<filter>.fits, master_flat_<filter>_dome.fits,
+                # master_flat_<filter>_sky.fits. The check is by filter, whatever
+                # the group's kind: a master written under another kind suffix
+                # (e.g. twilight flats that older versions labelled _dome) still
+                # counts as present.
+                group_filter = group_key.split(":", 1)[0]
+                flat_master_files = [
+                    candidate
+                    for candidate in (
+                        calibdir_path / f"master_flat_{group_filter}.fits",
+                        calibdir_path / f"master_flat_{group_filter}_dome.fits",
+                        calibdir_path / f"master_flat_{group_filter}_sky.fits",
+                    )
+                    if candidate.exists()
+                ]
 
                 if flat_master_files:
                     filters_reused.append(group_key)
