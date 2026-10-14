@@ -2,14 +2,18 @@
 
 Per-filter master flats are built by combining and normalizing calibration flat
 frames. The ``separate_dome_and_sky_flats`` setting was previously unspecified;
-this module adopts the semantics that when enabled, flats whose OBJECT field
-(lower-cased) contains "sky" or "twilight" are grouped separately from "dome"
-flats under the same filter, allowing independent masters per illumination source.
+this module adopts the semantics that when enabled, twilight (sky) flats --
+recognised by :func:`robo43.calib.twilight.is_twilight_flat` from the OBJECT
+value, the raw IMAGETYP value or the file name -- are grouped separately from
+"dome" flats under the same filter, allowing independent masters per
+illumination source. A twilight group is scaled to a common level and
+star-masked before it is combined (:mod:`robo43.calib.twilight`).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -21,6 +25,15 @@ from robo43.calib.bias import apply_overscan_trim, resolve_common_gain, select_f
 from robo43.calib.combine import combine_lazy, combine_stack
 from robo43.calib.masks import cold_pixel_mask, write_cold_pixel_mask
 from robo43.calib.master import MasterFrame
+from robo43.calib.twilight import (
+    TwilightParams,
+    combine_twilight,
+    flat_star_qc,
+    frame_level,
+    is_twilight_flat,
+    method_cards,
+    scales_from_levels,
+)
 from robo43.config import Settings
 from robo43.exceptions import CalibrationError
 from robo43.instruments.profile import InstrumentProfile
@@ -39,16 +52,20 @@ __all__ = ["build_master_flats", "group_flats_by_filter", "normalise_flat"]
 
 
 def group_flats_by_filter(
-    metas: Sequence[FrameMeta], *, separate_dome_and_sky: bool = True
+    metas: Sequence[FrameMeta],
+    *,
+    separate_dome_and_sky: bool = True,
+    profile: InstrumentProfile | None = None,
 ) -> dict[str, list[FrameMeta]]:
     """Group flat frames by filter, optionally separating dome and sky flats.
 
     Returns a dict mapping group keys to lists of FrameMeta objects in input
-    order. When ``separate_dome_and_sky`` is True, flats whose ``object``
-    (lower-cased) contains "sky" or "twilight" are grouped to key
-    ``"{filter}:sky"``; all others to ``"{filter}:dome"``. When False, all
-    flats of a filter go to the same key regardless of object. Flats with
-    ``filter is None`` are skipped with a warning.
+    order. When ``separate_dome_and_sky`` is True, twilight flats
+    (:func:`robo43.calib.twilight.is_twilight_flat`: raw IMAGETYP, OBJECT or
+    file name says sky/twilight; ``profile`` supplies its IMAGETYP aliases) are
+    grouped to key ``"{filter}:sky"``; all others to ``"{filter}:dome"``. When
+    False, all flats of a filter go to the same key regardless of object. Flats
+    with ``filter is None`` are skipped with a warning.
     """
     flat_metas = select_frames(metas, "flat")
 
@@ -59,11 +76,8 @@ def group_flats_by_filter(
             continue
 
         if separate_dome_and_sky:
-            obj_lower = (meta.object or "").lower()
-            if "sky" in obj_lower or "twilight" in obj_lower:
-                key = f"{meta.filter}:sky"
-            else:
-                key = f"{meta.filter}:dome"
+            twilight = is_twilight_flat(meta, profile)
+            key = f"{meta.filter}:sky" if twilight else f"{meta.filter}:dome"
         else:
             key = meta.filter
 
@@ -282,6 +296,7 @@ def build_master_flats(
     fallback_source_nights: Mapping[str, tuple[tuple[str, ...], bool]] | None = None,
     pool_window_nights: int | None = None,
     pool_target_frames: int | None = None,
+    twilight_params: TwilightParams | None = None,
 ) -> dict[str, MasterFrame]:
     """Build and write master flat frames, one per filter (and illumination source).
 
@@ -298,8 +313,18 @@ def build_master_flats(
        is bit-identical to :func:`robo43.calib.combine.combine_stack`).
     2. Applies the level cut: accepts only frames with median in
        [flat_min_level_frac, flat_max_level_frac] * saturation_adu
-    3. Combines accepted frames (or uses the single frame if n==1)
-    4. Normalizes the combined data
+    3. Combines accepted frames (or uses the single frame if n==1). A twilight
+       group (every frame :func:`robo43.calib.twilight.is_twilight_flat`; a
+       mixed group is warned about and treated as dome) is scaled to a common
+       level (NaN-ignoring central-region median; a frame without a finite,
+       positive level is dropped with a warning) before clipping and its stars
+       are masked per frame in two passes
+       (:func:`robo43.calib.twilight.combine_twilight`), in memory and
+       streaming alike; a dome group is combined as before unless
+       ``twilight_params.scale_all_flats`` also scales it
+    4. Normalizes the combined data and counts the compact positive peaks left
+       in it (:func:`robo43.calib.twilight.flat_star_qc`; cards ``FLATQC*``,
+       WARNING above ``twilight_params.qc_warn_per_mpix``)
     5. Builds the cold-pixel mask from the normalized master (skipped when
        fewer than ``settings.calib.cold_pixel_min_flats`` flats were combined)
        and writes it to outdir/coldpix_<key>.fits (: -> _)
@@ -335,11 +360,28 @@ def build_master_flats(
 
     masters: dict[str, MasterFrame] = {}
     max_bytes = settings.calib.max_memory_mb * 1024.0 * 1024.0
+    tw_params = twilight_params if twilight_params is not None else TwilightParams()
 
     for group_key in sorted(groups.keys()):
         group_metas = groups[group_key]
         n_group = len(group_metas)
         logger.info("Processing flat group %s with %d frames", group_key, n_group)
+
+        # A group is twilight only when every frame is; such a group is scaled
+        # to a common level and star-masked. Dome groups are scaled only when
+        # tw_params.scale_all_flats asks for it. A mixed group (possible when
+        # dome and sky flats are not separated) is treated as dome.
+        n_twilight = sum(1 for m in group_metas if is_twilight_flat(m, profile))
+        group_twilight = n_twilight == n_group
+        if 0 < n_twilight < n_group:
+            logger.warning(
+                "flat group %s is mixed: %d of %d frames are twilight flats; treating "
+                "the whole group as dome (no per-frame star masking)",
+                group_key,
+                n_twilight,
+                n_group,
+            )
+        scale_group = group_twilight or tw_params.scale_all_flats
 
         # Conservative (raw, untrimmed) estimate of holding both a corrected
         # copy and a transient working copy of every frame in this group at
@@ -408,6 +450,7 @@ def build_master_flats(
         bias_cards: list[tuple[str, Any, str]] = []
         dark_cards: list[tuple[str, Any, str]] = []
         frame_medians: list[float] = []
+        frame_levels: list[float] = []  # central-region medians, only when scale_group
         frame_shape: tuple[int, int] | None = None
         processed_frames: list[np.ndarray] = []  # used only when not streaming
 
@@ -460,6 +503,10 @@ def build_master_flats(
                     raise CalibrationError(msg)
 
                 frame_medians.append(median)
+                if scale_group:
+                    frame_levels.append(
+                        frame_level(processed, settings.calib.flat_norm_region_frac)
+                    )
 
                 if stream:
                     memmap_arr[i] = processed
@@ -473,6 +520,30 @@ def build_master_flats(
             accepted_indices, level_cut_cards, _level_cut_applied = _flat_level_cut(
                 frame_medians, group_metas, group_key, profile, settings
             )
+            if scale_group:
+                # A frame whose central-region level is not finite and positive
+                # (all-NaN region, negative sky) cannot be scaled: drop it.
+                unscalable = [
+                    i
+                    for i in accepted_indices
+                    if not (math.isfinite(frame_levels[i]) and frame_levels[i] > 0.0)
+                ]
+                for i in unscalable:
+                    logger.warning(
+                        "dropping flat frame %s from group %s: its central-region level is "
+                        "%s (not finite and > 0), so it cannot be scaled",
+                        group_metas[i].path,
+                        group_key,
+                        frame_levels[i],
+                    )
+                if unscalable:
+                    accepted_indices = [i for i in accepted_indices if i not in unscalable]
+                    if not accepted_indices:
+                        msg = (
+                            f"no frame of flat group {group_key} has a finite, positive "
+                            "central-region level"
+                        )
+                        raise CalibrationError(msg)
             n_accepted = len(accepted_indices)
 
             if n_accepted == 0:
@@ -497,7 +568,45 @@ def build_master_flats(
                 )
 
             if n_accepted >= 2:
-                if stream:
+                group_scales: list[float] | None = None
+                group_l_ref: float | None = None
+                tw_info = None
+                if scale_group:
+                    acc_levels = [frame_levels[i] for i in accepted_indices]
+                    group_l_ref, scale_array = scales_from_levels(acc_levels)
+                    group_scales = [float(s) for s in scale_array]
+                if group_twilight:
+                    if stream:
+                        def _tw_stream_loader(idx: int, memmap=memmap_arr):
+                            def loader(slices):
+                                rows, cols = slices
+                                return np.asarray(memmap[idx, rows, cols])
+
+                            return loader
+
+                        tw_loaders = [_tw_stream_loader(i) for i in accepted_indices]
+                    else:
+                        def _tw_memory_loader(frame_data):
+                            def loader(slices):
+                                rows, cols = slices
+                                return frame_data[rows, cols]
+
+                            return loader
+
+                        tw_loaders = [
+                            _tw_memory_loader(processed_frames[i]) for i in accepted_indices
+                        ]
+                    result, tw_info = combine_twilight(
+                        tw_loaders,
+                        frame_shape,
+                        settings.calib,
+                        levels=acc_levels,
+                        params=tw_params,
+                        read_noise_e=read_noise_e,
+                        gain_e_per_adu=combine_gain_e_per_adu,
+                    )
+                    del tw_loaders  # drop the memmap reference before the scratch file goes
+                elif stream:
                     def _make_loader(idx: int):
                         def loader(slices):
                             rows, cols = slices
@@ -510,6 +619,7 @@ def build_master_flats(
                         loaders,
                         frame_shape,
                         settings.calib,
+                        scales=group_scales,
                         read_noise_e=read_noise_e,
                         gain_e_per_adu=combine_gain_e_per_adu,
                     )
@@ -529,6 +639,7 @@ def build_master_flats(
                             loaders,
                             accepted_frames[0].shape,
                             settings.calib,
+                            scales=group_scales,
                             read_noise_e=read_noise_e,
                             gain_e_per_adu=combine_gain_e_per_adu,
                         )
@@ -536,11 +647,18 @@ def build_master_flats(
                         result = combine_stack(
                             accepted_frames,
                             settings.calib,
+                            scales=group_scales,
                             read_noise_e=read_noise_e,
                             gain_e_per_adu=combine_gain_e_per_adu,
                         )
 
                 combine_cards = result.header_cards()
+                if tw_info is not None:
+                    combine_cards = combine_cards + tw_info.header_cards()
+                else:
+                    combine_cards = combine_cards + method_cards(
+                        "dome", scaled=group_scales is not None, l_ref=group_l_ref
+                    )
                 master_data = result.data
                 master_variance = result.variance
                 master_weight = result.weight
@@ -550,7 +668,18 @@ def build_master_flats(
                 master_data = np.array(single, dtype=np.float32)
                 master_variance = None
                 master_weight = None
-                combine_cards = [("NCOMBINE", 1, "Number of input frames")]
+                combine_cards = [
+                    ("NCOMBINE", 1, "Number of input frames"),
+                    *method_cards(
+                        "twilight" if group_twilight else "dome", scaled=False, l_ref=None
+                    ),
+                ]
+                if group_twilight:
+                    logger.warning(
+                        "twilight flat group %s has a single usable frame: its stars "
+                        "cannot be removed",
+                        group_key,
+                    )
         finally:
             if memmap_arr is not None:
                 del memmap_arr
@@ -559,6 +688,28 @@ def build_master_flats(
 
         # Normalize the flat
         normalized_data, norm_cards = normalise_flat(master_data, settings.calib)
+
+        # Star-residual QC on the normalised master, before any masking below.
+        star_qc = flat_star_qc(normalized_data, tw_params)
+        if star_qc.per_mpix > tw_params.qc_warn_per_mpix:
+            logger.warning(
+                "master flat %s has %d compact positive peaks (%.2f per Mpx, threshold %.2f "
+                "per Mpx; a peak is a 3x3 mean above %.2f x the local median, max ratio "
+                "%.3f): star residuals are likely",
+                group_key,
+                star_qc.n_peaks,
+                star_qc.per_mpix,
+                tw_params.qc_warn_per_mpix,
+                star_qc.threshold,
+                star_qc.max_ratio,
+            )
+        else:
+            logger.info(
+                "master flat %s: %d compact positive peaks above %.2f x local median",
+                group_key,
+                star_qc.n_peaks,
+                star_qc.threshold,
+            )
 
         # Cold pixels are judged on the normalized master BEFORE any fatal-pixel
         # replacement below, so an already-masked pixel cannot hide its defect.
@@ -616,6 +767,7 @@ def build_master_flats(
             + gain_cards
             + combine_cards
             + norm_cards
+            + star_qc.header_cards()
             + mask_cards
             + fallback_cards
         )

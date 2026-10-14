@@ -65,6 +65,30 @@ __all__ = ["SUBCOMMAND"]
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_flat_master_predates_flatkind(path: Path) -> bool:
+    """Log a WARNING when a master flat about to be reused has no ``FLATKIND`` card.
+
+    Masters written before the twilight-flat fix carry no ``FLATKIND``: they
+    were combined without per-frame scaling and star masking, so a twilight
+    group may hold star residuals.  They are not rebuilt automatically.
+    Returns True when the warning was issued.
+    """
+    try:
+        header = read_header(path)
+    except Exception as exc:
+        logger.warning("cannot read reused master flat %s to check FLATKIND: %s", path, exc)
+        return False
+    if "FLATKIND" in header:
+        return False
+    logger.warning(
+        "reused master flat %s has no FLATKIND card: it was built before the twilight-flat "
+        "fix (no per-frame scaling or star masking) and may hold star residuals; delete it "
+        "to rebuild it (it is not rebuilt automatically)",
+        path,
+    )
+    return True
+
+
 def _compose_static_mask(calibdir_path: Path, settings: Settings) -> None:
     """Write ``calibdir/mask.fits`` from hot (darks) and cold (flats) pixels.
 
@@ -996,23 +1020,40 @@ def _run(args: argparse.Namespace) -> int:
     if flat_metas:
         # Determine which filters are represented and which masters already exist
         separate_dome_and_sky = settings.calib.separate_dome_and_sky_flats
-        flat_groups = group_flats_by_filter(flat_metas, separate_dome_and_sky=separate_dome_and_sky)
+        flat_groups = group_flats_by_filter(
+            flat_metas, separate_dome_and_sky=separate_dome_and_sky, profile=profile
+        )
 
         if flat_groups:
             # Check which filters need to be built
             filters_to_build = []
             filters_reused = []
+            checked_flat_masters: set[Path] = set()
 
             for group_key in flat_groups:
                 # A filter's master already exists if ANY of these files is present:
-                # master_flat_<group_key>.fits, master_flat_<group_key>_dome.fits,
-                # master_flat_<group_key>_sky.fits
-                # Note: group_key already has ':' replaced with '_' in the actual filename
-                filename_key = group_key.replace(":", "_")
-                flat_master_files = list(calibdir_path.glob(f"master_flat_{filename_key}*.fits"))
+                # master_flat_<filter>.fits, master_flat_<filter>_dome.fits,
+                # master_flat_<filter>_sky.fits. The check is by filter, whatever
+                # the group's kind: a master written under another kind suffix
+                # (e.g. twilight flats that older versions labelled _dome) still
+                # counts as present.
+                group_filter = group_key.split(":", 1)[0]
+                flat_master_files = [
+                    candidate
+                    for candidate in (
+                        calibdir_path / f"master_flat_{group_filter}.fits",
+                        calibdir_path / f"master_flat_{group_filter}_dome.fits",
+                        calibdir_path / f"master_flat_{group_filter}_sky.fits",
+                    )
+                    if candidate.exists()
+                ]
 
                 if flat_master_files:
                     filters_reused.append(group_key)
+                    for existing in flat_master_files:
+                        if existing not in checked_flat_masters:
+                            checked_flat_masters.add(existing)
+                            _warn_if_flat_master_predates_flatkind(existing)
                 else:
                     filters_to_build.append(group_key)
 
