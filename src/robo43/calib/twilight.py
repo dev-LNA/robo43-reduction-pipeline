@@ -103,6 +103,16 @@ _IMAGETYP_CACHE_MAX = 8192
 #: noise puts almost none (see :func:`_mask_block`).
 _STATIC_MIN_VARYING = 8
 
+#: Stars are compact, detector defects are not.  Pixels masked in (nearly) all
+#: frames form a "streak" when ``_STREAK_RUN`` windows' worth (the window being
+#: ``2 * (2 * star_dilate_px + 2) + 1`` px) of consecutive pixels along a column
+#: (or row) are all such pixels: the masked region of a star is ~15 px across,
+#: that of a column or row defect whose excess scales with the sky level -- which
+#: varies from frame to frame like a star's -- runs for 100 px and more.  The run
+#: is 4 windows (69 px for the default dilation): above a chain of several
+#: stars, below the streaks seen on T80S (100-250 px).
+_STREAK_RUN = 4.0
+
 #: Block rows read per step while building a frame's smooth reference grid.
 _REF_CHUNK_BLOCKS = 32
 
@@ -129,14 +139,23 @@ class TwilightParams:
     strength sits on it); such a pixel with fewer unmasked frames than
     ``star_min_frames`` that has at least 8 varying pixels within
     ``2 * star_dilate_px + 2`` px is star-like, any other one is static
-    structure (hot pixel, edge) and is combined from all its frames.
+    structure (hot pixel, edge) and is combined from all its frames.  Pixels
+    masked in most frames that form a streak (a run of 69 consecutive rows or
+    columns each holding one: an additive column defect whose relative excess
+    follows the sky level) are structure as well, never stars.  Pixels found
+    static in pass 1 are not masked in pass 2.
     ``scale_all_flats``: also scale non-twilight
     (dome) flats to a common level before clipping.  ``qc_*``: the
     star-residual QC (window of the local median, threshold on the 3x3 mean of
     master / local median, blob area range counted as a compact peak, warning
     density in peaks per Mpixel).  The 3x3 mean is used because a sensor's
     pixel-response scatter (0.9 % rms on T80S) puts ~25 000 single pixels per
-    85 Mpx above 1.03 in a perfectly clean master.
+    85 Mpx above 1.03 in a perfectly clean master.  ``qc_warn_per_mpix``
+    (default 20) was calibrated on T80S 20251224 (21 sky flats, 85 Mpx): a
+    clean master holds ~6 compact peaks per Mpx (~550, static detector
+    structure that survives any combine: 71 % coincide within 4 px between
+    independent frame halves), the star-contaminated pre-fix master 226 per Mpx
+    (19 230); 20 sits between them.
     """
 
     star_nsigma: float = 4.0
@@ -148,7 +167,7 @@ class TwilightParams:
     scale_all_flats: bool = False
     qc_window_px: int = 61
     qc_threshold: float = 1.03
-    qc_warn_per_mpix: float = 2.0
+    qc_warn_per_mpix: float = 20.0
     qc_min_area_px: int = 4
     qc_max_area_px: int = 400
 
@@ -294,9 +313,7 @@ def scales_from_levels(levels: Sequence[float]) -> tuple[float, np.ndarray]:
     return l_ref, l_ref / arr
 
 
-def method_cards(
-    kind: str, *, scaled: bool, l_ref: float | None
-) -> list[tuple[str, Any, str]]:
+def method_cards(kind: str, *, scaled: bool, l_ref: float | None) -> list[tuple[str, Any, str]]:
     """Header cards for a flat group combined *without* star masking."""
     cards: list[tuple[str, Any, str]] = [
         ("FLATKIND", kind, "Flat illumination type of this group"),
@@ -501,6 +518,7 @@ def _mask_block(
     rows: tuple[int, int, int, int],
     width: int,
     prelim: np.ndarray | None,
+    exempt: np.ndarray | None,
     params: TwilightParams,
     min_frames: int,
 ) -> _BlockMasks:
@@ -510,7 +528,10 @@ def _mask_block(
     neighbourhood of the static test.  Each frame is compared with its
     reference: the smooth grid, upsampled (pass 1, ``prelim`` None), or the
     smooth grid of the frame / preliminary-master ratio times the preliminary
-    master (pass 2).
+    master (pass 2).  ``exempt`` (pass 2) marks the pixels pass 1 found to be
+    static structure: they are never masked, so a hot pixel or a streak is
+    combined from every frame instead of from the frames whose residual
+    against the preliminary master happens to stay below the threshold.
 
     A pixel left with fewer than ``min_frames`` unmasked frames is either a
     star sitting on it in every frame (small dither) or static structure.  The
@@ -521,7 +542,16 @@ def _mask_block(
     when at least ``_STATIC_MIN_VARYING`` varying pixels lie within
     ``2 * star_dilate_px + 2`` px of it (a star's faint wings are not
     individually distinguishable from noise, its core is), otherwise static,
-    and its star mask is lifted.  A star-like pixel with no unmasked frame is
+    and its star mask is lifted.  Whether the varying pixels are compact is
+    the second test: a star is compact, so when a run of ``_STREAK_RUN``
+    windows of consecutive pixels along a column (or row) are all masked in
+    (nearly) all frames, they are a streak -- a column or row defect,
+    typically additive, whose
+    residual relative to the sky varies with the frame level exactly as a
+    star's varies with its position.  A streak is structure, not a star, and
+    it is combined from all frames (pass 2 does not mask it again).  The
+    shape test does not depend on the physical origin of the defect, unlike a fit of the
+    excess against 1 / level.  A star-like pixel with no unmasked frame is
     ``empty``, as is one with no finite value at all.
     """
     ra, rb, r0, r1 = rows
@@ -548,17 +578,33 @@ def _mask_block(
         sum_r2 += r * r
         ref_sum += reference
 
+    if exempt is not None:
+        star[:, exempt[ra:rb]] = False
     n_clean = n - star.sum(axis=0)
     few = n_clean < min_frames
     static = np.zeros((nr, width), dtype=bool)
     empty = np.zeros((nr, width), dtype=bool)
+    var = np.maximum((sum_r2 - sum_r * sum_r / n) / (n - 1), 0.0)
+    noise_var = float(np.median(var[core])) / _median_variance_factor(n - 1)
+    varying = (few & (var > params.star_static_tol**2 * noise_var)).astype(np.float32)
     if few[core].any():
-        var = np.maximum((sum_r2 - sum_r * sum_r / n) / (n - 1), 0.0)
-        noise_var = float(np.median(var[core])) / _median_variance_factor(n - 1)
-        varying = few & (var > params.star_static_tol**2 * noise_var)
         window = 2 * (2 * params.star_dilate_px + 2) + 1
-        n_varying = ndimage.uniform_filter(varying.astype(np.float32), size=window, mode="constant")
-        starlike = few & (n_varying * np.float32(window * window) >= _STATIC_MIN_VARYING - 0.5)
+        run = int(_STREAK_RUN * window) | 1
+        n_sq = ndimage.uniform_filter(varying, size=window, mode="constant") * np.float32(
+            window * window
+        )
+        enough = n_sq >= _STATIC_MIN_VARYING - 0.5
+        # A streak is a run of ``run`` consecutive masked-in-most-frames pixels along a
+        # column (or row); only those pixels themselves count, so a star next to a
+        # streak is not swept in.  (Not only the varying pixels: a weak streak varies
+        # too little to be solid.)
+        masked_all = few.astype(np.uint8)
+        streak = np.zeros(few.shape, dtype=bool)
+        for axis in (0, 1):
+            full_run = ndimage.minimum_filter1d(masked_all, size=run, axis=axis, mode="nearest")
+            streak |= ndimage.maximum_filter1d(full_run, size=run, axis=axis, mode="nearest") > 0
+        streak &= few
+        starlike = few & enough & ~streak
         static_halo = few & ~starlike
         star[:, static_halo] = False
         static = static_halo[core]
@@ -588,8 +634,8 @@ def combine_twilight(
     sigma clip compares like with like and the master (and its variance) stay
     in the frames' units at level ``l_ref``.
 
-    Both passes run per row block (with a halo of ``3 * star_dilate_px + 4``
-    rows for the filters and the static test), see :func:`_mask_block`.  Pass 1 masks each frame's
+    Both passes run per row block (with a halo for the filters and for the
+    static / streak test), see :func:`_mask_block`.  Pass 1 masks each frame's
     stars against its smooth reference grid and stores a preliminary master
     (float32, one frame): the median of the unmasked entries, the median of
     all frames at a static pixel, the mean smooth reference at a pixel with a
@@ -632,7 +678,10 @@ def combine_twilight(
     y_interp = _interp_axis(h, box, n_by)
     x_interp = _interp_axis(w, box, n_bx)
 
-    halo = (params.star_dilate_px + 2) + (2 * params.star_dilate_px + 2)  # filters + static test
+    window = 2 * (2 * params.star_dilate_px + 2) + 1
+    # filters + the long (streak) window of the static test
+    run = int(_STREAK_RUN * window) | 1
+    halo = (params.star_dilate_px + 2) + run
     min_frames = min(params.star_min_frames, max(1, n - 1))
     rows_per_block = row_block_size(shape, n, settings.max_memory_mb * _BLOCK_MEMORY_FRACTION)
     blocks = [
@@ -648,12 +697,14 @@ def combine_twilight(
         for loader, scale in zip(loader_list, scales, strict=True)
     ]
     prelim = np.empty(shape, dtype=np.float32)
+    exempt = np.zeros(shape, dtype=bool)
     n_static = 0
     for rows in blocks:
         bm = _mask_block(
-            loader_list, scales, grids, y_interp, x_interp, rows, w, None, params, min_frames
+            loader_list, scales, grids, y_interp, x_interp, rows, w, None, None, params, min_frames
         )
         n_static += int(bm.static.sum())
+        exempt[rows[2] : rows[3]] = bm.static
         bm.stack[bm.star] = np.nan
         med = _nan_median_axis0(bm.stack)
         nothing = ~np.isfinite(med)
@@ -687,7 +738,17 @@ def combine_twilight(
     for rows in blocks:
         r0, r1 = rows[2], rows[3]
         bm = _mask_block(
-            loader_list, scales, grids, y_interp, x_interp, rows, w, prelim, params, min_frames
+            loader_list,
+            scales,
+            grids,
+            y_interp,
+            x_interp,
+            rows,
+            w,
+            prelim,
+            exempt,
+            params,
+            min_frames,
         )
         n_static_final += int(bm.static.sum())
         n_filled += int(bm.empty.sum())

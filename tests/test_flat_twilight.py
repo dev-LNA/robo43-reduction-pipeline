@@ -264,9 +264,7 @@ def test_missing_imagetyp_origin_falls_back_to_the_fits_header(tmp_path):
     assert read_raw_imagetyp(sky) == "sky-flat"
     assert read_raw_imagetyp(unlabelled) is None
     assert raw_imagetyp(_meta(tmp_path / "missing.fits")) is None
-    groups = group_flats_by_filter(
-        [_meta(sky), _meta(dome_named_sky)], separate_dome_and_sky=True
-    )
+    groups = group_flats_by_filter([_meta(sky), _meta(dome_named_sky)], separate_dome_and_sky=True)
     assert sorted(groups) == ["R:dome", "R:sky"]
     # an origin, when present, is used as it is
     origin = {"imagetyp": FieldOrigin(Source.HEADER, "Flat Field")}
@@ -390,9 +388,7 @@ def test_levels_are_equalised_before_combining():
 def test_variance_is_at_the_scaled_noise_level():
     frames, _truth_img = _make_frames(levels=LEVELS, seed=5)
     levels = [frame_level(f, 0.5) for f in frames]
-    result, info = combine_twilight(
-        _loaders(frames), SHAPE, CalibSettings(), levels=levels
-    )
+    result, info = combine_twilight(_loaders(frames), SHAPE, CalibSettings(), levels=levels)
     rel_var = np.median(result.variance[result.n_used >= 9]) / info.l_ref**2
     expected = REL_NOISE**2 / 10.0
     assert 0.6 * expected < rel_var < 1.6 * expected
@@ -507,6 +503,43 @@ def test_stars_repeating_within_a_small_dither_are_removed_and_hot_pixels_kept()
     assert np.abs(err[filled]).max() < 0.03
 
 
+def test_additive_column_defect_is_structure_not_a_star():
+    """A bright column segment whose excess follows the sky level (additive ADU).
+
+    Its excess relative to the sky changes from frame to frame (levels span 3x),
+    so the variance test calls it "varying" like a star; its streak shape says it
+    is structure: no filled pixel, no masked frame, combined from every frame,
+    while the dithered stars around it are still removed.
+    """
+    frames, _truth_norm, _hot = _make_dithered_frames(levels=LEVELS, seed=8)
+    levels = [frame_level(f, 0.5) for f in frames]
+    plain, _ = combine_twilight(_loaders(frames), SHAPE, CalibSettings(), levels=levels)
+    cols = slice(100, 102)  # two pixels wide
+    rows = slice(20, 170)  # 150 px long
+    amplitude = 1500.0  # ADU in every frame: 3.8 % of the brightest, 10.7 % of the faintest
+    with_column = [f.copy() for f in frames]
+    for f in with_column:
+        f[rows, cols] += np.float32(amplitude)
+    result, info = combine_twilight(_loaders(with_column), SHAPE, CalibSettings(), levels=levels)
+    assert np.all(result.n_used[40:150, cols] == len(frames))  # every frame combined
+    assert np.all(result.weight[rows, cols] > 0) and not result.mask[rows, cols].any()
+    filled = result.n_used == 0
+    assert not filled[:, 94:108].any()  # no filled pixel on or beside the column
+    assert info.n_filled_px <= int((plain.n_used == 0).sum())
+    expected = amplitude * float(np.mean(info.scales))  # the mean additive excess, scaled
+    excess = float(np.mean(result.data[40:150, cols] - plain.data[40:150, cols]))
+    assert excess == pytest.approx(expected, rel=0.05)
+    # the stars are removed all the same: the rest of the master is unchanged
+    away = np.ones(SHAPE, dtype=bool)
+    away[:, 88:114] = False
+    change = np.abs(result.data[away] / plain.data[away] - 1.0)
+    assert np.mean(change > 2e-3) < 0.005 and change.max() < 0.02
+    master = result.data.astype(np.float64)
+    master /= np.median(master[48:144, 48:144])
+    master[:, 94:108] = 1.0  # the column is real structure the QC rightly sees; count the stars
+    assert flat_star_qc(master).n_peaks == 0
+
+
 def test_dithered_stars_with_hot_pixels_through_memmap_blocks(tmp_path):
     """Several row blocks (halo, static test and fill across block edges) give the same answer."""
     frames, truth_norm, _hot = _make_dithered_frames(levels=LEVELS, seed=8)
@@ -545,8 +578,12 @@ def test_single_contributing_frame_has_zero_weight_in_groups_of_three_or_more():
     assert result.weight[50, 61] > 0 and not bool(result.mask[50, 61])
     # two frames only: the rule applies from three frames on
     result2, _ = combine_twilight(
-        _loaders(frames[2:]), SHAPE, CalibSettings(), levels=levels[2:],
-        read_noise_e=5.0, gain_e_per_adu=1.0,
+        _loaders(frames[2:]),
+        SHAPE,
+        CalibSettings(),
+        levels=levels[2:],
+        read_noise_e=5.0,
+        gain_e_per_adu=1.0,
     )
     assert int(result2.n_used[50, 60]) == 1
     assert result2.weight[50, 60] > 0
@@ -681,8 +718,11 @@ def test_single_twilight_frame_is_flagged_not_masked(tmp_path, caplog):
 
 
 def test_qc_default_threshold_and_warning_message(tmp_path, caplog):
-    """Review F2: 2 peaks per Mpx by default; the warning gives count, rate and threshold."""
-    assert TwilightParams().qc_warn_per_mpix == 2.0
+    """Review F2: 20 peaks per Mpx by default (T80S: clean ~6, contaminated ~226 per Mpx).
+
+    The warning gives count, rate and threshold.
+    """
+    assert TwilightParams().qc_warn_per_mpix == 20.0
     frames, _truth_img = _make_frames(levels=LEVELS, amp_range=(2.0, 4.0), seed=3)
     metas = _write_group(tmp_path, frames, prefix="lamp", object="DomeFlat")
     caplog.set_level(logging.WARNING)
@@ -691,13 +731,13 @@ def test_qc_default_threshold_and_warning_message(tmp_path, caplog):
     )
     n_peaks = _cards(masters["R:dome"])["FLATQCN"]
     rate = 1.0e6 * n_peaks / (SHAPE[0] * SHAPE[1])
-    assert rate > 2.0
+    assert rate > 20.0
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     qc = [m for m in messages if "compact positive peaks" in m]
     assert len(qc) == 1
     assert f"{n_peaks} compact positive peaks" in qc[0]
     assert f"{rate:.2f} per Mpx" in qc[0]
-    assert "threshold 2.00 per Mpx" in qc[0]
+    assert "threshold 20.00 per Mpx" in qc[0]
 
 
 def test_mixed_flat_group_warns_and_is_combined_as_dome(tmp_path, caplog):
